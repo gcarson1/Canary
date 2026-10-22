@@ -385,6 +385,12 @@ impl History {
         self.dirty
     }
 
+    /// Marks unsaved changes that live outside the project data, such as a
+    /// plugin parameter, so quitting still saves them. No undo step.
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
     pub fn revision(&self) -> u64 {
         self.revision
     }
@@ -484,7 +490,16 @@ impl History {
             .tracks
             .iter()
             .all(|t| t.gain.is_finite() && t.pan.is_finite());
-        if !(p.bpm.is_finite() && p.bpm > 0.0) || p.sample_rate == 0 || !finite {
+        // Two devices sharing a uid would put one plugin node in the graph twice.
+        let mut uids: Vec<u64> = p
+            .tracks
+            .iter()
+            .flat_map(|t| &t.devices)
+            .map(|d| d.uid)
+            .collect();
+        uids.sort_unstable();
+        let unique = uids.windows(2).all(|w| w[0] != w[1]);
+        if !(p.bpm.is_finite() && p.bpm > 0.0) || p.sample_rate == 0 || !finite || !unique {
             return Err(ProjectError::Invalid);
         }
         Ok(Self::new(file.project))
@@ -739,6 +754,16 @@ mod tests {
             uid,
             "a removed device's uid is not reused"
         );
+
+        // A file with two devices sharing a uid does not load.
+        let text = fs::read_to_string(&path).unwrap();
+        let mut file: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let devices = file["project"]["tracks"][0]["devices"]
+            .as_array_mut()
+            .unwrap();
+        devices.push(devices[0].clone());
+        fs::write(&path, file.to_string()).unwrap();
+        assert!(matches!(History::load(&path), Err(ProjectError::Invalid)));
         assert!(h.undo());
         assert_eq!(h.project().tracks[0].devices[0].state.len(), 256);
         fs::remove_dir_all(&dir).unwrap();

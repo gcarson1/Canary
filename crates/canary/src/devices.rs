@@ -1,7 +1,7 @@
 //! Plugin devices: the live plugin behind every project `Device`, kept alive
 //! across plan rebuilds so plugin state survives edits.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use daw_core::NodeId;
 use daw_graph::{AudioNode, ExecutionPlan, Source, StepId, MAX_NODES};
@@ -34,6 +34,8 @@ pub struct Devices {
     removing: Vec<NodeId>,
     /// Last state of removed devices, so an undo brings back what was there.
     removed_state: HashMap<u64, Vec<u8>>,
+    /// Devices whose plugin failed to load; not retried on every edit.
+    failed: HashSet<u64>,
     free: Vec<u32>,
 }
 
@@ -76,6 +78,7 @@ impl Devices {
             retired: Vec::new(),
             removing: Vec::new(),
             removed_state: HashMap::new(),
+            failed: HashSet::new(),
             free: (FIRST_DEVICE_NODE..MAX_NODES as u32).rev().collect(),
         }
     }
@@ -169,10 +172,13 @@ impl Devices {
             self.free.push(live.id.0);
             self.retired.push((live.hosted, RETIRE_FRAMES));
         }
+        self.failed
+            .retain(|uid| wanted.iter().any(|d| d.uid == *uid));
         let mut errors = Vec::new();
         for d in wanted {
-            if !self.live.contains_key(&d.uid) {
+            if !self.live.contains_key(&d.uid) && !self.failed.contains(&d.uid) {
                 if let Err(e) = self.instantiate(d, sample_rate, max_block) {
+                    self.failed.insert(d.uid);
                     errors.push(e);
                 }
             }
@@ -226,6 +232,19 @@ impl Devices {
         step
     }
 
+    /// False if the device is not live or is not an instrument.
+    pub fn is_instrument(&self, uid: u64) -> bool {
+        self.live.get(&uid).is_some_and(|l| l.instrument)
+    }
+
+    /// Drops a device made by `create` that never went into the project.
+    pub fn discard(&mut self, uid: u64) {
+        if let Some(l) = self.live.remove(&uid) {
+            // Its node never reached a plan, so both halves can go now.
+            self.free.push(l.id.0);
+        }
+    }
+
     pub fn set_param(&mut self, uid: u64, id: u32, value: f64) {
         if let Some(l) = self.live.get_mut(&uid) {
             l.hosted.set_param(id, value);
@@ -264,14 +283,100 @@ impl Devices {
             .collect()
     }
 
-    /// Main-thread plugin work, and dropping retired handles once their nodes are gone.
-    pub fn idle(&mut self) {
+    /// Main-thread plugin work, and dropping retired handles once their nodes are
+    /// gone. `waiting` holds the timer while a plan has not reached the engine.
+    pub fn idle(&mut self, waiting: bool) {
         for l in self.live.values_mut() {
             l.hosted.idle();
+        }
+        if waiting {
+            return;
         }
         for (_, frames) in &mut self.retired {
             *frames = frames.saturating_sub(1);
         }
         self.retired.retain(|(_, frames)| *frames > 0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use daw_graph::LiveNodes;
+    use daw_project::Track;
+
+    const DELAY: &str = "aufx:dely:appl";
+
+    fn project(uids: &[u64]) -> Project {
+        let mut track = Track::new("t");
+        track.devices = uids
+            .iter()
+            .map(|&uid| Device {
+                uid,
+                format: PluginFormat::AudioUnit,
+                bundle: None,
+                id: DELAY.into(),
+                name: "AUDelay".into(),
+                state: Vec::new(),
+            })
+            .collect();
+        Project {
+            tracks: vec![track],
+            ..Project::default()
+        }
+    }
+
+    /// Each plan's node changes must be valid against the engine's live set in
+    /// the order sent, including when a removed device's node id is reused.
+    #[test]
+    fn plans_stay_valid_through_add_remove_and_id_reuse() {
+        let mut d = Devices::scan();
+        let mut live = LiveNodes::default();
+        let send = |d: &mut Devices, live: &mut LiveNodes| {
+            let mut plan = ExecutionPlan::new(64);
+            d.apply_changes(&mut plan);
+            *live = live.check(&plan).expect("plan accepted");
+        };
+
+        assert!(d.sync(&project(&[1]), 48_000.0, 64).is_empty());
+        assert!(d.changed());
+        send(&mut d, &mut live);
+        assert!(!d.changed());
+        let first = d.live[&1].id;
+
+        // Remove device 1 and add device 2 in one sync: 2 takes 1's node id.
+        assert!(d.sync(&project(&[2]), 48_000.0, 64).is_empty());
+        assert_eq!(d.live[&2].id, first, "freed id reused");
+        send(&mut d, &mut live); // remove + insert of the same id in one plan
+        assert!(live.is_live(first));
+
+        // Removing everything leaves the id free and the engine without it.
+        d.sync(&project(&[]), 48_000.0, 64);
+        send(&mut d, &mut live);
+        assert!(!live.is_live(first));
+        assert_eq!(d.retired.len(), 2, "handles wait for their nodes to go");
+        for _ in 0..RETIRE_FRAMES {
+            d.idle(true); // a plan still queued: the timer holds
+        }
+        assert_eq!(d.retired.len(), 2);
+        for _ in 0..RETIRE_FRAMES {
+            d.idle(false);
+        }
+        assert!(d.retired.is_empty());
+    }
+
+    #[test]
+    fn a_missing_plugin_fails_once_not_on_every_sync() {
+        let mut d = Devices::scan();
+        let mut p = project(&[7]);
+        p.tracks[0].devices[0].id = "aufx:none:none".into();
+        assert_eq!(d.sync(&p, 48_000.0, 64).len(), 1);
+        assert!(d.sync(&p, 48_000.0, 64).is_empty(), "not retried");
+        d.sync(&project(&[]), 48_000.0, 64);
+        assert_eq!(
+            d.sync(&p, 48_000.0, 64).len(),
+            1,
+            "retried once it comes back"
+        );
     }
 }

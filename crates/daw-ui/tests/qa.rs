@@ -241,6 +241,11 @@ fn click(h: &mut Harness<'_, Rig>, pos: egui::Pos2) {
 }
 
 fn rig() -> Harness<'static, Rig> {
+    rig_with(devices())
+}
+
+/// The rig with `rack` as the selected track's devices.
+fn rig_with(rack: Vec<DeviceView>) -> Harness<'static, Rig> {
     let (history, waveforms, files) = fixture();
     let engine = EngineView::default();
     let mut ws = Workspace::default();
@@ -259,7 +264,7 @@ fn rig() -> Harness<'static, Rig> {
                             waveforms: &waveforms,
                             files: &files,
                             plugins: &plugins(),
-                            devices: &devices(),
+                            devices: &rack,
                         },
                     );
                     rig.requests.extend(out);
@@ -374,4 +379,22 @@ fn picker_adds_a_device_and_dials_set_params() {
         _ => None,
     });
     assert!(set.is_some_and(|v| v > 50.0), "{:?}", h.state().requests);
+}
+
+#[test]
+fn picker_opens_on_a_track_with_no_devices() {
+    // With no modules, + DEVICE sits at the rack's left: x 292..388, y 564..588,
+    // outside the modal. The click that opens the picker must not close it.
+    let mut h = rig_with(Vec::new());
+    h.run();
+    click(&mut h, egui::Pos2::new(340.0, 576.0));
+    click(&mut h, egui::Pos2::new(700.0, 568.0 + 16.0)); // first row: AUDelay
+    assert!(
+        h.state().requests.contains(&Request::AddDevice {
+            track: 0,
+            choice: 0
+        }),
+        "{:?}",
+        h.state().requests
+    );
 }

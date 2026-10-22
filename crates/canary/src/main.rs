@@ -416,6 +416,14 @@ impl App {
                 match self.devices.create(choice, uid, rate, MAX_BLOCK) {
                     Ok(device) => {
                         let tracks = &self.history.project().tracks;
+                        // One instrument per track: a second would never be scheduled.
+                        let has_instrument = tracks.get(track).is_some_and(|t| {
+                            t.devices.iter().any(|d| self.devices.is_instrument(d.uid))
+                        });
+                        if has_instrument && self.devices.is_instrument(device.uid) {
+                            self.devices.discard(device.uid);
+                            return self.error("this track already has an instrument".into());
+                        }
                         let index = tracks.get(track).map_or(0, |t| t.devices.len());
                         let action = Action::InsertDevice {
                             track,
@@ -444,6 +452,7 @@ impl App {
                     .map(|d| d.uid);
                 if let Some(uid) = uid {
                     self.devices.set_param(uid, param, value);
+                    self.history.mark_dirty(); // so quitting saves the plugin's state
                 }
             }
         }
@@ -530,7 +539,7 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
 
-        self.devices.idle();
+        self.devices.idle(self.queued.is_some());
         let views = self
             .ws
             .selected_track

@@ -84,6 +84,30 @@ pub struct ParamInfo {
     pub default: f64,
 }
 
+impl ParamInfo {
+    /// A parameter with a usable range: `None` if a bound is not finite, bounds
+    /// given backwards are swapped, and the default is kept inside them. Plugins
+    /// are untrusted; a bad range must not reach code that clamps to it.
+    pub fn new(id: u32, name: String, min: f64, max: f64, default: f64) -> Option<Self> {
+        if !(min.is_finite() && max.is_finite()) {
+            return None;
+        }
+        let (min, max) = if min <= max { (min, max) } else { (max, min) };
+        let default = if default.is_finite() {
+            default.clamp(min, max)
+        } else {
+            min
+        };
+        Some(Self {
+            id,
+            name,
+            min,
+            max,
+            default,
+        })
+    }
+}
+
 /// Loads a `.clap` bundle. Unsafe because it runs the bundle's code in this process;
 /// only load plugins the user chose.
 ///
@@ -226,13 +250,13 @@ impl ClapPlugin {
                     (0..ext.count(&handle))
                         .filter_map(|i| {
                             let p = ext.get_info(&handle, i, &mut buffer)?;
-                            Some(ParamInfo {
-                                id: p.id.get(),
-                                name: String::from_utf8_lossy(p.name).into_owned(),
-                                min: p.min_value,
-                                max: p.max_value,
-                                default: p.default_value,
-                            })
+                            ParamInfo::new(
+                                p.id.get(),
+                                String::from_utf8_lossy(p.name).into_owned(),
+                                p.min_value,
+                                p.max_value,
+                                p.default_value,
+                            )
                         })
                         .collect()
                 });

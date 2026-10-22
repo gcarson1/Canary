@@ -516,13 +516,13 @@ fn params(unit: &Instance) -> Vec<ParamInfo> {
                         .into_owned()
                 }
             };
-            Some(ParamInfo {
+            ParamInfo::new(
                 id,
                 name,
-                min: f64::from(info.minValue),
-                max: f64::from(info.maxValue),
-                default: f64::from(info.defaultValue),
-            })
+                f64::from(info.minValue),
+                f64::from(info.maxValue),
+                f64::from(info.defaultValue),
+            )
         })
         .collect()
 }

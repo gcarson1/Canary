@@ -63,6 +63,8 @@ pub(crate) fn show(
         return;
     };
 
+    // While the picker is open it owns the pointer: nothing under it reacts.
+    let was_open = ws.picker.is_some();
     let module_w = 16.0 * u;
     let mut x = body.min.x;
     for (di, device) in inputs.devices.iter().enumerate() {
@@ -91,7 +93,7 @@ pub(crate) fn show(
         if resp.hovered() {
             p.hline(remove.x_range(), m.snap(remove.max.y), m.hair(t.muted));
         }
-        if resp.clicked() {
+        if resp.clicked() && !was_open {
             ws.edit(Action::RemoveDevice { track, index: di });
         }
 
@@ -104,7 +106,7 @@ pub(crate) fn show(
             );
             let area = Rect::from_min_size(origin, cell);
             let id = ui.scope_id().with(("dial", di, param.id));
-            if let Some(v) = dial(ui, &p, m, ws, area, param, id) {
+            if let Some(v) = dial(ui, &p, m, ws, area, param, (!was_open).then_some(id)) {
                 out.push(Request::SetParam {
                     track,
                     device: di,
@@ -145,11 +147,13 @@ pub(crate) fn show(
         m.mono(0.6875),
         t.muted,
     );
-    if resp.clicked() {
+    if resp.clicked() && !was_open {
         ws.picker = Some(0.0);
     }
     if ws.picker.is_some() {
-        picker(ws, ui, m, r, inputs, track, out);
+        if let Some(choice) = picker(ws, ui, m, r, inputs, was_open) {
+            out.push(Request::AddDevice { track, choice });
+        }
     }
 }
 
@@ -161,7 +165,8 @@ fn dial(
     ws: &Workspace,
     area: Rect,
     param: &ParamView,
-    id: egui::Id,
+    // None while something (the picker) covers the dial: draw it, don't take input.
+    id: Option<egui::Id>,
 ) -> Option<f64> {
     let (t, u) = (ws.theme, m.u);
     let radius = 1.125 * u;
@@ -212,7 +217,7 @@ fn dial(
     );
 
     let hit = Rect::from_center_size(center, Vec2::splat(radius * 2.4));
-    let resp = ui.interact(hit, id, Sense::drag());
+    let resp = ui.interact(hit, id?, Sense::drag());
     if resp.dragged() {
         let dy = f64::from(-resp.drag_delta().y);
         // Full range over 200 points; hold shift for fine control.
@@ -221,7 +226,10 @@ fn dial(
         } else {
             1.0
         };
-        let v = (param.value + dy / 200.0 * span * fine).clamp(param.min, param.max);
+        // max() then min(), not clamp(): a bad range must not panic the UI.
+        let v = (param.value + dy / 200.0 * span * fine)
+            .max(param.min)
+            .min(param.max);
         return (v != param.value).then_some(v);
     }
     None
@@ -234,9 +242,9 @@ fn picker(
     m: &Metrics,
     rack: Rect,
     inputs: &Inputs<'_>,
-    track: usize,
-    out: &mut Vec<Request>,
-) {
+    // False on the frame it opens: the click that opened it must not close it.
+    was_open: bool,
+) -> Option<usize> {
     let (t, u) = (ws.theme, m.u);
     let p = ui.ctx().layer_painter(egui::LayerId::new(
         egui::Order::Foreground,
@@ -249,7 +257,8 @@ fn picker(
             (rack.height() - 2.0 * u).max(8.0 * u),
         ),
     );
-    let radius = egui::CornerRadius::same(8);
+    // 8pt at 1u = 16pt (0.5u), scaled like everything else.
+    let radius = egui::CornerRadius::same((0.5 * u).round().min(255.0) as u8);
     p.rect_filled(modal, radius, t.bg_panel);
     p.rect_stroke(modal, radius, m.hair(t.line_2), StrokeKind::Inside);
     p.text(
@@ -318,17 +327,16 @@ fn picker(
             chosen = Some(i);
         }
     }
-    let close = ui.input(|i| i.key_pressed(egui::Key::Escape))
-        || ui.input(|i| i.pointer.primary_clicked())
-            && ui
-                .input(|i| i.pointer.interact_pos())
-                .is_some_and(|p| !modal.contains(p));
+    let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
+    let outside = ui.input(|i| i.pointer.primary_clicked())
+        && ui
+            .input(|i| i.pointer.interact_pos())
+            .is_some_and(|p| !modal.contains(p));
+    let close = was_open && (escape || outside);
     ws.picker = if chosen.is_some() || close {
         None
     } else {
         Some(scroll)
     };
-    if let Some(choice) = chosen {
-        out.push(Request::AddDevice { track, choice });
-    }
+    chosen
 }

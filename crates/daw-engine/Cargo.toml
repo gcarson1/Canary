@@ -9,7 +9,7 @@ cpal = "0.18"
 daw-core = { path = "../daw-core" }
 daw-graph = { path = "../daw-graph" }
 rtrb = "0.4"
-rubato = "4"
+rubato = "5"
 symphonia = { version = "0.6", features = ["wav", "flac", "mp3", "aac", "isomp4"] }
 
 [dev-dependencies]

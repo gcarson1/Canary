@@ -137,36 +137,16 @@ pub fn resample(audio: &Arc<SampleData>, sample_rate: u32) -> Result<Arc<SampleD
     let frames = audio.frames();
     let wanted = (frames as u64 * u64::from(sample_rate)).div_ceil(u64::from(audio.sample_rate()));
 
-    // shortcut: rubato 4's process_all only trims its startup delay once its chunk
-    // loop runs, which needs more input than one FFT block; a shorter clip comes back
-    // as mostly delay. Padding short clips with silence past one block works around it.
-    let min_frames = resampler.input_frames_next() + 1;
-    let padded: Vec<Vec<f32>> = if frames < min_frames {
-        (0..channels)
-            .map(|ch| {
-                let mut plane = audio.channel(ch).to_vec();
-                plane.resize(min_frames, 0.0);
-                plane
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
-    let planes: Vec<&[f32]> = if padded.is_empty() {
-        (0..channels).map(|ch| audio.channel(ch)).collect()
-    } else {
-        padded.iter().map(Vec::as_slice).collect()
-    };
-    let in_frames = planes[0].len();
-    let input = SequentialSliceOfSlices::new(&planes, channels, in_frames)
+    let planes: Vec<&[f32]> = (0..channels).map(|ch| audio.channel(ch)).collect();
+    let input = SequentialSliceOfSlices::new(&planes, channels, frames)
         .map_err(|e| LoadError::Resample(e.into()))?;
 
-    let out_len = resampler.process_all_needed_output_len(in_frames);
+    let out_len = resampler.process_all_needed_output_len(frames);
     let mut out_channels = vec![vec![0.0; out_len]; channels];
     let mut output = SequentialSliceOfVecs::new_mut(&mut out_channels, channels, out_len)
         .map_err(|e| LoadError::Resample(e.into()))?;
     let (_, written) = resampler
-        .process_all_into_buffer(&input, &mut output, in_frames, None)
+        .process_all_into_buffer(&input, &mut output, frames, None)
         .map_err(|e| LoadError::Resample(e.into()))?;
     let len = written.min(wanted as usize);
     for channel in &mut out_channels {

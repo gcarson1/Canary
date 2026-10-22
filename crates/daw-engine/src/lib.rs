@@ -288,9 +288,9 @@ mod tests {
         let mut block = vec![9.0; 500 * 2]; // 500 frames: 7 full chunks of 64 plus 52
         audio.process(&mut block, 2);
 
-        for (frame, out) in block.chunks_exact(2).enumerate() {
+        for (frame, out) in block.as_chunks::<2>().0.iter().enumerate() {
             let want = if frame < 300 { 1.0 } else { 0.0 };
-            assert_eq!(out, [want, 0.0], "frame {frame}");
+            assert_eq!(*out, [want, 0.0], "frame {frame}");
         }
         assert_eq!(audio.transport().playhead(), 500);
     }

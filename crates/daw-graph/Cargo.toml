@@ -1,0 +1,9 @@
+[package]
+name = "daw-graph"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+daw-core = { path = "../daw-core" }
+daw-dsp = { path = "../daw-dsp" }

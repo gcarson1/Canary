@@ -1,0 +1,9 @@
+[package]
+name = "daw-ui"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+daw-core = { path = "../daw-core" }
+daw-project = { path = "../daw-project" }

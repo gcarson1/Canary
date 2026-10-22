@@ -1,0 +1,11 @@
+# Secrets: never commit
+.env
+.env.*
+*.key
+
+# Personal Claude Code files
+CLAUDE.local.md
+.claude/settings.local.json
+
+# Rust build output
+/target

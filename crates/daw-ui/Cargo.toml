@@ -6,4 +6,9 @@ publish.workspace = true
 
 [dependencies]
 daw-core = { path = "../daw-core" }
+daw-dsp = { path = "../daw-dsp" }
 daw-project = { path = "../daw-project" }
+egui = { version = "0.37", default-features = false }
+
+[dev-dependencies]
+egui_kittest = { version = "0.37", features = ["wgpu", "snapshot"] }

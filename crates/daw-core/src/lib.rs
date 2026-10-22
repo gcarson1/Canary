@@ -139,6 +139,29 @@ impl Clip {
         }
     }
 
+    /// Rebuilds a saved window. `None` unless it lies inside the audio with at
+    /// least one frame and the fades fit, the invariants every edit keeps.
+    pub fn with_window(
+        start_sample: u64,
+        audio: Arc<SampleData>,
+        offset: u64,
+        length: u64,
+        fade_in: u64,
+        fade_out: u64,
+    ) -> Option<Self> {
+        let fits = length >= 1
+            && offset.checked_add(length)? <= audio.frames() as u64
+            && fade_in.checked_add(fade_out)? <= length;
+        fits.then_some(Self {
+            start_sample,
+            audio,
+            offset,
+            length,
+            fade_in,
+            fade_out,
+        })
+    }
+
     pub fn audio(&self) -> &Arc<SampleData> {
         &self.audio
     }
@@ -405,6 +428,29 @@ mod tests {
         assert_eq!(
             (c.start_sample, c.offset_samples(), c.length_samples()),
             (0, 30, 70)
+        );
+    }
+
+    #[test]
+    fn with_window_rebuilds_only_valid_windows() {
+        let audio = ramp_clip(0).audio().clone();
+        let c = Clip::with_window(500, audio.clone(), 10, 80, 5, 5).unwrap();
+        assert_eq!((c.offset_samples(), c.end_sample()), (10, 580));
+        assert!(
+            Clip::with_window(0, audio.clone(), 50, 51, 0, 0).is_none(),
+            "past the audio"
+        );
+        assert!(
+            Clip::with_window(0, audio.clone(), 0, 0, 0, 0).is_none(),
+            "empty"
+        );
+        assert!(
+            Clip::with_window(0, audio.clone(), 0, 10, 6, 5).is_none(),
+            "fades"
+        );
+        assert!(
+            Clip::with_window(0, audio, u64::MAX, 2, 0, 0).is_none(),
+            "overflow"
         );
     }
 

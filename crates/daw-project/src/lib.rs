@@ -253,6 +253,8 @@ pub struct History {
     redo: Vec<Action>,
     /// Edits since the last save or load.
     dirty: bool,
+    /// Bumped by every change, so callers can tell when to rebuild from the project.
+    revision: u64,
 }
 
 impl History {
@@ -271,12 +273,17 @@ impl History {
         self.dirty
     }
 
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
     /// Applies an edit, makes it undoable and clears the redo stack.
     pub fn apply(&mut self, action: Action) -> Result<(), ActionError> {
         let inverse = action.apply(&mut self.project)?;
         self.undo.push(inverse);
         self.redo.clear();
         self.dirty = true;
+        self.revision += 1;
         Ok(())
     }
 
@@ -304,6 +311,7 @@ impl History {
             .expect("recorded inverse applies");
         to.push(inverse);
         self.dirty = true;
+        self.revision += 1;
         true
     }
 

@@ -79,10 +79,11 @@ To enforce strict boundaries at compile time (so a UI developer or contributor c
 | **`daw-core`** | Pure data types: `Sample`, `TimeSignature`, `MidiEvent`, `NodeId`, `ParameterId`, Command/Telemetry enums. | Zero heavy dependencies (`no_std` compatible if desired). |
 | **`daw-dsp`** | Pure signal processing primitives (biquad filters, envelopes, oscillators, delay lines, FFT). | `daw-core`, `realfft`, `dasp`. **Zero OS or UI dependencies.** |
 | **`daw-graph`** | The `AudioNode` trait, topological sorter, PDC calculator, and `ExecutionPlan` compiler. | `daw-core`, `daw-dsp`. |
-| **`daw-engine`** | Real-time thread coordinator, `cpal`/`coreaudio-rs` stream management, `rtrb` queues, disk streamer, and garbage collector. | `daw-core`, `daw-graph`, `rtrb`, `symphonia`. |
+| **`daw-engine`** | Real-time thread coordinator, `cpal`/`coreaudio-rs` stream management, `rtrb` queues, disk streamer, and garbage collector. | `daw-core`, `daw-dsp` (`.pek` waveform cache), `daw-graph`, `rtrb`, `symphonia`, `hound`, `midir`. |
 | **`daw-host`** | CLAP (`clack`), VST3, and AudioUnit wrappers that implement `AudioNode`. | `daw-core`, `daw-graph`, `clack`, `objc2`. |
-| **`daw-project`** | Undo/Redo command pattern (`Action` trait), serialization (`serde`), `.daw` project file bundles, and state management. | `daw-core`, `serde`. |
-| **`daw-ui`** | macOS windowing, timeline canvas, mixer views, and user input translation into `daw-project` actions. | `daw-core`, `daw-project`, UI framework (`vizia`/`gpui`). |
+| **`daw-project`** | Undo/Redo command pattern (`Action` trait), serialization (`serde`), `.daw` project file bundles, and state management. | `daw-core`, `serde`, `serde_json` (`.daw` files). |
+| **`daw-ui`** | macOS windowing, timeline canvas, mixer views, and user input translation into `daw-project` actions. | `daw-core`, `daw-dsp` (pure data only: `WaveformPyramid`/`MinMax`), `daw-project`, `egui` (custom-painted). |
+| **`canary`** | The `eframe` app binary: wires `daw-ui`, `daw-engine` and `daw-project`; builds engine plans from the project, loads audio on worker threads, records takes, saves. | `daw-core`, `daw-dsp`, `daw-graph`, `daw-engine`, `daw-project`, `daw-ui`, `eframe`, `egui`, `cpal`. |
 
 ### Why this workspace structure pays off
 

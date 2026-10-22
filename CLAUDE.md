@@ -21,6 +21,9 @@ Phases and progress live in ROADMAP.md: tick its checkboxes as work lands. The s
 - Build: `cargo build --workspace` (crates live in `crates/`)
 - Test: `cargo test --workspace` (single crate: `cargo test -p <crate>`)
 - Lint/format: `cargo clippy --workspace -- -D warnings` and `cargo fmt --all`
+- Run the app: `cargo run --release -p canary -- [project.daw] [--samples DIR]` (samples default to `~/Music/Canary`)
+- Signed app bundle: `scripts/bundle.sh` (optional `SIGN_IDENTITY="Developer ID Application: …"`)
+- `cargo test -p daw-ui` runs the Styles.md QA protocol and writes renders to `target/qa/`
 
 ## Conventions
 - Crate boundaries in `ARCHITECTURE.md` section 5 are hard rules: `daw-dsp` has no OS or UI dependencies, and nothing below `daw-ui` depends on a UI framework.

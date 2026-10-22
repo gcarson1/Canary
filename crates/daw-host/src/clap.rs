@@ -481,6 +481,14 @@ mod tests {
     #[global_allocator]
     static ALLOCATOR: AllocDisabler = AllocDisabler;
 
+    /// Held by every test that makes plugins, so the live-instance count one test
+    /// checks is not moved by another running in parallel.
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn entry() -> PluginEntry {
         PluginEntry::load_from_clack::<SinglePluginEntry<TestGain>>(c"/test/gain.clap").unwrap()
     }
@@ -511,6 +519,7 @@ mod tests {
 
     #[test]
     fn lists_binds_and_reports_latency() {
+        let _serial = serial();
         let entry = entry();
         assert_eq!(plugins(&entry)[0].id, test_plugin::ID);
         assert!(matches!(
@@ -540,6 +549,7 @@ mod tests {
 
     #[test]
     fn params_and_notes_reach_the_plugin_without_allocating() {
+        let _serial = serial();
         let entry = entry();
         let (mut plugin, mut node) =
             ClapPlugin::new(&entry, test_plugin::ID, 48_000.0, 64).unwrap();
@@ -566,6 +576,7 @@ mod tests {
 
     #[test]
     fn block_longer_than_activation_is_silence_not_a_panic() {
+        let _serial = serial();
         let entry = entry();
         let (_plugin, mut node) = ClapPlugin::new(&entry, test_plugin::ID, 48_000.0, 4).unwrap();
         assert_eq!(run(&mut node, &[]), [0.0; 8]); // 8 frames, activated for 4
@@ -573,6 +584,7 @@ mod tests {
 
     #[test]
     fn state_round_trips_and_plugin_is_destroyed_after_its_node() {
+        let _serial = serial();
         let entry = entry();
         let before = test_plugin::LIVE.load(Ordering::SeqCst);
         let (mut plugin, mut node) =

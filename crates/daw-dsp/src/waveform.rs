@@ -109,9 +109,13 @@ impl WaveformPyramid {
         {
             return None;
         }
-        let mut pairs = bytes[16..].chunks_exact(8).map(|p| MinMax {
-            min: f32::from_le_bytes(p[..4].try_into().unwrap()),
-            max: f32::from_le_bytes(p[4..].try_into().unwrap()),
+        let (whole, rest) = bytes[16..].as_chunks::<8>();
+        if !rest.is_empty() {
+            return None;
+        }
+        let mut pairs = whole.iter().map(|p| MinMax {
+            min: f32::from_le_bytes([p[0], p[1], p[2], p[3]]),
+            max: f32::from_le_bytes([p[4], p[5], p[6], p[7]]),
         });
         let mut bins_at = frames;
         let mut levels = Vec::with_capacity(LEVELS.len());
@@ -130,7 +134,7 @@ impl WaveformPyramid {
             }
             levels.push(level);
         }
-        if pairs.next().is_some() || (bytes.len() - 16) % 8 != 0 {
+        if pairs.next().is_some() {
             return None;
         }
         Some(Self { audio, levels })

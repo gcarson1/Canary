@@ -300,6 +300,7 @@ dependencies = [
  "assert_no_alloc",
  "cpal",
  "daw-core",
+ "daw-dsp",
  "daw-graph",
  "hound",
  "midir",

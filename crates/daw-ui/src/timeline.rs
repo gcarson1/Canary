@@ -70,6 +70,10 @@ fn grid(snap: Snap, bpm: f64, sample_rate: u32) -> Option<f64> {
 }
 
 impl View {
+    pub(crate) fn is_dragging(&self) -> bool {
+        self.drag.is_some()
+    }
+
     fn x_of(&self, lanes: Rect, sample: f64) -> f32 {
         lanes.min.x + ((sample - self.start) / self.zoom) as f32
     }

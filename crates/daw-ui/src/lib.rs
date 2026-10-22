@@ -88,6 +88,14 @@ enum Edit {
     Redo,
 }
 
+/// One line of app status in the top bar, such as a failed save.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Status {
+    pub text: String,
+    /// Shown in `bad` red; otherwise muted.
+    pub error: bool,
+}
+
 /// UI state that is not part of the project: view, tools, selection, drags.
 pub struct Workspace {
     pub theme: Theme,
@@ -95,6 +103,7 @@ pub struct Workspace {
     pub snap: Snap,
     pub selected_track: Option<usize>,
     pub selected_clip: Option<(usize, usize)>,
+    pub status: Option<Status>,
     timeline: timeline::View,
     /// Tempo while its readout is being dragged; applied on release.
     tempo_drag: Option<f64>,
@@ -111,6 +120,7 @@ impl Default for Workspace {
             snap: Snap::Sixteenth,
             selected_track: None,
             selected_clip: None,
+            status: None,
             timeline: timeline::View::default(),
             tempo_drag: None,
             clip_latch: [false; 2],
@@ -254,6 +264,11 @@ impl Workspace {
         out
     }
 
+    /// True while a clip is being dragged; the app holds back its own edits then.
+    pub fn is_dragging(&self) -> bool {
+        self.timeline.is_dragging()
+    }
+
     /// Queues a project edit for the end of the frame.
     fn edit(&mut self, action: Action) {
         self.edits.push(Edit::Apply(action));
@@ -264,6 +279,9 @@ impl Workspace {
         if ui.ctx().text_edit_focused() {
             return;
         }
+        // Space on a focused button presses that button; it must not also toggle
+        // the transport.
+        let button_focused = ui.ctx().memory(|mem| mem.focused().is_some());
         let (space, undo, redo, delete) = ui.input(|i| {
             let cmd = i.modifiers.command;
             // Space and Delete act once per press: a held key must not toggle the
@@ -274,7 +292,7 @@ impl Workspace {
                 })
             };
             (
-                fresh(Key::Space),
+                !button_focused && fresh(Key::Space),
                 cmd && !i.modifiers.shift && i.key_pressed(Key::Z),
                 cmd && i.modifiers.shift && i.key_pressed(Key::Z),
                 fresh(Key::Delete) || fresh(Key::Backspace),
@@ -475,13 +493,23 @@ impl Workspace {
         } else {
             p.rect_stroke(dirty, 0.0, m.hair(t.line_2), StrokeKind::Inside);
         }
-        p.text(
+        let rate = p.text(
             Pos2::new(dirty.min.x - 0.75 * u, cy),
             Align2::RIGHT_CENTER,
             format!("{:.1} kHz", engine.sample_rate as f32 / 1000.0),
             m.mono(0.75),
             t.muted,
         );
+        if let Some(status) = &self.status {
+            let color = if status.error { t.bad } else { t.muted };
+            p.text(
+                Pos2::new(rate.min.x - 1.5 * u, cy),
+                Align2::RIGHT_CENTER,
+                &status.text,
+                m.mono(0.6875),
+                color,
+            );
+        }
     }
 
     fn browser(

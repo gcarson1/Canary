@@ -16,17 +16,16 @@ use daw_dsp::WaveformPyramid;
 use daw_engine::{EngineHandle, Recorder};
 use daw_graph::{ExecutionPlan, GainNode, Source, TrackNode, MAX_NODES};
 use daw_project::{Action, ClipRef, History, Track};
-use daw_ui::{theme, EngineView, Inputs, Request, Workspace};
+use daw_ui::{theme, EngineView, Inputs, Request, Status, Workspace};
 
 /// Frames per plan buffer; larger device callbacks render in chunks.
 const MAX_BLOCK: usize = 4096;
 const AUDIO_EXTENSIONS: [&str; 7] = ["wav", "flac", "mp3", "m4a", "aac", "aif", "aiff"];
 
-/// A finished background load, and where to put the clip if anywhere.
+/// A finished background load.
 struct Loaded {
     path: PathBuf,
     result: Result<(Arc<SampleData>, WaveformPyramid), String>,
-    place: Option<(Option<usize>, u64)>,
 }
 
 struct App {
@@ -40,13 +39,22 @@ struct App {
     view: EngineView,
     audio: HashMap<PathBuf, Arc<SampleData>>,
     waveforms: HashMap<PathBuf, WaveformPyramid>,
-    loading: Vec<PathBuf>,
+    /// Files being loaded, with the placements waiting on each.
+    pending: HashMap<PathBuf, Vec<(Option<usize>, u64)>>,
     loads_tx: mpsc::Sender<Loaded>,
     loads_rx: mpsc::Receiver<Loaded>,
     /// Project revision the live plan was built from.
     built: Option<u64>,
     live: Vec<NodeId>,
+    /// One per track, kept across rebuilds so mixer changes glide instead of
+    /// rebuilding nodes; `solo` is their shared solo count.
+    params: Vec<Arc<TrackParams>>,
+    solo: Arc<AtomicUsize>,
+    /// Each track's clips as of the live plan.
+    built_clips: Vec<Vec<ClipRef>>,
+    /// Open only while a take records, so the microphone is not held between takes.
     recorder: Option<(Recorder, cpal::Stream)>,
+    title: String,
 }
 
 fn home() -> PathBuf {
@@ -89,10 +97,17 @@ impl App {
         } else {
             History::default()
         };
-        if history.project().tracks.is_empty()
-            && history.project().sample_rate != config.sample_rate
-        {
-            // shortcut: positions in a non-empty project at another rate are not converted yet
+        if history.project().sample_rate != config.sample_rate {
+            if !history.project().tracks.is_empty() {
+                // shortcut: converting positions between rates is not built yet; opening
+                // would mix rates in one file, so refuse instead.
+                return Err(format!(
+                    "{} is at {} Hz but the audio device runs at {} Hz; switch the device rate to open it",
+                    project_path.display(),
+                    history.project().sample_rate,
+                    config.sample_rate
+                ));
+            }
             history = History::new(daw_project::Project {
                 sample_rate: config.sample_rate,
                 ..history.project().clone()
@@ -113,12 +128,16 @@ impl App {
             },
             audio: HashMap::new(),
             waveforms: HashMap::new(),
-            loading: Vec::new(),
+            pending: HashMap::new(),
             loads_tx,
             loads_rx,
             built: None,
             live: Vec::new(),
+            params: Vec::new(),
+            solo: Arc::new(AtomicUsize::new(0)),
+            built_clips: Vec::new(),
             recorder: None,
+            title: String::new(),
         };
         let sources: Vec<PathBuf> = app
             .history
@@ -142,10 +161,12 @@ impl App {
             }
             return;
         }
-        if self.loading.contains(&path) && place.is_none() {
+        if let Some(waiting) = self.pending.get_mut(&path) {
+            waiting.extend(place);
             return;
         }
-        self.loading.push(path.clone());
+        self.pending
+            .insert(path.clone(), place.into_iter().collect());
         let (tx, rate) = (self.loads_tx.clone(), self.view.sample_rate);
         thread::spawn(move || {
             let result = daw_engine::load_audio(&path)
@@ -155,11 +176,7 @@ impl App {
                     (a, w)
                 })
                 .map_err(|e| e.to_string());
-            let _ = tx.send(Loaded {
-                path,
-                result,
-                place,
-            });
+            let _ = tx.send(Loaded { path, result });
         });
     }
 
@@ -203,24 +220,64 @@ impl App {
             }
         };
         if let Err(e) = self.history.apply(action) {
-            eprintln!("could not add {}: {e}", path.display());
+            self.error(format!("could not add {}: {e}", path.display()));
         }
     }
 
     fn receive_loads(&mut self) {
+        // Placing a clip mid-drag would cancel the drag; finished loads wait.
+        if self.ws.is_dragging() {
+            return;
+        }
         while let Ok(done) = self.loads_rx.try_recv() {
-            self.loading.retain(|p| p != &done.path);
+            let places = self.pending.remove(&done.path).unwrap_or_default();
             match done.result {
                 Ok((audio, waveform)) => {
                     self.audio.insert(done.path.clone(), audio);
                     self.waveforms.insert(done.path.clone(), waveform);
                     self.built = None; // clips waiting on this audio can now play
-                    if let Some((track, at)) = done.place {
+                    for (track, at) in places {
                         self.place(&done.path, track, at);
                     }
                 }
-                Err(e) => eprintln!("could not load {}: {e}", done.path.display()),
+                Err(e) => self.error(format!("could not load {}: {e}", done.path.display())),
             }
+        }
+    }
+
+    fn error(&mut self, text: String) {
+        eprintln!("{text}");
+        self.ws.status = Some(Status { text, error: true });
+    }
+
+    /// Brings the engine up to date with the project: mixer-only edits just set
+    /// the live params (smoothed, no click); anything else rebuilds the plan.
+    fn sync(&mut self) {
+        let revision = self.history.revision();
+        if self.built == Some(revision) {
+            return;
+        }
+        let tracks = &self.history.project().tracks;
+        let same_shape = self.built.is_some()
+            && tracks.len() == self.built_clips.len()
+            && tracks
+                .iter()
+                .zip(&self.built_clips)
+                .all(|(t, c)| &t.clips == c);
+        if same_shape {
+            self.set_params();
+            self.built = Some(revision);
+        } else {
+            self.rebuild();
+        }
+    }
+
+    fn set_params(&self) {
+        for (track, params) in self.history.project().tracks.iter().zip(&self.params) {
+            params.set_gain(track.gain);
+            params.set_pan(track.pan);
+            params.set_mute(track.mute);
+            params.set_solo(track.solo);
         }
     }
 
@@ -233,14 +290,16 @@ impl App {
         for &id in &self.live {
             plan.remove(id);
         }
-        let solo = Arc::new(AtomicUsize::new(0));
+        self.params.truncate(tracks.len());
+        while self.params.len() < tracks.len() {
+            self.params
+                .push(Arc::new(TrackParams::new(self.solo.clone())));
+        }
+        self.set_params();
+        let project = self.history.project();
+        let tracks = &project.tracks[..project.tracks.len().min(MAX_NODES - 1)];
         let mut steps = Vec::with_capacity(tracks.len());
         for (i, track) in tracks.iter().enumerate() {
-            let params = TrackParams::new(solo.clone());
-            params.set_gain(track.gain);
-            params.set_pan(track.pan);
-            params.set_mute(track.mute);
-            params.set_solo(track.solo);
             let clips = track
                 .clips
                 .iter()
@@ -250,7 +309,7 @@ impl App {
                 })
                 .collect();
             let id = NodeId(i as u32 + 1);
-            plan.insert(id, Box::new(TrackNode::new(clips, Arc::new(params))));
+            plan.insert(id, Box::new(TrackNode::new(clips, self.params[i].clone())));
             steps.push(plan.add(id, vec![], 2).expect("no inputs, two outputs"));
         }
         let master = NodeId(0);
@@ -261,11 +320,12 @@ impl App {
         match self.engine.send_plan(Box::new(plan)) {
             Ok(()) => {
                 self.live = (0..=tracks.len() as u32).map(NodeId).collect();
+                self.built_clips = tracks.iter().map(|t| t.clips.clone()).collect();
                 self.built = Some(self.history.revision());
             }
             // Queue full: try again next frame.
             Err(daw_engine::SendPlanError::QueueFull(_)) => {}
-            Err(e) => eprintln!("plan rejected: {e}"),
+            Err(e) => self.error(format!("plan rejected: {e}")),
         }
     }
 
@@ -313,7 +373,7 @@ impl App {
         if self.recorder.is_none() {
             match daw_engine::start_input(self.view.sample_rate, self.engine.playhead_clock()) {
                 Ok((recorder, stream, _)) => self.recorder = Some((recorder, stream)),
-                Err(e) => return eprintln!("cannot record: {e}"),
+                Err(e) => return self.error(format!("cannot record: {e}")),
             }
         }
         let Some((recorder, _)) = self.recorder.as_mut() else {
@@ -326,11 +386,15 @@ impl App {
                     error,
                     take: Some(take),
                 }) => {
-                    eprintln!("take cut short: {error}");
+                    self.error(format!("take cut short: {error}"));
                     take
                 }
-                Err(e) => return eprintln!("recording failed: {e}"),
+                Err(e) => {
+                    self.recorder = None;
+                    return self.error(format!("recording failed: {e}"));
+                }
             };
+            self.recorder = None; // release the microphone between takes
             self.files = audio_files(&self.samples_dir);
             self.load(take.path, Some((self.ws.selected_track, take.start_sample)));
         } else {
@@ -342,15 +406,28 @@ impl App {
                 Ok(()) => {
                     let _ = self.engine.commands.push(Command::Play);
                 }
-                Err(e) => eprintln!("cannot record: {e}"),
+                Err(e) => {
+                    self.recorder = None;
+                    self.error(format!("cannot record: {e}"));
+                }
             }
         }
     }
 
-    fn save(&mut self) {
+    /// Saves the project; true on success.
+    fn save(&mut self) -> bool {
         match self.history.save(&self.project_path) {
-            Ok(()) => {}
-            Err(e) => eprintln!("save failed: {e}"),
+            Ok(()) => {
+                self.ws.status = Some(Status {
+                    text: "SAVED".into(),
+                    error: false,
+                });
+                true
+            }
+            Err(e) => {
+                self.error(format!("SAVE FAILED: {e}"));
+                false
+            }
         }
     }
 }
@@ -363,6 +440,11 @@ impl eframe::App for App {
         self.engine.collect_garbage();
         if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::S)) {
             self.save();
+        }
+        // Quitting saves edits; if that fails the window stays open with the error.
+        if ctx.input(|i| i.viewport().close_requested()) && self.history.is_dirty() && !self.save()
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
 
         let requests = self.ws.show(
@@ -377,9 +459,7 @@ impl eframe::App for App {
         for request in requests {
             self.handle(request);
         }
-        if self.built != Some(self.history.revision()) {
-            self.rebuild();
-        }
+        self.sync();
 
         let name = self
             .project_path
@@ -390,12 +470,15 @@ impl eframe::App for App {
         } else {
             ""
         };
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!(
-            "Canary · {name}{dirty}"
-        )));
+        // Every viewport command repaints, so send the title only when it changes.
+        let title = format!("Canary · {name}{dirty}");
+        if title != self.title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.title = title;
+        }
         // Meters and the playhead move every frame while audio runs; input events
         // repaint on their own, so a stopped app idles.
-        let busy = self.view.playing || self.view.recording || !self.loading.is_empty();
+        let busy = self.view.playing || self.view.recording || !self.pending.is_empty();
         ctx.request_repaint_after(Duration::from_millis(if busy { 16 } else { 250 }));
     }
 }

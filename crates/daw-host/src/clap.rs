@@ -33,6 +33,8 @@ pub enum HostError {
     /// More than one input or output port (a sidechain, say); not routed yet.
     ExtraPorts,
     State,
+    /// An Audio Unit call failed with this OSStatus.
+    Status(i32),
 }
 
 impl fmt::Display for HostError {
@@ -53,6 +55,7 @@ impl fmt::Display for HostError {
                 "plugins with more than one input or output port are not supported yet"
             ),
             Self::State => write!(f, "plugin could not save or load its state"),
+            Self::Status(s) => write!(f, "Audio Unit call failed (OSStatus {s})"),
         }
     }
 }

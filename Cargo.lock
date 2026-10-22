@@ -927,6 +927,9 @@ dependencies = [
  "daw-core",
  "daw-engine",
  "daw-graph",
+ "objc2-audio-toolbox",
+ "objc2-core-audio-types",
+ "objc2-core-foundation",
  "rtrb",
 ]
 

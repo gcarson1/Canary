@@ -46,7 +46,7 @@ The UI follows Styles.md whichever framework is chosen.
 
 ### Phase 2: Multi-Track Mixing and Clip Scheduling
 - [x] `Track` with a pre-allocated scratch buffer sized to the max block (for example 4096 frames). Per ARCHITECTURE.md, tracks become `AudioNode`s in the DAG, not a flat `Vec<Track>`. `TrackNode` runs in an `ExecutionPlan` that owns every buffer; plans swap through an `rtrb` queue and retire to a garbage queue.
-- [x] Load samples with `symphonia` into `Arc<SampleData>` (planar `f32`) on the main thread and send `Arc` clones over the queue (inside the plan). Resampling to the device rate is not done yet.
+- [x] Load samples with `symphonia` into `Arc<SampleData>` (planar `f32`) on the main thread and send `Arc` clones over the queue (inside the plan). `resample` converts it to the device rate with `rubato` (FFT, band-limited).
 - [x] Schedule clips by comparing `start_sample`/`end_sample` against the block's sample range
 - [x] Lock-free / smoothed parameters for Gain, Pan, Mute, Solo
 

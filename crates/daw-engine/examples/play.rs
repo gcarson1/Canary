@@ -17,12 +17,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some(path) = env::args().nth(1) {
         let audio = daw_engine::load_audio(Path::new(&path))?;
-        if audio.sample_rate() != config.sample_rate {
-            println!(
-                "file is {} Hz; it plays at the wrong pitch until resampling lands",
-                audio.sample_rate()
-            );
-        }
+        let audio = daw_engine::resample(&audio, config.sample_rate)?;
         let params = Arc::new(TrackParams::new(Arc::default()));
         let (track, master) = (NodeId(0), NodeId(1));
         let mut plan = ExecutionPlan::new(MAX_BLOCK);

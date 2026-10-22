@@ -4,6 +4,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use daw_core::SampleData;
+use rubato::audioadapter_buffers::direct::{SequentialSliceOfSlices, SequentialSliceOfVecs};
+use rubato::{Fft, FixedSync, Resampler};
 use symphonia::core::codecs::audio::AudioDecoderOptions;
 use symphonia::core::errors::Error;
 use symphonia::core::formats::probe::Hint;
@@ -18,6 +20,7 @@ pub enum LoadError {
     NoAudioTrack,
     /// The file decoded to no audio frames.
     Empty,
+    Resample(Box<dyn std::error::Error + Send + Sync>),
 }
 
 impl fmt::Display for LoadError {
@@ -27,6 +30,7 @@ impl fmt::Display for LoadError {
             Self::Decode(e) => write!(f, "cannot decode audio file: {e}"),
             Self::NoAudioTrack => write!(f, "file has no decodable audio track"),
             Self::Empty => write!(f, "file contains no audio"),
+            Self::Resample(e) => write!(f, "cannot resample audio: {e}"),
         }
     }
 }
@@ -92,7 +96,10 @@ pub fn load_audio(path: &Path) -> Result<Arc<SampleData>, LoadError> {
         frames += decoded.frames();
         for (ch, channel) in channels.iter_mut().enumerate() {
             match packet_planes.get(ch) {
-                Some(plane) => channel.extend_from_slice(plane),
+                // A corrupt float file can hold NaN or infinity; play it as silence.
+                Some(plane) => {
+                    channel.extend(plane.iter().map(|&s| if s.is_finite() { s } else { 0.0 }))
+                }
                 None => channel.resize(frames, 0.0),
             }
         }
@@ -102,6 +109,70 @@ pub fn load_audio(path: &Path) -> Result<Arc<SampleData>, LoadError> {
         return Err(LoadError::Empty);
     }
     SampleData::new(sample_rate, channels)
+        .map(Arc::new)
+        .ok_or(LoadError::Empty)
+}
+
+/// FFT block size for `resample`; rubato rounds it to suit the rate pair.
+const RESAMPLE_CHUNK: usize = 1024;
+
+/// Converts `audio` to `sample_rate` with rubato's FFT resampler (band-limited, so
+/// downsampling does not alias). Returns the same `Arc` when the rate already
+/// matches. Blocking and allocating: call it off the audio thread, for example after
+/// `load_audio`, and again from the original if the device rate changes.
+pub fn resample(audio: &Arc<SampleData>, sample_rate: u32) -> Result<Arc<SampleData>, LoadError> {
+    if audio.sample_rate() == sample_rate {
+        return Ok(audio.clone());
+    }
+    let channels = audio.num_channels();
+    let mut resampler = Fft::<f32>::new(
+        audio.sample_rate() as usize,
+        sample_rate as usize,
+        RESAMPLE_CHUNK,
+        channels,
+        FixedSync::Both,
+    )
+    .map_err(|e| LoadError::Resample(e.into()))?;
+
+    let frames = audio.frames();
+    let wanted = (frames as u64 * u64::from(sample_rate)).div_ceil(u64::from(audio.sample_rate()));
+
+    // shortcut: rubato 4's process_all only trims its startup delay once its chunk
+    // loop runs, which needs more input than one FFT block; a shorter clip comes back
+    // as mostly delay. Padding short clips with silence past one block works around it.
+    let min_frames = resampler.input_frames_next() + 1;
+    let padded: Vec<Vec<f32>> = if frames < min_frames {
+        (0..channels)
+            .map(|ch| {
+                let mut plane = audio.channel(ch).to_vec();
+                plane.resize(min_frames, 0.0);
+                plane
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let planes: Vec<&[f32]> = if padded.is_empty() {
+        (0..channels).map(|ch| audio.channel(ch)).collect()
+    } else {
+        padded.iter().map(Vec::as_slice).collect()
+    };
+    let in_frames = planes[0].len();
+    let input = SequentialSliceOfSlices::new(&planes, channels, in_frames)
+        .map_err(|e| LoadError::Resample(e.into()))?;
+
+    let out_len = resampler.process_all_needed_output_len(in_frames);
+    let mut out_channels = vec![vec![0.0; out_len]; channels];
+    let mut output = SequentialSliceOfVecs::new_mut(&mut out_channels, channels, out_len)
+        .map_err(|e| LoadError::Resample(e.into()))?;
+    let (_, written) = resampler
+        .process_all_into_buffer(&input, &mut output, in_frames, None)
+        .map_err(|e| LoadError::Resample(e.into()))?;
+    let len = written.min(wanted as usize);
+    for channel in &mut out_channels {
+        channel.truncate(len); // into_boxed_slice in SampleData::new frees the slack
+    }
+    SampleData::new(sample_rate, out_channels)
         .map(Arc::new)
         .ok_or(LoadError::Empty)
 }
@@ -143,5 +214,64 @@ mod tests {
             load_audio(Path::new("/nonexistent/canary.wav")),
             Err(LoadError::Io(_))
         ));
+    }
+
+    #[test]
+    fn resample_converts_rate_and_keeps_pitch() {
+        // One second of a 1 kHz sine at 44.1 kHz becomes one second at 48 kHz.
+        let sine = |rate: f32, frames: usize| -> Vec<f32> {
+            (0..frames)
+                .map(|i| (2.0 * std::f32::consts::PI * 1_000.0 * i as f32 / rate).sin())
+                .collect()
+        };
+        let audio = Arc::new(SampleData::new(44_100, vec![sine(44_100.0, 44_100); 2]).unwrap());
+
+        let out = resample(&audio, 48_000).unwrap();
+
+        assert_eq!(out.sample_rate(), 48_000);
+        assert_eq!(out.num_channels(), 2);
+        assert!(
+            (out.frames() as i64 - 48_000).abs() <= 1,
+            "{} frames",
+            out.frames()
+        );
+        // Same pitch: a 1 kHz sine crosses zero 2,000 times a second at any rate.
+        let mid = &out.channel(1)[1_000..47_000];
+        let crossings = mid
+            .windows(2)
+            .filter(|w| (w[0] < 0.0) != (w[1] < 0.0))
+            .count();
+        let expected = 2_000.0 * mid.len() as f32 / 48_000.0;
+        assert!(
+            (crossings as f32 - expected).abs() <= 2.0,
+            "{crossings} crossings"
+        );
+        // Same level.
+        let peak = mid.iter().fold(0.0f32, |p, s| p.max(s.abs()));
+        assert!((peak - 1.0).abs() < 0.02, "peak {peak}");
+    }
+
+    #[test]
+    fn resample_to_same_rate_is_a_no_op() {
+        let audio = Arc::new(SampleData::new(48_000, vec![vec![0.5; 16]]).unwrap());
+        assert!(Arc::ptr_eq(&resample(&audio, 48_000).unwrap(), &audio));
+    }
+
+    #[test]
+    fn resample_keeps_short_clips_in_time() {
+        // A drum-hit-length clip shorter than one FFT block: the impulse at frame
+        // 100 (44.1 kHz) must land near frame 109 at 48 kHz, not vanish into the
+        // resampler's startup delay.
+        let mut click = vec![0.0; 256];
+        click[100] = 1.0;
+        let audio = Arc::new(SampleData::new(44_100, vec![click]).unwrap());
+
+        let out = resample(&audio, 48_000).unwrap();
+
+        assert_eq!(out.frames(), 279); // ceil(256 * 48000 / 44100)
+        let peak = (0..out.frames())
+            .max_by(|&a, &b| out.channel(0)[a].abs().total_cmp(&out.channel(0)[b].abs()))
+            .unwrap();
+        assert!((107..=111).contains(&peak), "impulse moved to frame {peak}");
     }
 }

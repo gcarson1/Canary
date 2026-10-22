@@ -4,7 +4,7 @@ mod load;
 mod output;
 mod transport;
 
-pub use load::{load_audio, LoadError};
+pub use load::{load_audio, resample, LoadError};
 pub use output::{start_output, OutputError};
 pub use transport::Transport;
 

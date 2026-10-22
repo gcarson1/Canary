@@ -98,6 +98,8 @@ pub enum Action {
         index: usize,
         clip: ClipRef,
     },
+    /// Several edits that undo as one step (a split, say). All or nothing.
+    Batch(Vec<Action>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -127,6 +129,8 @@ pub enum ActionError {
     OutOfRange,
     /// A tempo that is not finite and positive.
     BadTempo,
+    /// A gain or pan that is not finite, which a project file cannot store.
+    BadValue,
 }
 
 impl fmt::Display for ActionError {
@@ -134,6 +138,7 @@ impl fmt::Display for ActionError {
         match self {
             Self::OutOfRange => write!(f, "no such track or clip"),
             Self::BadTempo => write!(f, "tempo must be a positive number"),
+            Self::BadValue => write!(f, "gain and pan must be finite numbers"),
         }
     }
 }
@@ -172,6 +177,9 @@ impl Action {
                 }
             }
             SetTrackProps { index, props } => {
+                if !(props.gain.is_finite() && props.pan.is_finite()) {
+                    return Err(ActionError::BadValue);
+                }
                 let t = track(p, index)?;
                 let old = TrackProps::of(t);
                 (t.name, t.gain, t.pan, t.mute, t.solo) =
@@ -215,6 +223,23 @@ impl Action {
                     index,
                     clip: std::mem::replace(slot, clip),
                 }
+            }
+            Batch(actions) => {
+                let mut inverses = Vec::with_capacity(actions.len());
+                for action in actions {
+                    match action.apply(p) {
+                        Ok(inverse) => inverses.push(inverse),
+                        Err(e) => {
+                            // Roll back what applied, so a failed batch changes nothing.
+                            for inverse in inverses.into_iter().rev() {
+                                inverse.apply(p).expect("fresh inverse applies");
+                            }
+                            return Err(e);
+                        }
+                    }
+                }
+                inverses.reverse();
+                Batch(inverses)
             }
         })
     }
@@ -289,7 +314,11 @@ impl History {
             project: self.project.clone(),
         };
         let json = serde_json::to_vec_pretty(&file).map_err(ProjectError::Format)?;
-        fs::write(path, json).map_err(ProjectError::Io)?;
+        // Write then rename, so a crash or full disk never leaves a broken project.
+        let tmp = path.with_extension("daw.tmp");
+        fs::write(&tmp, json)
+            .and_then(|()| fs::rename(&tmp, path))
+            .map_err(ProjectError::Io)?;
         self.dirty = false;
         Ok(())
     }
@@ -300,6 +329,14 @@ impl History {
         let file: ProjectFile = serde_json::from_slice(&bytes).map_err(ProjectError::Format)?;
         if file.version != FORMAT_VERSION {
             return Err(ProjectError::Version(file.version));
+        }
+        let p = &file.project;
+        let finite = p
+            .tracks
+            .iter()
+            .all(|t| t.gain.is_finite() && t.pan.is_finite());
+        if !(p.bpm.is_finite() && p.bpm > 0.0) || p.sample_rate == 0 || !finite {
+            return Err(ProjectError::Invalid);
         }
         Ok(Self::new(file.project))
     }
@@ -317,6 +354,8 @@ pub enum ProjectError {
     Format(serde_json::Error),
     /// Written by a newer or older, incompatible Canary.
     Version(u32),
+    /// Parses, but holds a tempo, sample rate, gain or pan no project can have.
+    Invalid,
 }
 
 impl fmt::Display for ProjectError {
@@ -325,6 +364,7 @@ impl fmt::Display for ProjectError {
             Self::Io(e) => write!(f, "cannot read or write the project: {e}"),
             Self::Format(e) => write!(f, "not a valid project file: {e}"),
             Self::Version(v) => write!(f, "project format {v} is not supported"),
+            Self::Invalid => write!(f, "project file holds invalid values"),
         }
     }
 }
@@ -384,13 +424,25 @@ mod tests {
                 clip: clip(960),
             },
             Action::RemoveClip { track: 1, index: 0 },
+            Action::Batch(vec![
+                Action::SetClip {
+                    track: 1,
+                    index: 0,
+                    clip: clip(900),
+                },
+                Action::InsertClip {
+                    track: 1,
+                    index: 1,
+                    clip: clip(1_000),
+                },
+            ]),
             Action::RemoveTrack { index: 0 },
         ] {
             h.apply(action).unwrap();
             snapshots.push(h.project().clone());
         }
         assert_eq!(h.project().tracks[0].name, "Bass");
-        assert_eq!(h.project().tracks[0].clips, [clip(960)]);
+        assert_eq!(h.project().tracks[0].clips, [clip(900), clip(1_000)]);
 
         for want in snapshots.iter().rev().skip(1) {
             assert!(h.undo());
@@ -407,7 +459,6 @@ mod tests {
     #[test]
     fn bad_actions_change_nothing_and_new_edits_clear_redo() {
         let mut h = History::default();
-        let before = h.project().clone();
         for bad in [
             Action::SetTempo(0.0),
             Action::SetTempo(f64::NAN),
@@ -429,8 +480,26 @@ mod tests {
         ] {
             assert!(h.apply(bad).is_err());
         }
+        assert!(h.project() == &Project::default() && !h.is_dirty());
+        h.apply(Action::InsertTrack {
+            index: 0,
+            track: Track::new("x"),
+        })
+        .unwrap();
+        let before = h.project().clone();
+        let mut props = TrackProps::of(&before.tracks[0]);
+        props.gain = f32::NAN;
+        assert_eq!(
+            h.apply(Action::SetTrackProps { index: 0, props }),
+            Err(ActionError::BadValue)
+        );
+        let half_bad = Action::Batch(vec![
+            Action::SetTempo(77.0),
+            Action::RemoveTrack { index: 5 },
+        ]);
+        assert_eq!(h.apply(half_bad), Err(ActionError::OutOfRange));
         assert_eq!(h.project(), &before);
-        assert!(!h.is_dirty() && !h.undo());
+        assert!(h.undo() && !h.undo());
 
         h.apply(Action::SetTempo(90.0)).unwrap();
         h.undo();
@@ -469,6 +538,12 @@ mod tests {
             History::load(&path),
             Err(ProjectError::Version(99))
         ));
+        let text = fs::read_to_string(&path).unwrap();
+        let zero_tempo = text
+            .replace("\"version\": 99", "\"version\": 1")
+            .replace("\"bpm\": 120.0", "\"bpm\": 0.0");
+        fs::write(&path, zero_tempo).unwrap();
+        assert!(matches!(History::load(&path), Err(ProjectError::Invalid)));
         fs::write(&path, "{").unwrap();
         assert!(matches!(History::load(&path), Err(ProjectError::Format(_))));
         fs::remove_dir_all(&dir).unwrap();

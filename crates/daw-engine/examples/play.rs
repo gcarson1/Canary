@@ -42,9 +42,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         handle.collect_garbage();
         let mut last = None;
         while let Ok(t) = handle.telemetry.pop() {
-            last = Some(t);
+            if let Telemetry::Playhead { sample, playing } = t {
+                last = Some((sample, playing));
+            }
         }
-        if let Some(Telemetry::Playhead { sample, playing }) = last {
+        if let Some((sample, playing)) = last {
             println!("playhead {sample} samples, playing {playing}");
         }
     }

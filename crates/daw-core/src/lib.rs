@@ -54,7 +54,8 @@ pub enum Command {
     SetTimeSignature(TimeSignature),
 }
 
-/// Audio thread → main thread. Sent once per block; dropped if the queue is full.
+/// Audio thread → main thread. Each variant is sent once per block; dropped if the
+/// queue is full.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Telemetry {
     Playhead {

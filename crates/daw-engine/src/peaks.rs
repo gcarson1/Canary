@@ -30,6 +30,8 @@ pub fn cached_waveform(source: &Path, audio: Arc<SampleData>, cache_dir: &Path) 
     pyramid
 }
 
+// shortcut: stale .pek files (edited sources, or a new DefaultHasher after a Rust
+// update) are never deleted; prune old files once the app owns the cache dir.
 fn cache_file(source: &Path, audio: &SampleData, cache_dir: &Path) -> Option<PathBuf> {
     let meta = fs::metadata(source).ok()?;
     let mut h = DefaultHasher::new();

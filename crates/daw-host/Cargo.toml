@@ -5,5 +5,15 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+clack-extensions = { version = "0.2", features = ["clack-host", "audio-ports", "latency", "params", "state"] }
+clack-host = "0.2"
 daw-core = { path = "../daw-core" }
 daw-graph = { path = "../daw-graph" }
+rtrb = "0.4"
+
+[dev-dependencies]
+assert_no_alloc = "1.1"
+daw-engine = { path = "../daw-engine" }
+clack-extensions = { version = "0.2", features = ["clack-host", "clack-plugin", "audio-ports", "latency", "params", "state"] }
+clack-host = { version = "0.2", features = ["clack-plugin"] }
+clack-plugin = "0.2"

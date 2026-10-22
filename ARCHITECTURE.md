@@ -49,6 +49,7 @@ Third-party AU and VST3/CLAP plugins are the #1 cause of DAW crashes. Furthermor
 
 * **The Modular Solution:** Design `PluginNode` so it can operate either **In-Process** (direct function pointer call) or **Out-of-Process** (via macOS XPC / POSIX shared memory `shm_open` + Mach semaphores).
 * **Future Growth:** By abstracting plugin hosting behind the `AudioNode` trait now, you can start by running plugins in-process and later move them into separate worker processes (like Bitwig's sandboxing) without touching a single line of the core Audio Engine or UI code. If a buggy synth segfaults, only the child process dies, and the DAW stays open.
+* **In-Process Split (CLAP, `daw-host`):** `ClapPlugin` is not `Send` and stays on the Main Thread (params, state, callbacks). Its `PluginNode` runs in the arena and gets pre-zeroed buffers. The node is dropped on the Main Thread through garbage collection, so it must be removed from the graph and collected before its `ClapPlugin` is dropped, or the plugin leaks.
 
 ---
 

@@ -9,3 +9,6 @@ CLAUDE.local.md
 
 # Rust build output
 /target
+
+# Recorded takes from the examples
+*.wav

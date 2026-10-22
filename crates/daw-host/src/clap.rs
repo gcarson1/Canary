@@ -1,0 +1,594 @@
+use std::ffi::{CStr, CString};
+use std::fmt;
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use clack_extensions::audio_ports::{AudioPortInfoBuffer, PluginAudioPorts};
+use clack_extensions::latency::PluginLatency;
+use clack_extensions::params::{ParamInfoBuffer, PluginParams};
+use clack_extensions::state::PluginState;
+use clack_host::entry::PluginEntryError;
+use clack_host::events::event_types::{
+    MidiEvent as ClapMidi, NoteOffEvent, NoteOnEvent, ParamValueEvent,
+};
+use clack_host::events::Match;
+use clack_host::prelude::*;
+use daw_core::{MidiEvent, ProcessContext};
+use daw_graph::{AudioNode, MAX_CHANNELS};
+use rtrb::{Consumer, Producer, RingBuffer};
+
+/// Parameter changes waiting for the audio thread.
+const PARAM_QUEUE_CAPACITY: usize = 256;
+/// Events one block can carry to the plugin: a full MIDI block plus a full param queue.
+const EVENT_CAPACITY: usize = 1024 + PARAM_QUEUE_CAPACITY;
+
+#[derive(Debug)]
+pub enum HostError {
+    Load(PluginEntryError),
+    NoFactory,
+    UnknownPlugin(String),
+    Instance(PluginInstanceError),
+    /// More audio channels on one port than a node can carry.
+    TooManyChannels(u32),
+    /// More than one input or output port (a sidechain, say); not routed yet.
+    ExtraPorts,
+    State,
+}
+
+impl fmt::Display for HostError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Load(e) => write!(f, "could not load the plugin bundle: {e}"),
+            Self::NoFactory => write!(f, "the bundle has no plugin factory"),
+            Self::UnknownPlugin(id) => write!(f, "no plugin with id {id} in the bundle"),
+            Self::Instance(e) => write!(f, "plugin failed: {e}"),
+            Self::TooManyChannels(n) => {
+                write!(
+                    f,
+                    "plugin port has {n} channels, the limit is {MAX_CHANNELS}"
+                )
+            }
+            Self::ExtraPorts => write!(
+                f,
+                "plugins with more than one input or output port are not supported yet"
+            ),
+            Self::State => write!(f, "plugin could not save or load its state"),
+        }
+    }
+}
+
+impl std::error::Error for HostError {}
+
+impl From<PluginInstanceError> for HostError {
+    fn from(e: PluginInstanceError) -> Self {
+        Self::Instance(e)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginInfo {
+    pub id: String,
+    pub name: String,
+    pub vendor: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParamInfo {
+    pub id: u32,
+    pub name: String,
+    pub min: f64,
+    pub max: f64,
+    pub default: f64,
+}
+
+/// Loads a `.clap` bundle. Unsafe because it runs the bundle's code in this process;
+/// only load plugins the user chose.
+///
+/// # Safety
+/// The bundle must be a compliant CLAP plugin.
+pub unsafe fn load_bundle(path: &Path) -> Result<PluginEntry, HostError> {
+    // SAFETY: upheld by the caller.
+    unsafe { PluginEntry::load(path) }.map_err(HostError::Load)
+}
+
+/// The plugins a bundle offers.
+pub fn plugins(entry: &PluginEntry) -> Vec<PluginInfo> {
+    let text = |s: Option<&CStr>| {
+        s.map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    };
+    entry
+        .get_plugin_factory()
+        .map(|f| {
+            f.plugin_descriptors()
+                .map(|d| PluginInfo {
+                    id: text(d.id()),
+                    name: text(d.name()),
+                    vendor: text(d.vendor()),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Host callbacks. Requests are flags the main thread acts on in `ClapPlugin::idle`.
+struct CanaryHost;
+
+#[derive(Default)]
+struct Requests {
+    callback: AtomicBool,
+}
+
+impl SharedHandler<'_> for Requests {
+    fn request_restart(&self) {} // shortcut: restarting (re-activation) is not wired yet
+    fn request_process(&self) {} // nodes always process, so nothing to wake
+    fn request_callback(&self) {
+        self.callback.store(true, Ordering::Release);
+    }
+}
+
+impl HostHandlers for CanaryHost {
+    type Shared<'a> = Requests;
+    type MainThread<'a> = ();
+    type AudioProcessor<'a> = ();
+}
+
+/// Main-thread side of one hosted CLAP plugin: parameters, state and callbacks.
+/// Not `Send`; it stays on the main thread while its `PluginNode` runs in the graph.
+///
+/// Remove the node from the graph and collect garbage before dropping this, so the
+/// plugin is deactivated and destroyed; dropped first, the plugin is leaked.
+pub struct ClapPlugin {
+    instance: PluginInstance<CanaryHost>,
+    params: Vec<ParamInfo>,
+    param_changes: Producer<(u32, f64)>,
+    latency: u32,
+}
+
+impl ClapPlugin {
+    /// Instantiates plugin `id` from `entry` and activates it for blocks of up to
+    /// `max_block` frames, returning the main-thread handle and the node to put in a
+    /// plan. Everything is allocated here, on the main thread.
+    pub fn new(
+        entry: &PluginEntry,
+        id: &str,
+        sample_rate: f32,
+        max_block: usize,
+    ) -> Result<(ClapPlugin, PluginNode), HostError> {
+        let factory = entry.get_plugin_factory().ok_or(HostError::NoFactory)?;
+        let unknown = || HostError::UnknownPlugin(id.to_owned());
+        let cid = CString::new(id).map_err(|_| unknown())?;
+        if !factory
+            .plugin_descriptors()
+            .any(|d| d.id() == Some(cid.as_c_str()))
+        {
+            return Err(unknown());
+        }
+        let host_info = HostInfo::new(
+            "Canary",
+            "Canary",
+            "https://github.com/gcarson1/Canary",
+            env!("CARGO_PKG_VERSION"),
+        )
+        .expect("host info has no NUL bytes");
+        let mut instance = PluginInstance::<CanaryHost>::new(
+            |_| Requests::default(),
+            |_| (),
+            entry,
+            &cid,
+            &host_info,
+        )?;
+
+        let (inputs, outputs) = {
+            let handle = instance.plugin_handle();
+            // Channels of the single port of each kind, or None for no port. The
+            // plugin must be handed exactly the ports it declared.
+            let channels = |is_input| -> Result<Option<u32>, HostError> {
+                let Some(ports) = handle.get_extension::<PluginAudioPorts>() else {
+                    return Ok(None);
+                };
+                match ports.count(&handle, is_input) {
+                    0 => return Ok(None),
+                    1 => {}
+                    _ => return Err(HostError::ExtraPorts),
+                }
+                let mut buffer = AudioPortInfoBuffer::new();
+                let n = ports
+                    .get(&handle, 0, is_input, &mut buffer)
+                    .map_or(0, |p| p.channel_count);
+                if n as usize > MAX_CHANNELS {
+                    return Err(HostError::TooManyChannels(n));
+                }
+                Ok(Some(n))
+            };
+            (channels(true)?, channels(false)?)
+        };
+
+        let max_frames = u32::try_from(max_block).unwrap_or(u32::MAX);
+        let config = PluginAudioConfiguration {
+            sample_rate: f64::from(sample_rate),
+            min_frames_count: 1,
+            max_frames_count: max_frames,
+        };
+        let processor = instance.activate(|_, _| (), config)?;
+
+        let (params, latency) = {
+            let handle = instance.plugin_handle();
+            let params = handle
+                .get_extension::<PluginParams>()
+                .map_or_else(Vec::new, |ext| {
+                    let mut buffer = ParamInfoBuffer::new();
+                    (0..ext.count(&handle))
+                        .filter_map(|i| {
+                            let p = ext.get_info(&handle, i, &mut buffer)?;
+                            Some(ParamInfo {
+                                id: p.id.get(),
+                                name: String::from_utf8_lossy(p.name).into_owned(),
+                                min: p.min_value,
+                                max: p.max_value,
+                                default: p.default_value,
+                            })
+                        })
+                        .collect()
+                });
+            let latency = handle
+                .get_extension::<PluginLatency>()
+                .map_or(0, |ext| ext.get(&handle));
+            (params, latency)
+        };
+
+        let (param_changes, param_rx) = RingBuffer::new(PARAM_QUEUE_CAPACITY);
+        let buffers = |n: Option<u32>| {
+            (0..n.unwrap_or(0))
+                .map(|_| vec![0.0; max_block].into_boxed_slice())
+                .collect()
+        };
+        let ports = |n: Option<u32>| AudioPorts::with_capacity(n.unwrap_or(0) as usize, 1);
+        let node = PluginNode {
+            processor: processor.into(),
+            input_ports: ports(inputs),
+            output_ports: ports(outputs),
+            has_input: inputs.is_some(),
+            has_output: outputs.is_some(),
+            inputs: buffers(inputs),
+            outputs: buffers(outputs),
+            max_block,
+            events: EventBuffer::with_capacity(EVENT_CAPACITY),
+            param_changes: param_rx,
+            steady_time: 0,
+            latency,
+        };
+        Ok((
+            ClapPlugin {
+                instance,
+                params,
+                param_changes,
+                latency,
+            },
+            node,
+        ))
+    }
+
+    pub fn params(&self) -> &[ParamInfo] {
+        &self.params
+    }
+
+    /// Delay the plugin adds, in samples, as reported at activation.
+    pub fn latency_samples(&self) -> u32 {
+        self.latency
+    }
+
+    /// The plugin's current value for a parameter.
+    pub fn param_value(&mut self, id: u32) -> Option<f64> {
+        let handle = self.instance.plugin_handle();
+        let ext = handle.get_extension::<PluginParams>()?;
+        ext.get_value(&handle, ClapId::new(id))
+    }
+
+    /// Sends a parameter change, clamped to its range, to the audio thread. Returns
+    /// false for an unknown id, a non-finite value or a full queue.
+    pub fn set_param(&mut self, id: u32, value: f64) -> bool {
+        let Some(p) = self.params.iter().find(|p| p.id == id) else {
+            return false;
+        };
+        value.is_finite()
+            && self
+                .param_changes
+                .push((id, value.clamp(p.min, p.max)))
+                .is_ok()
+    }
+
+    /// The plugin's opaque state, to store with the project.
+    pub fn save_state(&mut self) -> Result<Vec<u8>, HostError> {
+        let handle = self.instance.plugin_handle();
+        let ext = handle
+            .get_extension::<PluginState>()
+            .ok_or(HostError::State)?;
+        let mut bytes = Vec::new();
+        ext.save(&handle, &mut bytes)
+            .map_err(|_| HostError::State)?;
+        Ok(bytes)
+    }
+
+    /// Restores state from `save_state`. Plugins accept this while processing.
+    pub fn load_state(&mut self, mut bytes: &[u8]) -> Result<(), HostError> {
+        let handle = self.instance.plugin_handle();
+        let ext = handle
+            .get_extension::<PluginState>()
+            .ok_or(HostError::State)?;
+        ext.load(&handle, &mut bytes).map_err(|_| HostError::State)
+    }
+
+    /// Runs main-thread work the plugin asked for. Call it regularly, like
+    /// `EngineHandle::collect_garbage`.
+    pub fn idle(&mut self) {
+        let asked = self
+            .instance
+            .access_shared_handler(|r| r.callback.swap(false, Ordering::Acquire));
+        if asked {
+            self.instance.call_on_main_thread_callback();
+        }
+    }
+}
+
+/// Audio-thread side of a hosted CLAP plugin. Copies its inputs into the plugin's
+/// main input port, sends live MIDI (notes as CLAP note events, everything else as
+/// raw MIDI) and parameter changes, and copies the main output port to its outputs.
+/// A mono plugin output feeds every node output; other unmatched outputs are zeroed.
+pub struct PluginNode {
+    processor: PluginAudioProcessor<CanaryHost>,
+    input_ports: AudioPorts,
+    output_ports: AudioPorts,
+    has_input: bool,
+    has_output: bool,
+    inputs: Box<[Box<[f32]>]>,
+    outputs: Box<[Box<[f32]>]>,
+    /// The plugin was activated for blocks up to this long.
+    max_block: usize,
+    events: EventBuffer,
+    param_changes: Consumer<(u32, f64)>,
+    steady_time: u64,
+    latency: u32,
+}
+
+impl PluginNode {
+    fn fill_events(&mut self, midi: &[MidiEvent], frames: u32) {
+        let any = Pckn::match_all(); // global, not per-voice
+        self.events.clear();
+        // Parameter changes apply from the block start, before any note.
+        while self.events.len() < PARAM_QUEUE_CAPACITY as u32 {
+            let Ok((id, value)) = self.param_changes.pop() else {
+                break;
+            };
+            self.events
+                .push(&ParamValueEvent::new(0, ClapId::new(id), any, value));
+        }
+        for e in midi {
+            if self.events.len() as usize >= EVENT_CAPACITY {
+                break; // never grow the buffer on the audio thread
+            }
+            let time = e.sample_offset.min(frames.saturating_sub(1));
+            let [status, key, velocity] = e.data;
+            let channel = u16::from(status & 0x0F);
+            let note = Pckn::new(0u16, channel, u16::from(key), Match::All);
+            match status & 0xF0 {
+                0x90 if velocity > 0 => {
+                    self.events
+                        .push(&NoteOnEvent::new(time, note, f64::from(velocity) / 127.0))
+                }
+                0x80 | 0x90 => {
+                    self.events
+                        .push(&NoteOffEvent::new(time, note, f64::from(velocity) / 127.0))
+                }
+                _ => self.events.push(&ClapMidi::new(time, 0, e.data)),
+            }
+        }
+    }
+}
+
+impl AudioNode for PluginNode {
+    fn process(
+        &mut self,
+        inputs: &[&[f32]],
+        outputs: &mut [&mut [f32]],
+        midi_in: &[MidiEvent],
+        _midi_out: &mut Vec<MidiEvent>,
+        context: &ProcessContext,
+    ) {
+        let n = context.num_samples;
+        if n > self.max_block {
+            // Never hand the plugin more than it was activated for.
+            for output in outputs.iter_mut() {
+                output.fill(0.0);
+            }
+            return;
+        }
+        // Untrusted plugins get pre-zeroed inputs where nothing feeds them.
+        for (ch, buffer) in self.inputs.iter_mut().enumerate() {
+            match inputs.get(ch) {
+                Some(input) => buffer[..n].copy_from_slice(input),
+                None => buffer[..n].fill(0.0),
+            }
+        }
+        for buffer in self.outputs.iter_mut() {
+            buffer[..n].fill(0.0);
+        }
+        self.fill_events(midi_in, n as u32);
+
+        let ok = match self.processor.ensure_processing_started() {
+            Ok(processor) => {
+                let audio_in = self.input_ports.with_input_buffers(
+                    self.has_input.then_some(AudioPortBuffer {
+                        latency: 0,
+                        channels: AudioPortBufferType::f32_input_only(
+                            self.inputs
+                                .iter_mut()
+                                .map(|b| InputChannel::variable(&mut b[..n])),
+                        ),
+                    }),
+                );
+                let mut audio_out =
+                    self.output_ports
+                        .with_output_buffers(self.has_output.then_some(AudioPortBuffer {
+                            latency: 0,
+                            channels: AudioPortBufferType::f32_output_only(
+                                self.outputs.iter_mut().map(|b| &mut b[..n]),
+                            ),
+                        }));
+                processor
+                    .process(
+                        &audio_in,
+                        &mut audio_out,
+                        &self.events.as_input(),
+                        // Plugin output events are not used yet; void never allocates.
+                        &mut OutputEvents::void(),
+                        Some(self.steady_time),
+                        None,
+                    )
+                    .is_ok()
+            }
+            Err(_) => false,
+        };
+        self.steady_time += n as u64;
+
+        let last = self.outputs.len().checked_sub(1);
+        for (ch, output) in outputs.iter_mut().enumerate() {
+            match last {
+                Some(last) if ok && (ch <= last || last == 0) => {
+                    output.copy_from_slice(&self.outputs[ch.min(last)][..n]);
+                }
+                _ => output.fill(0.0),
+            }
+        }
+    }
+
+    fn latency_samples(&self) -> u32 {
+        self.latency
+    }
+
+    fn reset(&mut self) {
+        self.processor.reset();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_plugin::{self, TestGain, GAIN, LATENCY};
+    use assert_no_alloc::{assert_no_alloc, AllocDisabler};
+    use clack_plugin::prelude::SinglePluginEntry;
+
+    #[global_allocator]
+    static ALLOCATOR: AllocDisabler = AllocDisabler;
+
+    fn entry() -> PluginEntry {
+        PluginEntry::load_from_clack::<SinglePluginEntry<TestGain>>(c"/test/gain.clap").unwrap()
+    }
+
+    fn ctx(n: usize) -> ProcessContext {
+        ProcessContext {
+            sample_rate: 48_000.0,
+            num_samples: n,
+            playhead: 0,
+            playing: true,
+        }
+    }
+
+    /// One 8-frame block of ones through the node; returns the left output.
+    fn run(node: &mut PluginNode, midi: &[MidiEvent]) -> [f32; 8] {
+        let input = [1.0; 8];
+        let (mut l, mut r) = ([9.0; 8], [9.0; 8]);
+        node.process(
+            &[&input, &input],
+            &mut [&mut l, &mut r],
+            midi,
+            &mut Vec::new(),
+            &ctx(8),
+        );
+        assert_eq!(l, r);
+        l
+    }
+
+    #[test]
+    fn lists_binds_and_reports_latency() {
+        let entry = entry();
+        assert_eq!(plugins(&entry)[0].id, test_plugin::ID);
+        assert!(matches!(
+            ClapPlugin::new(&entry, "nope", 48_000.0, 64),
+            Err(HostError::UnknownPlugin(_))
+        ));
+        let (mut plugin, node) = ClapPlugin::new(&entry, test_plugin::ID, 48_000.0, 64).unwrap();
+        assert_eq!(
+            plugin.params(),
+            [ParamInfo {
+                id: GAIN,
+                name: "Gain".into(),
+                min: 0.0,
+                max: 4.0,
+                default: 1.0
+            }]
+        );
+        assert_eq!(
+            (plugin.latency_samples(), node.latency_samples()),
+            (LATENCY, LATENCY)
+        );
+        assert_eq!(plugin.param_value(GAIN), Some(1.0));
+        assert!(!plugin.set_param(99, 1.0), "unknown id");
+        assert!(!plugin.set_param(GAIN, f64::NAN));
+        drop(node);
+    }
+
+    #[test]
+    fn params_and_notes_reach_the_plugin_without_allocating() {
+        let entry = entry();
+        let (mut plugin, mut node) =
+            ClapPlugin::new(&entry, test_plugin::ID, 48_000.0, 64).unwrap();
+        let note_on = MidiEvent {
+            sample_offset: 5,
+            data: [0x90, 60, 100],
+        };
+        let note_off = MidiEvent {
+            sample_offset: 2,
+            data: [0x80, 60, 0],
+        };
+
+        assert_eq!(run(&mut node, &[]), [1.0; 8]); // starts processing
+        assert!(plugin.set_param(GAIN, 10.0)); // clamped to 4.0
+        let (with_note, after_off) = assert_no_alloc(|| {
+            let a = run(&mut node, &[note_on]);
+            (a, run(&mut node, &[note_off]))
+        });
+        assert_eq!(with_note, [4., 4., 4., 4., 4., 5., 5., 5.]);
+        assert_eq!(after_off, [5., 5., 4., 4., 4., 4., 4., 4.]);
+        assert_eq!(plugin.param_value(GAIN), Some(4.0));
+        drop(node);
+    }
+
+    #[test]
+    fn block_longer_than_activation_is_silence_not_a_panic() {
+        let entry = entry();
+        let (_plugin, mut node) = ClapPlugin::new(&entry, test_plugin::ID, 48_000.0, 4).unwrap();
+        assert_eq!(run(&mut node, &[]), [0.0; 8]); // 8 frames, activated for 4
+    }
+
+    #[test]
+    fn state_round_trips_and_plugin_is_destroyed_after_its_node() {
+        let entry = entry();
+        let before = test_plugin::LIVE.load(Ordering::SeqCst);
+        let (mut plugin, mut node) =
+            ClapPlugin::new(&entry, test_plugin::ID, 48_000.0, 64).unwrap();
+        let saved = plugin.save_state().unwrap();
+        plugin.set_param(GAIN, 3.0);
+        run(&mut node, &[]);
+        assert_eq!(plugin.param_value(GAIN), Some(3.0));
+        plugin.load_state(&saved).unwrap();
+        assert_eq!(plugin.param_value(GAIN), Some(1.0));
+        assert_eq!(run(&mut node, &[]), [1.0; 8]);
+        assert!(matches!(plugin.load_state(&[1, 2]), Err(HostError::State)));
+        plugin.idle();
+
+        drop(node); // as garbage collection would, on the main thread
+        drop(plugin);
+        assert_eq!(test_plugin::LIVE.load(Ordering::SeqCst), before);
+    }
+}

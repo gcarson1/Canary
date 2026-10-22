@@ -58,5 +58,13 @@ The UI follows Styles.md whichever framework is chosen.
 ### Phase 4: Recording, MIDI and Plugin Graph
 - [x] Recording: `start_input` opens a separate default input stream (`cpal`); `RecordInput::push` fills an SPSC ring of whole frames, and a per-take disk-writer thread (`Recorder`) drains it to a 32-bit float WAV (`hound`). Takes are placed by `EngineHandle::playhead_clock`. Still to come: a true duplex/aggregate device and input/output latency compensation of `Take::start_sample`
 - [x] `midir` capture: `connect_midi` stamps messages with a shared clock; the audio thread places them one block late at exact spacing (`MidiReceiver`), split across plan chunks, and delivers them to steps marked `ExecutionPlan::route_midi`. An instrument track is a `SynthNode` (built-in 16-voice sine) feeding a `TrackNode`'s inputs
-- [ ] Plugin hosting (`daw-host`), in-process first, per ARCHITECTURE.md section 2
+- [x] CLAP hosting (`daw-host`, via `clack-host`), in-process, per ARCHITECTURE.md section 2: `load_bundle`/`plugins` list a bundle; `ClapPlugin` is the main-thread handle (params with id, name, range, default; `set_param` over a lock-free queue; `save_state`/`load_state`; `latency_samples`; `idle`); `PluginNode` is the `AudioNode` (live MIDI as CLAP note/MIDI events, param events at block start, no allocation). Still open: re-activation on `request_restart` or sample-rate change, transport info to plugins, plugins with a sidechain or extra ports (rejected for now), plugin output events, plugin GUIs, loading a real bundle (untested here, no CLAP plugins installed)
+- [ ] AU, VST3, then ARA2 once the timeline exists
 - [ ] Signed `.app` bundle via `cargo-bundle` with `NSMicrophoneUsageDescription` in `Info.plist`
+
+### Phase 5: Production Toolkit (later)
+- [ ] Every built-in effect has dry/wet and automatic level matching; insert racks can be reordered by drag and drop
+- [ ] Built-in dynamics and tone: dynamic EQ (incl. threshold-triggered low cut), de-esser, compressor, saturator
+- [ ] Sampler: one-shot/classic/slice modes (transient, grid, manual), slice to pads, key and velocity zones, round robin
+- [ ] Metering and QC: LUFS (integrated/short-term), oversampled true peak, delta monitoring, mid/side, level-matched A/B reference
+- [ ] Plugin GUIs drawn through Metal; SIMD where profiling shows a hot loop

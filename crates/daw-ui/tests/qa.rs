@@ -9,7 +9,9 @@ use std::sync::Arc;
 use daw_core::SampleData;
 use daw_dsp::WaveformPyramid;
 use daw_project::{Action, ClipRef, History, Track};
-use daw_ui::{theme, EngineView, Inputs, Theme, Workspace};
+use daw_ui::{
+    theme, DeviceView, EngineView, Inputs, ParamView, PluginChoice, Request, Theme, Workspace,
+};
 use egui::epaint::ColorMode;
 use egui::{Color32, Shape, Vec2};
 use egui_kittest::Harness;
@@ -94,10 +96,43 @@ fn harness(size: (f32, f32, f32), theme: Theme, engine: EngineView) -> Harness<'
                         engine: &engine,
                         waveforms: &waveforms,
                         files: &files,
+                        plugins: &plugins(),
+                        devices: &devices(),
                     },
                 );
             })
         })
+}
+
+fn plugins() -> Vec<PluginChoice> {
+    ["AUDelay", "AUMatrixReverb", "DLSMusicDevice"]
+        .iter()
+        .map(|n| PluginChoice {
+            name: n.to_string(),
+            vendor: "Apple".into(),
+            format: "AU",
+        })
+        .collect()
+}
+
+/// One effect on the selected track with a few parameters at different values.
+fn devices() -> Vec<DeviceView> {
+    let param = |id: u32, name: &str, value: f64| ParamView {
+        id,
+        name: name.into(),
+        value,
+        min: 0.0,
+        max: 100.0,
+    };
+    vec![DeviceView {
+        name: "AUDelay".into(),
+        params: vec![
+            param(0, "Dry Wet Mix", 50.0),
+            param(1, "Delay Time", 10.0),
+            param(2, "Feedback", 0.0),
+            param(3, "Lowpass", 100.0),
+        ],
+    }]
 }
 
 /// The harness insets the ui by a margin; the app draws edge to edge, so do that.
@@ -183,7 +218,7 @@ fn every_viewport_and_theme_renders_and_passes_the_audits() {
 /// Drives the workspace at 1440x900 (u = 16pt) with scripted input.
 struct Rig {
     history: History,
-    requests: Vec<daw_ui::Request>,
+    requests: Vec<Request>,
 }
 
 fn press(h: &mut Harness<'_, Rig>, pos: egui::Pos2, pressed: bool) {
@@ -195,10 +230,21 @@ fn press(h: &mut Harness<'_, Rig>, pos: egui::Pos2, pressed: bool) {
     });
 }
 
+/// Press, a frame, release, a frame: a click as egui sees one.
+fn click(h: &mut Harness<'_, Rig>, pos: egui::Pos2) {
+    h.hover_at(pos);
+    h.run();
+    press(h, pos, true);
+    h.run();
+    press(h, pos, false);
+    h.run();
+}
+
 fn rig() -> Harness<'static, Rig> {
     let (history, waveforms, files) = fixture();
     let engine = EngineView::default();
     let mut ws = Workspace::default();
+    ws.selected_track = Some(0);
     Harness::builder()
         .with_size(Vec2::new(1440.0, 900.0))
         .with_context_setup(theme::install_fonts)
@@ -212,6 +258,8 @@ fn rig() -> Harness<'static, Rig> {
                             engine: &engine,
                             waveforms: &waveforms,
                             files: &files,
+                            plugins: &plugins(),
+                            devices: &devices(),
                         },
                     );
                     rig.requests.extend(out);
@@ -230,7 +278,7 @@ fn space_plays_once_per_press() {
     h.run();
     h.key_press(egui::Key::Space);
     h.run();
-    assert_eq!(h.state().requests, [daw_ui::Request::Play]);
+    assert_eq!(h.state().requests, [Request::Play]);
 }
 
 #[test]
@@ -276,4 +324,54 @@ fn dragging_a_clip_moves_it_across_lanes_and_delete_mid_drag_is_safe() {
         "only the dragged clip went; no other clip was overwritten"
     );
     assert_eq!(tracks.len(), 3, "one Backspace removes one thing");
+}
+
+#[test]
+fn picker_adds_a_device_and_dials_set_params() {
+    // Rack: x 280..1100, y 520..900 (45% of the body), header 32pt. The one
+    // device is 16u = 256pt wide, so + DEVICE (96 x 24) starts at x 548, y 564.
+    let mut h = rig();
+    h.run();
+    let add = egui::Pos2::new(596.0, 576.0);
+    click(&mut h, add);
+    std::fs::create_dir_all("../../target/qa").unwrap();
+    h.render()
+        .unwrap()
+        .save("../../target/qa/picker-open.png")
+        .unwrap();
+    // The picker (rack height - 2u, centred: y 536..884) lists 32pt rows from
+    // y 568; the second row is AUMatrixReverb.
+    let row = egui::Pos2::new(700.0, 568.0 + 32.0 + 16.0);
+    click(&mut h, row);
+    assert!(
+        h.state().requests.contains(&Request::AddDevice {
+            track: 0,
+            choice: 1
+        }),
+        "{:?}",
+        h.state().requests
+    );
+
+    // Drag the first dial up: Dry Wet Mix rises from 50.
+    // First dial: cell 64pt wide from x 280; centre y = 552 + 20 + 20 + 8 + 18.
+    let dial = egui::Pos2::new(312.0, 618.0);
+    h.hover_at(dial);
+    press(&mut h, dial, true);
+    h.run();
+    for step in 1..=5 {
+        h.hover_at(dial - Vec2::new(0.0, 4.0 * step as f32));
+        h.run();
+    }
+    press(&mut h, dial - Vec2::new(0.0, 20.0), false);
+    h.run();
+    let set = h.state().requests.iter().find_map(|r| match r {
+        Request::SetParam {
+            track: 0,
+            device: 0,
+            param: 0,
+            value,
+        } => Some(*value),
+        _ => None,
+    });
+    assert!(set.is_some_and(|v| v > 50.0), "{:?}", h.state().requests);
 }

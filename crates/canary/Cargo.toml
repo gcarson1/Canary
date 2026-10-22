@@ -16,3 +16,4 @@ daw-ui = { path = "../daw-ui" }
 egui = "0.37"
 eframe = { version = "0.37", default-features = false, features = ["wgpu", "accesskit"] }
 
+daw-host = { path = "../daw-host" }

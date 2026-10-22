@@ -4,6 +4,8 @@
 //!
 //! `canary [project.daw] [--samples DIR]`. Defaults to `~/Music/Canary`.
 
+mod devices;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
@@ -14,9 +16,10 @@ use std::{env, fs, thread};
 use daw_core::{Clip, Command, NodeId, SampleData, Telemetry, TrackParams};
 use daw_dsp::WaveformPyramid;
 use daw_engine::{EngineHandle, Recorder};
-use daw_graph::{ExecutionPlan, GainNode, Source, TrackNode, MAX_NODES};
+use daw_graph::{ExecutionPlan, GainNode, Source, TrackNode};
 use daw_project::{Action, ClipRef, History, Track};
 use daw_ui::{theme, EngineView, Inputs, Request, Status, Workspace};
+use devices::Devices;
 
 /// Frames per plan buffer; larger device callbacks render in chunks.
 const MAX_BLOCK: usize = 4096;
@@ -50,8 +53,12 @@ struct App {
     /// rebuilding nodes; `solo` is their shared solo count.
     params: Vec<Arc<TrackParams>>,
     solo: Arc<AtomicUsize>,
-    /// Each track's clips as of the live plan.
+    /// Each track's clips and device uids as of the live plan.
     built_clips: Vec<Vec<ClipRef>>,
+    built_devices: Vec<Vec<u64>>,
+    /// A plan the engine's queue had no room for; sent before any new one.
+    queued: Option<Box<ExecutionPlan>>,
+    devices: Devices,
     /// Open only while a take records, so the microphone is not held between takes.
     recorder: Option<(Recorder, cpal::Stream)>,
     title: String,
@@ -136,6 +143,9 @@ impl App {
             params: Vec::new(),
             solo: Arc::new(AtomicUsize::new(0)),
             built_clips: Vec::new(),
+            built_devices: Vec::new(),
+            queued: None,
+            devices: Devices::scan(),
             recorder: None,
             title: String::new(),
         };
@@ -253,17 +263,31 @@ impl App {
     /// Brings the engine up to date with the project: mixer-only edits just set
     /// the live params (smoothed, no click); anything else rebuilds the plan.
     fn sync(&mut self) {
+        if let Some(plan) = self.queued.take() {
+            self.send(plan);
+            return;
+        }
         let revision = self.history.revision();
         if self.built == Some(revision) {
             return;
         }
+        let rate = self.view.sample_rate as f32;
+        for e in self.devices.sync(self.history.project(), rate, MAX_BLOCK) {
+            self.error(e);
+        }
         let tracks = &self.history.project().tracks;
+        let uids = |t: &Track| t.devices.iter().map(|d| d.uid).collect::<Vec<_>>();
         let same_shape = self.built.is_some()
+            && !self.devices.changed()
             && tracks.len() == self.built_clips.len()
             && tracks
                 .iter()
                 .zip(&self.built_clips)
-                .all(|(t, c)| &t.clips == c);
+                .all(|(t, c)| &t.clips == c)
+            && tracks
+                .iter()
+                .zip(&self.built_devices)
+                .all(|(t, d)| &uids(t) == d);
         if same_shape {
             self.set_params();
             self.built = Some(revision);
@@ -281,24 +305,29 @@ impl App {
         }
     }
 
-    /// Sends the engine a plan for the current project: one track node per track
-    /// summed into a master. Node state resets on rebuild.
+    /// Sends the engine a plan for the current project: per track, its instrument
+    /// (if any) into a track node into its effects, all summed into a master.
+    /// Track nodes are rebuilt; plugin nodes persist and keep their state.
     fn rebuild(&mut self) {
-        let project = self.history.project();
-        let tracks = &project.tracks[..project.tracks.len().min(MAX_NODES - 1)];
-        let mut plan = ExecutionPlan::new(MAX_BLOCK);
-        for &id in &self.live {
-            plan.remove(id);
-        }
-        self.params.truncate(tracks.len());
-        while self.params.len() < tracks.len() {
+        let count = self
+            .history
+            .project()
+            .tracks
+            .len()
+            .min(devices::FIRST_DEVICE_NODE as usize - 1);
+        self.params.truncate(count);
+        while self.params.len() < count {
             self.params
                 .push(Arc::new(TrackParams::new(self.solo.clone())));
         }
         self.set_params();
-        let project = self.history.project();
-        let tracks = &project.tracks[..project.tracks.len().min(MAX_NODES - 1)];
-        let mut steps = Vec::with_capacity(tracks.len());
+        let mut plan = ExecutionPlan::new(MAX_BLOCK);
+        for &id in &self.live {
+            plan.remove(id);
+        }
+        self.devices.apply_changes(&mut plan);
+        let tracks = &self.history.project().tracks[..count];
+        let mut steps = Vec::with_capacity(count);
         for (i, track) in tracks.iter().enumerate() {
             let clips = track
                 .clips
@@ -310,21 +339,36 @@ impl App {
                 .collect();
             let id = NodeId(i as u32 + 1);
             plan.insert(id, Box::new(TrackNode::new(clips, self.params[i].clone())));
-            steps.push(plan.add(id, vec![], 2).expect("no inputs, two outputs"));
+            let inputs = match self.devices.instrument_step(&mut plan, track) {
+                Some(step) => (0..2)
+                    .map(|channel| vec![Source { step, channel }])
+                    .collect(),
+                None => vec![],
+            };
+            let track_step = plan.add(id, inputs, 2).expect("inputs are earlier steps");
+            steps.push(self.devices.effects_after(&mut plan, track, track_step));
         }
         let master = NodeId(0);
         plan.insert(master, Box::new(GainNode { gain: 1.0 }));
         let sum = |channel| steps.iter().map(|&step| Source { step, channel }).collect();
         plan.add(master, vec![sum(0), sum(1)], 2)
             .expect("sources are earlier steps");
-        match self.engine.send_plan(Box::new(plan)) {
-            Ok(()) => {
-                self.live = (0..=tracks.len() as u32).map(NodeId).collect();
-                self.built_clips = tracks.iter().map(|t| t.clips.clone()).collect();
-                self.built = Some(self.history.revision());
-            }
-            // Queue full: try again next frame.
-            Err(daw_engine::SendPlanError::QueueFull(_)) => {}
+        self.live = (0..=count as u32).map(NodeId).collect();
+        self.built_clips = tracks.iter().map(|t| t.clips.clone()).collect();
+        self.built_devices = tracks
+            .iter()
+            .map(|t| t.devices.iter().map(|d| d.uid).collect())
+            .collect();
+        self.built = Some(self.history.revision());
+        self.send(Box::new(plan));
+    }
+
+    /// Sends a plan, keeping it for next frame if the queue is full: it may carry
+    /// plugin nodes that exist nowhere else.
+    fn send(&mut self, plan: Box<ExecutionPlan>) {
+        match self.engine.send_plan(plan) {
+            Ok(()) => {}
+            Err(daw_engine::SendPlanError::QueueFull(plan)) => self.queued = Some(plan),
             Err(e) => self.error(format!("plan rejected: {e}")),
         }
     }
@@ -366,6 +410,42 @@ impl App {
             Request::Seek(at) => command(self, Command::Seek(at)),
             Request::AddFile { track, path, at } => self.load(path, Some((track, at))),
             Request::ToggleRecord => self.toggle_record(),
+            Request::AddDevice { track, choice } => {
+                let uid = self.history.new_device_uid();
+                let rate = self.view.sample_rate as f32;
+                match self.devices.create(choice, uid, rate, MAX_BLOCK) {
+                    Ok(device) => {
+                        let tracks = &self.history.project().tracks;
+                        let index = tracks.get(track).map_or(0, |t| t.devices.len());
+                        let action = Action::InsertDevice {
+                            track,
+                            index,
+                            device,
+                        };
+                        if let Err(e) = self.history.apply(action) {
+                            self.error(format!("could not add device: {e}"));
+                        }
+                    }
+                    Err(e) => self.error(format!("could not load plugin: {e}")),
+                }
+            }
+            Request::SetParam {
+                track,
+                device,
+                param,
+                value,
+            } => {
+                let uid = self
+                    .history
+                    .project()
+                    .tracks
+                    .get(track)
+                    .and_then(|t| t.devices.get(device))
+                    .map(|d| d.uid);
+                if let Some(uid) = uid {
+                    self.devices.set_param(uid, param, value);
+                }
+            }
         }
     }
 
@@ -416,6 +496,9 @@ impl App {
 
     /// Saves the project; true on success.
     fn save(&mut self) -> bool {
+        for (uid, state) in self.devices.states() {
+            self.history.store_device_state(uid, state);
+        }
         match self.history.save(&self.project_path) {
             Ok(()) => {
                 self.ws.status = Some(Status {
@@ -447,6 +530,12 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
 
+        self.devices.idle();
+        let views = self
+            .ws
+            .selected_track
+            .and_then(|i| self.history.project().tracks.get(i))
+            .map_or_else(Vec::new, |t| self.devices.views(t));
         let requests = self.ws.show(
             ui,
             Inputs {
@@ -454,6 +543,8 @@ impl eframe::App for App {
                 engine: &self.view,
                 waveforms: &self.waveforms,
                 files: &self.files,
+                plugins: &self.devices.choices,
+                devices: &views,
             },
         );
         for request in requests {

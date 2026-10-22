@@ -577,6 +577,7 @@ dependencies = [
  "daw-dsp",
  "daw-engine",
  "daw-graph",
+ "daw-host",
  "daw-project",
  "daw-ui",
  "eframe",

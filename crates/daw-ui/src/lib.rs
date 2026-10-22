@@ -3,6 +3,7 @@
 //! dock), drawn with egui. Edits go into `daw_project::History`; anything the
 //! engine must do comes back as `Request`s. This crate never touches audio.
 
+mod rack;
 pub mod theme;
 mod timeline;
 
@@ -13,6 +14,7 @@ use daw_dsp::WaveformPyramid;
 use daw_project::{Action, History, Track, TrackProps};
 use egui::{Align2, Color32, Key, Pos2, Rect, Sense, Shape, StrokeKind, Vec2};
 
+pub use rack::{DeviceView, ParamView, PluginChoice};
 use theme::Metrics;
 pub use theme::Theme;
 
@@ -54,6 +56,18 @@ pub enum Request {
         path: PathBuf,
         at: u64,
     },
+    /// Add `Inputs::plugins[choice]` to the end of `track`'s devices.
+    AddDevice {
+        track: usize,
+        choice: usize,
+    },
+    /// Set a parameter on `track`'s device `device` (its index in the track).
+    SetParam {
+        track: usize,
+        device: usize,
+        param: u32,
+        value: f64,
+    },
 }
 
 /// Everything the UI reads besides its own state.
@@ -65,6 +79,10 @@ pub struct Inputs<'a> {
     pub waveforms: &'a HashMap<PathBuf, WaveformPyramid>,
     /// Files listed in the asset browser.
     pub files: &'a [PathBuf],
+    /// Plugins the device picker offers.
+    pub plugins: &'a [PluginChoice],
+    /// The selected track's devices, in order, with live parameter values.
+    pub devices: &'a [DeviceView],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,6 +128,8 @@ pub struct Workspace {
     /// Clip indicator per side, latched until clicked.
     clip_latch: [bool; 2],
     edits: Vec<Edit>,
+    /// The device picker's scroll offset while it is open.
+    picker: Option<f32>,
 }
 
 impl Default for Workspace {
@@ -125,6 +145,7 @@ impl Default for Workspace {
             tempo_drag: None,
             clip_latch: [false; 2],
             edits: Vec::new(),
+            picker: None,
         }
     }
 }
@@ -240,15 +261,7 @@ impl Workspace {
         );
         self.tool_strip(ui, &p, &m, z.tools);
         timeline::show(self, ui, &p, &m, z.timeline, &inputs, &mut out);
-        let y = header(&p, &m, &t, z.rack, "02B // HARDWARE_DSP_RACK");
-        let body = Rect::from_x_y_ranges(z.rack.x_range(), y..=z.rack.max.y);
-        p.text(
-            body.center(),
-            Align2::CENTER_CENTER,
-            "NO DEVICE LOADED",
-            m.mono(0.6875),
-            t.faint,
-        );
+        rack::show(self, ui, &p, &m, z.rack, &inputs, &mut out);
         self.manifest(ui, &p, &m, z.manifest, inputs.history, inputs.engine);
         self.dock(ui, &p, &m, z.dock, inputs.engine);
 

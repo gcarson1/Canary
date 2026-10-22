@@ -112,36 +112,41 @@ impl Vst3Bundle {
                 std::io::Error::other(e.to_string()),
             ))
         };
-        let name = path.file_stem().ok_or_else(|| io(&"not a bundle path"))?;
-        let binary = path.join("Contents/MacOS").join(name);
         let url = CFURL::from_file_path(path).ok_or_else(|| io(&"bad bundle path"))?;
         let bundle = CFBundle::new(None, Some(&url)).ok_or_else(|| io(&"not a bundle"))?;
+        // Info.plist names the binary; the folder name may differ.
+        let binary = bundle
+            .executable_url()
+            .and_then(|u| u.to_file_path())
+            .ok_or_else(|| io(&"bundle has no executable"))?;
         // SAFETY: upheld by the caller.
         let lib = unsafe { libloading::Library::new(&binary) }.map_err(|e| io(&e))?;
         // SAFETY: symbol types are fixed by the VST3 module ABI.
-        let factory = unsafe {
+        unsafe {
             let entry = lib
                 .get::<unsafe extern "system" fn(*mut c_void) -> bool>(b"BundleEntry")
                 .map_err(|e| io(&e))?;
-            if !entry(
-                objc2_core_foundation::CFRetained::as_ptr(&bundle)
-                    .as_ptr()
-                    .cast(),
-            ) {
+            let bundle_ref = objc2_core_foundation::CFRetained::as_ptr(&bundle)
+                .as_ptr()
+                .cast();
+            if !entry(bundle_ref) {
                 return Err(io(&"BundleEntry failed"));
             }
-            let get = lib
+        }
+        // Entered: from here on, dropping the library calls BundleExit.
+        let library = Library {
+            lib,
+            _bundle: bundle,
+        };
+        // SAFETY: as above.
+        let factory = unsafe {
+            let get = library
+                .lib
                 .get::<unsafe extern "system" fn() -> *mut IPluginFactory>(b"GetPluginFactory")
                 .map_err(|e| io(&e))?;
             ComPtr::from_raw(get()).ok_or(HostError::NoFactory)?
         };
-        Ok(Arc::new(Self::with_factory(
-            factory,
-            Some(Library {
-                lib,
-                _bundle: bundle,
-            }),
-        )))
+        Ok(Arc::new(Self::with_factory(factory, Some(library))))
     }
 
     /// Wraps a factory already in this process (a statically linked plugin).
@@ -168,13 +173,7 @@ impl Vst3Bundle {
     pub fn plugins(&self) -> Vec<PluginInfo> {
         self.classes()
             .into_iter()
-            .filter(|c| {
-                c.category
-                    .iter()
-                    .map(|&b| b as u8)
-                    .take_while(|&b| b != 0)
-                    .eq(AUDIO_MODULE.iter().copied())
-            })
+            .filter(is_audio_module)
             .map(|c| PluginInfo {
                 id: hex(&c.cid),
                 name: cstring(&c.name),
@@ -258,10 +257,14 @@ impl IBStreamTrait for Stream {
     unsafe fn read(&self, buffer: *mut c_void, num_bytes: int32, num_read: *mut int32) -> tresult {
         let mut d = self.data.lock().unwrap();
         let (bytes, pos) = &mut *d;
-        let n = (num_bytes.max(0) as usize).min(bytes.len().saturating_sub(*pos));
-        // SAFETY: the plugin gives a buffer of at least `num_bytes`.
-        unsafe { ptr::copy_nonoverlapping(bytes[*pos..].as_ptr(), buffer.cast::<u8>(), n) };
-        *pos += n;
+        // A seek may leave the position past the end; reading there gives nothing.
+        let start = (*pos).min(bytes.len());
+        let n = (num_bytes.max(0) as usize).min(bytes.len() - start);
+        if n > 0 && !buffer.is_null() {
+            // SAFETY: the plugin gives a buffer of at least `num_bytes`.
+            unsafe { ptr::copy_nonoverlapping(bytes[start..].as_ptr(), buffer.cast::<u8>(), n) };
+            *pos = start + n;
+        }
         if !num_read.is_null() {
             unsafe { *num_read = n as int32 };
         }
@@ -277,9 +280,18 @@ impl IBStreamTrait for Stream {
         let mut d = self.data.lock().unwrap();
         let (bytes, pos) = &mut *d;
         let n = num_bytes.max(0) as usize;
+        if n == 0 || buffer.is_null() {
+            if !num_written.is_null() {
+                unsafe { *num_written = 0 };
+            }
+            return kResultOk;
+        }
+        // Plugin state lives in memory; refuse to grow past 2 GiB.
+        let Some(end) = pos.checked_add(n).filter(|&e| e <= i32::MAX as usize) else {
+            return kResultFalse;
+        };
         // SAFETY: the plugin gives `num_bytes` readable bytes.
         let src = unsafe { std::slice::from_raw_parts(buffer.cast::<u8>(), n) };
-        let end = *pos + n;
         if bytes.len() < end {
             bytes.resize(end, 0);
         }
@@ -299,10 +311,9 @@ impl IBStreamTrait for Stream {
             IBStream_::IStreamSeekMode_::kIBSeekEnd => d.0.len() as int64,
             _ => return kInvalidArgument,
         };
-        let to = base + pos;
-        if to < 0 {
+        let Some(to) = base.checked_add(pos).filter(|&to| to >= 0) else {
             return kInvalidArgument;
-        }
+        };
         d.1 = to as usize;
         if !result.is_null() {
             unsafe { *result = to };
@@ -433,6 +444,8 @@ struct Instance {
     controller: ComPtr<IEditController>,
     _host: ComWrapper<HostApp>,
     _bundle: Arc<Vst3Bundle>,
+    /// Set once `setActive(1)` succeeded; processing calls are only legal after.
+    active: bool,
 }
 
 // SAFETY: controller calls stay on the main thread (the plugin handle) and
@@ -444,8 +457,10 @@ impl Drop for Instance {
     fn drop(&mut self) {
         // SAFETY: nothing else uses the objects any more.
         unsafe {
-            self.processor.setProcessing(0);
-            self.component.setActive(0);
+            if self.active {
+                self.processor.setProcessing(0);
+                self.component.setActive(0);
+            }
             if let Some(c) = &self.separate {
                 c.terminate();
             }
@@ -461,6 +476,33 @@ pub struct Vst3Plugin {
     params: Vec<ParamInfo>,
     changes: Producer<(u32, f64)>,
     latency: u32,
+    /// Has an audio input port; without one it is an instrument.
+    audio_input: bool,
+}
+
+/// Runs its closure on drop unless disarmed: cleanup for early returns.
+struct Undo<F: FnOnce()>(Option<F>);
+
+impl<F: FnOnce()> Undo<F> {
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl<F: FnOnce()> Drop for Undo<F> {
+    fn drop(&mut self) {
+        if let Some(f) = self.0.take() {
+            f();
+        }
+    }
+}
+
+fn is_audio_module(c: &PClassInfo) -> bool {
+    c.category
+        .iter()
+        .map(|&b| b as u8)
+        .take_while(|&b| b != 0)
+        .eq(AUDIO_MODULE.iter().copied())
 }
 
 fn bus_channels(
@@ -500,7 +542,7 @@ impl Vst3Plugin {
         let class = bundle
             .classes()
             .into_iter()
-            .find(|c| hex(&c.cid) == id && bundle.plugins().iter().any(|p| p.id == id))
+            .find(|c| hex(&c.cid) == id && is_audio_module(c))
             .ok_or_else(unknown)?;
         let host = ComWrapper::new(HostApp);
         let context = host.as_com_ref::<FUnknown>().ok_or_else(unknown)?.as_ptr();
@@ -508,6 +550,11 @@ impl Vst3Plugin {
         // SAFETY: standard VST3 setup sequence on the main thread.
         unsafe {
             ok(component.initialize(context))?;
+            // Until `Instance` owns the component, a failure must still terminate it.
+            let initialized = component.clone();
+            let _undo = Undo(Some(move || {
+                initialized.terminate();
+            }));
             let processor: ComPtr<IAudioProcessor> =
                 component.cast().ok_or(HostError::NoFactory)?;
             let (controller, separate) = match component.cast::<IEditController>() {
@@ -521,14 +568,16 @@ impl Vst3Plugin {
                     (c.clone(), Some(c))
                 }
             };
-            let instance = Arc::new(Instance {
+            _undo.disarm();
+            let mut instance = Instance {
                 processor,
                 component,
                 separate,
                 controller,
                 _host: host,
                 _bundle: bundle.clone(),
-            });
+                active: false,
+            };
             let inputs = bus_channels(
                 &instance.component,
                 MediaTypes_::kAudio as MediaType,
@@ -572,6 +621,8 @@ impl Vst3Plugin {
             };
             ok(instance.processor.setupProcessing(&mut setup))?;
             ok(instance.component.setActive(1))?;
+            instance.active = true;
+            let instance = Arc::new(instance);
             sync_controller(&instance);
             let latency = instance.processor.getLatencySamples();
 
@@ -633,6 +684,7 @@ impl Vst3Plugin {
             Ok((
                 Vst3Plugin {
                     instance,
+                    audio_input: inputs.is_some(),
                     params,
                     changes,
                     latency,
@@ -640,6 +692,11 @@ impl Vst3Plugin {
                 node,
             ))
         }
+    }
+
+    /// False for instruments, which take notes instead of audio.
+    pub fn has_audio_input(&self) -> bool {
+        self.audio_input
     }
 
     pub fn params(&self) -> &[ParamInfo] {

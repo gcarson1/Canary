@@ -474,3 +474,44 @@ fn state_round_trips_and_the_plugin_terminates_when_both_halves_go() {
     drop(node);
     assert_eq!(LIVE.load(Ordering::SeqCst), before);
 }
+
+#[test]
+fn stream_reads_nothing_past_the_end_and_rejects_bad_seeks() {
+    let stream = Stream::new(vec![1, 2, 3]);
+    let s = stream.as_com_ref::<IBStream>().unwrap();
+    let (mut buf, mut n, mut at) = ([0u8; 4], -1, 0i64);
+    unsafe {
+        assert_eq!(
+            s.seek(4, IBStream_::IStreamSeekMode_::kIBSeekEnd as int32, &mut at),
+            kResultOk
+        );
+        assert_eq!(at, 7);
+        assert_eq!(s.read(buf.as_mut_ptr().cast(), 4, &mut n), kResultOk);
+        assert_eq!(n, 0);
+        assert_eq!(
+            s.seek(
+                i64::MAX,
+                IBStream_::IStreamSeekMode_::kIBSeekCur as int32,
+                ptr::null_mut()
+            ),
+            kInvalidArgument
+        );
+        assert_eq!(
+            s.seek(
+                -1,
+                IBStream_::IStreamSeekMode_::kIBSeekSet as int32,
+                ptr::null_mut()
+            ),
+            kInvalidArgument
+        );
+        assert_eq!(s.read(ptr::null_mut(), 0, &mut n), kResultOk);
+        assert_eq!(s.write(ptr::null_mut(), 0, &mut n), kResultOk);
+        s.seek(
+            1,
+            IBStream_::IStreamSeekMode_::kIBSeekSet as int32,
+            ptr::null_mut(),
+        );
+        assert_eq!(s.read(buf.as_mut_ptr().cast(), 4, &mut n), kResultOk);
+        assert_eq!((n, &buf[..2]), (2, &[2u8, 3][..]));
+    }
+}

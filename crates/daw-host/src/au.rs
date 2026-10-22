@@ -5,6 +5,7 @@
 //! share one instance. AU parameter calls are thread-safe, so parameter changes go
 //! straight to the unit instead of through a queue.
 
+use std::cell::Cell;
 use std::ffi::{c_void, CStr};
 use std::ptr::{self, NonNull};
 use std::sync::Arc;
@@ -195,15 +196,18 @@ impl Instance {
 }
 
 /// Where the render callback reads the node's input from, set before each render.
+/// Shared (`Arc`) with interior mutability, so the pointer the unit holds stays
+/// valid while the node updates it.
 struct InputFeed {
-    channels: [*const f32; MAX_CHANNELS],
-    count: usize,
-    frames: usize,
+    channels: [Cell<*const f32>; MAX_CHANNELS],
+    count: Cell<usize>,
+    frames: Cell<usize>,
 }
 
 // SAFETY: the pointers are only set and read within one `AuNode::process` call on
 // the thread running it, and cleared before it returns.
 unsafe impl Send for InputFeed {}
+unsafe impl Sync for InputFeed {}
 
 /// Feeds the effect's input bus from the node's inputs. Runs on the audio thread,
 /// inside `AudioUnitRender`; copies only.
@@ -224,7 +228,7 @@ unsafe extern "C-unwind" fn feed_input(
     let buffers = unsafe {
         std::slice::from_raw_parts_mut(list.mBuffers.as_mut_ptr(), list.mNumberBuffers as usize)
     };
-    let n = (frames as usize).min(feed.frames);
+    let n = (frames as usize).min(feed.frames.get());
     for (ch, b) in buffers.iter_mut().enumerate() {
         if b.mData.is_null() {
             continue;
@@ -232,9 +236,10 @@ unsafe extern "C-unwind" fn feed_input(
         // SAFETY: each buffer holds at least `frames` floats.
         let out = unsafe { std::slice::from_raw_parts_mut(b.mData.cast::<f32>(), frames as usize) };
         out.fill(0.0);
-        if ch < feed.count {
+        if ch < feed.count.get() {
             // SAFETY: `channels[ch]` points at `feed.frames` samples for this render.
-            let input = unsafe { std::slice::from_raw_parts(feed.channels[ch], feed.frames) };
+            let input =
+                unsafe { std::slice::from_raw_parts(feed.channels[ch].get(), feed.frames.get()) };
             out[..n].copy_from_slice(&input[..n]);
         }
     }
@@ -297,10 +302,10 @@ impl AuPlugin {
             0,
             &format,
         )?;
-        let feed = Box::new(InputFeed {
-            channels: [ptr::null(); MAX_CHANNELS],
-            count: 0,
-            frames: 0,
+        let feed = Arc::new(InputFeed {
+            channels: std::array::from_fn(|_| Cell::new(ptr::null())),
+            count: Cell::new(0),
+            frames: Cell::new(0),
         });
         if kind != AuKind::Instrument {
             unit.set(
@@ -311,7 +316,7 @@ impl AuPlugin {
             )?;
             let callback = AURenderCallbackStruct {
                 inputProc: Some(feed_input),
-                inputProcRefCon: ptr::from_ref::<InputFeed>(&feed).cast_mut().cast(),
+                inputProcRefCon: Arc::as_ptr(&feed).cast_mut().cast(),
             };
             unit.set(
                 kAudioUnitProperty_SetRenderCallback,
@@ -527,7 +532,7 @@ fn params(unit: &Instance) -> Vec<ParamInfo> {
 /// node outputs are zeroed, and a single node output takes the left channel.
 pub struct AuNode {
     unit: Arc<Instance>,
-    feed: Box<InputFeed>,
+    feed: Arc<InputFeed>,
     outputs: [Box<[f32]>; 2],
     max_block: usize,
     sample_time: f64,
@@ -550,10 +555,10 @@ impl AudioNode for AuNode {
             return;
         }
         // Pre-zeroed silence stands in for missing inputs (untrusted plugin).
-        self.feed.count = inputs.len().min(2);
-        self.feed.frames = n;
-        for (slot, input) in self.feed.channels.iter_mut().zip(inputs) {
-            *slot = input.as_ptr();
+        self.feed.count.set(inputs.len().min(2));
+        self.feed.frames.set(n);
+        for (slot, input) in self.feed.channels.iter().zip(inputs) {
+            slot.set(input.as_ptr());
         }
         if self.kind != AuKind::Effect {
             for e in midi_in {
@@ -571,6 +576,9 @@ impl AudioNode for AuNode {
             }
         }
         let [left, right] = &mut self.outputs;
+        // Pre-zeroed, so a unit that skips writing (silence) leaves silence.
+        left[..n].fill(0.0);
+        right[..n].fill(0.0);
         let mut list = BufferList {
             count: 2,
             // SAFETY: AudioBuffer is plain data; filled in below.
@@ -601,7 +609,7 @@ impl AudioNode for AuNode {
             )
         };
         self.sample_time += n as f64;
-        self.feed.count = 0; // the input slices die with this call
+        self.feed.count.set(0); // the input slices die with this call
         for (ch, out) in outputs.iter_mut().enumerate() {
             match self.outputs.get(ch) {
                 Some(src) if status == 0 => out.copy_from_slice(&src[..n]),
@@ -635,6 +643,15 @@ mod tests {
             playhead: 0,
             playing: true,
         }
+    }
+
+    /// A 512-frame stereo block into fixed arrays, so it can run under
+    /// `assert_no_alloc`; returns the left channel.
+    fn render_into(node: &mut AuNode, input: &[f32; 512]) -> [f32; 512] {
+        let (mut l, mut r) = ([9.0f32; 512], [9.0f32; 512]);
+        let ins: [&[f32]; 2] = [input, input];
+        node.process(&ins, &mut [&mut l, &mut r], &[], &mut Vec::new(), &ctx(512));
+        l
     }
 
     fn render(node: &mut AuNode, input: &[f32], midi: &[MidiEvent]) -> (Vec<f32>, Vec<f32>) {
@@ -689,12 +706,10 @@ mod tests {
         assert!(p.min <= p.default && p.default <= p.max, "{p:?}");
 
         // An impulse comes out delayed; something reaches the output within a second.
-        let mut impulse = vec![0.0; 512];
+        let mut impulse = [0.0f32; 512];
         impulse[0] = 1.0;
-        let mut heard = render(&mut node, &impulse, &[])
-            .0
-            .iter()
-            .any(|v| v.abs() > 1e-4);
+        let first = assert_no_alloc::assert_no_alloc(|| render_into(&mut node, &impulse));
+        let mut heard = first.iter().any(|v| v.abs() > 1e-4);
         for _ in 0..100 {
             heard |= render(&mut node, &[0.0; 512], &[])
                 .0
@@ -726,10 +741,11 @@ mod tests {
             sample_offset: 0,
             data: [0x90, 60, 110],
         };
-        let mut heard = render(&mut node, &[0.0; 512], &[on])
-            .0
-            .iter()
-            .any(|v| v.abs() > 1e-4);
+        let mut out = [0.0f32; 512];
+        assert_no_alloc::assert_no_alloc(|| {
+            node.process(&[], &mut [&mut out], &[on], &mut Vec::new(), &ctx(512));
+        });
+        let mut heard = out.iter().any(|v| v.abs() > 1e-4);
         for _ in 0..20 {
             heard |= render(&mut node, &[0.0; 512], &[])
                 .0

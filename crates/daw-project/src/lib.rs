@@ -38,6 +38,83 @@ pub struct Track {
     pub mute: bool,
     pub solo: bool,
     pub clips: Vec<ClipRef>,
+    /// Plugins on the track, in signal order. An instrument (a plugin without an
+    /// audio input) plays before the clips are mixed in; effects follow.
+    #[serde(default)]
+    pub devices: Vec<Device>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PluginFormat {
+    Clap,
+    AudioUnit,
+    Vst3,
+}
+
+/// A plugin on a track: what to load, and its saved state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Device {
+    /// Unique in the project; lets the app keep a plugin alive across edits.
+    pub uid: u64,
+    pub format: PluginFormat,
+    /// The `.clap`/`.vst3` bundle; Audio Units have none.
+    pub bundle: Option<PathBuf>,
+    pub id: String,
+    pub name: String,
+    /// The plugin's opaque state as of the last save.
+    #[serde(default, with = "base64")]
+    pub state: Vec<u8>,
+}
+
+/// Plugin state can be large; base64 keeps it a quarter of a JSON number array.
+mod base64 {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    pub fn encode(bytes: &[u8]) -> String {
+        let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+        for chunk in bytes.chunks(3) {
+            let b = [
+                chunk[0],
+                *chunk.get(1).unwrap_or(&0),
+                *chunk.get(2).unwrap_or(&0),
+            ];
+            let n = u32::from(b[0]) << 16 | u32::from(b[1]) << 8 | u32::from(b[2]);
+            for i in 0..4 {
+                out.push(if i <= chunk.len() {
+                    char::from(ABC[(n >> (18 - 6 * i) & 63) as usize])
+                } else {
+                    '='
+                });
+            }
+        }
+        out
+    }
+
+    pub fn decode(text: &str) -> Option<Vec<u8>> {
+        let text = text.trim_end_matches('=');
+        let mut out = Vec::with_capacity(text.len() * 3 / 4);
+        let (mut acc, mut bits) = (0u32, 0);
+        for c in text.bytes() {
+            acc = acc << 6 | ABC.iter().position(|&a| a == c)? as u32;
+            bits += 6;
+            if bits >= 8 {
+                bits -= 8;
+                out.push((acc >> bits) as u8);
+            }
+        }
+        Some(out)
+    }
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&encode(bytes))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        let text = String::deserialize(d)?;
+        decode(&text).ok_or_else(|| serde::de::Error::custom("invalid base64"))
+    }
 }
 
 impl Track {
@@ -49,6 +126,7 @@ impl Track {
             mute: false,
             solo: false,
             clips: Vec::new(),
+            devices: Vec::new(),
         }
     }
 }
@@ -97,6 +175,15 @@ pub enum Action {
         track: usize,
         index: usize,
         clip: ClipRef,
+    },
+    InsertDevice {
+        track: usize,
+        index: usize,
+        device: Device,
+    },
+    RemoveDevice {
+        track: usize,
+        index: usize,
     },
     /// Several edits that undo as one step (a split, say). All or nothing.
     Batch(Vec<Action>),
@@ -224,6 +311,29 @@ impl Action {
                     clip: std::mem::replace(slot, clip),
                 }
             }
+            InsertDevice {
+                track: ti,
+                index,
+                device,
+            } => {
+                let t = track(p, ti)?;
+                if index > t.devices.len() {
+                    return Err(ActionError::OutOfRange);
+                }
+                t.devices.insert(index, device);
+                RemoveDevice { track: ti, index }
+            }
+            RemoveDevice { track: ti, index } => {
+                let t = track(p, ti)?;
+                if index >= t.devices.len() {
+                    return Err(ActionError::OutOfRange);
+                }
+                InsertDevice {
+                    track: ti,
+                    index,
+                    device: t.devices.remove(index),
+                }
+            }
             Batch(actions) => {
                 let mut inverses = Vec::with_capacity(actions.len());
                 for action in actions {
@@ -255,6 +365,8 @@ pub struct History {
     dirty: bool,
     /// Bumped by every change, so callers can tell when to rebuild from the project.
     revision: u64,
+    /// Device uids below this were handed out, including any only in undo history.
+    next_uid: u64,
 }
 
 impl History {
@@ -275,6 +387,35 @@ impl History {
 
     pub fn revision(&self) -> u64 {
         self.revision
+    }
+
+    /// A device uid not used anywhere in the project or its undo history.
+    pub fn new_device_uid(&mut self) -> u64 {
+        self.next_uid = self.next_uid.max(
+            self.project
+                .tracks
+                .iter()
+                .flat_map(|t| &t.devices)
+                .map(|d| d.uid + 1)
+                .max()
+                .unwrap_or(0),
+        );
+        self.next_uid += 1;
+        self.next_uid - 1
+    }
+
+    /// Records a device's current plugin state for the next save. Not an edit:
+    /// no undo step, no revision change.
+    pub fn store_device_state(&mut self, uid: u64, state: Vec<u8>) {
+        let device = self
+            .project
+            .tracks
+            .iter_mut()
+            .flat_map(|t| &mut t.devices)
+            .find(|d| d.uid == uid);
+        if let Some(d) = device {
+            d.state = state;
+        }
     }
 
     /// Applies an edit, makes it undoable and clears the redo stack.
@@ -555,5 +696,63 @@ mod tests {
         fs::write(&path, "{").unwrap();
         assert!(matches!(History::load(&path), Err(ProjectError::Format(_))));
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn devices_undo_save_and_get_fresh_uids() {
+        let dir = std::env::temp_dir().join(format!("canary-devices-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let mut h = History::default();
+        h.apply(Action::InsertTrack {
+            index: 0,
+            track: Track::new("Synth"),
+        })
+        .unwrap();
+        let uid = h.new_device_uid();
+        let device = Device {
+            uid,
+            format: PluginFormat::AudioUnit,
+            bundle: None,
+            id: "aumu:dls :appl".into(),
+            name: "DLSMusicDevice".into(),
+            state: Vec::new(),
+        };
+        h.apply(Action::InsertDevice {
+            track: 0,
+            index: 0,
+            device,
+        })
+        .unwrap();
+        let revision = h.revision();
+        h.store_device_state(uid, (0..=255).collect());
+        assert_eq!(h.revision(), revision, "state is not an edit");
+        let path = dir.join("d.daw");
+        h.save(&path).unwrap();
+        let loaded = History::load(&path).unwrap();
+        assert_eq!(loaded.project(), h.project());
+
+        h.apply(Action::RemoveDevice { track: 0, index: 0 })
+            .unwrap();
+        assert!(h.project().tracks[0].devices.is_empty());
+        assert_ne!(
+            h.new_device_uid(),
+            uid,
+            "a removed device's uid is not reused"
+        );
+        assert!(h.undo());
+        assert_eq!(h.project().tracks[0].devices[0].state.len(), 256);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn base64_round_trips_every_length() {
+        for n in 0..10 {
+            let bytes: Vec<u8> = (0..n).map(|i| (i * 37 + 200) as u8).collect();
+            let text = base64::encode(&bytes);
+            assert_eq!(text.len() % 4, 0);
+            assert_eq!(base64::decode(&text).unwrap(), bytes);
+        }
+        assert_eq!(base64::encode(b"Man"), "TWFu");
+        assert!(base64::decode("$$$$").is_none());
     }
 }

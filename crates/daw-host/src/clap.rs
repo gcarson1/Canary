@@ -146,6 +146,8 @@ pub struct ClapPlugin {
     params: Vec<ParamInfo>,
     param_changes: Producer<(u32, f64)>,
     latency: u32,
+    /// Has an audio input port; without one it is an instrument.
+    audio_input: bool,
 }
 
 impl ClapPlugin {
@@ -264,12 +266,18 @@ impl ClapPlugin {
         Ok((
             ClapPlugin {
                 instance,
+                audio_input: inputs.is_some(),
                 params,
                 param_changes,
                 latency,
             },
             node,
         ))
+    }
+
+    /// False for instruments, which take notes instead of audio.
+    pub fn has_audio_input(&self) -> bool {
+        self.audio_input
     }
 
     pub fn params(&self) -> &[ParamInfo] {

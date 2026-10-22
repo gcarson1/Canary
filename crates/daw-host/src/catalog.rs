@@ -26,6 +26,9 @@ pub struct Available {
     pub info: PluginInfo,
 }
 
+/// A plugin's main-thread handle and its node for the graph.
+pub type Instance = (Box<dyn Hosted>, Box<dyn AudioNode>);
+
 /// Main-thread controls every hosted plugin offers.
 pub trait Hosted {
     fn params(&self) -> &[ParamInfo];
@@ -199,7 +202,7 @@ impl Catalog {
         id: &str,
         sample_rate: f32,
         max_block: usize,
-    ) -> Result<(Box<dyn Hosted>, Box<dyn AudioNode>), HostError> {
+    ) -> Result<Instance, HostError> {
         let missing = || HostError::UnknownPlugin(id.to_owned());
         match format {
             Format::Clap => {

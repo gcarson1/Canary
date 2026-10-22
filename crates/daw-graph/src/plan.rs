@@ -62,6 +62,8 @@ struct Step {
     sources: Vec<Vec<Source>>,
     inputs: Vec<Box<[f32]>>,
     outputs: Vec<Box<[f32]>>,
+    /// Receives the live MIDI input (an instrument); other steps get none.
+    takes_midi: bool,
 }
 
 /// A topologically ordered schedule with every buffer allocated up front, plus the
@@ -148,8 +150,18 @@ impl ExecutionPlan {
             inputs: (0..inputs.len()).map(|_| buffer()).collect(),
             outputs: (0..num_outputs).map(|_| buffer()).collect(),
             sources: inputs,
+            takes_midi: false,
         });
         Ok(StepId(self.steps.len() - 1))
+    }
+
+    /// Sends the live MIDI input to `step`, such as an instrument. Any number of steps
+    /// may take it. Returns false if there is no such step.
+    pub fn route_midi(&mut self, step: StepId) -> bool {
+        self.steps
+            .get_mut(step.0)
+            .map(|s| s.takes_midi = true)
+            .is_some()
     }
 
     /// The last step's output buffers, valid for `num_samples` frames after `process`.
@@ -164,10 +176,12 @@ impl ExecutionPlan {
     }
 
     /// Runs every step once. Never allocates, locks or blocks.
-    /// `context.num_samples` must not exceed `max_block`.
-    pub fn process(&mut self, arena: &mut NodeArena, context: &ProcessContext) {
+    /// `context.num_samples` must not exceed `max_block`. `midi` is this block's live
+    /// input, offsets below `num_samples` and in order; it goes to `route_midi` steps.
+    pub fn process(&mut self, arena: &mut NodeArena, context: &ProcessContext, midi: &[MidiEvent]) {
         let n = context.num_samples;
         assert!(n <= self.max_block, "block of {n} frames exceeds plan max");
+        debug_assert!(midi.iter().all(|e| (e.sample_offset as usize) < n.max(1)));
 
         for i in 0..self.steps.len() {
             let (done, rest) = self.steps.split_at_mut(i);
@@ -176,6 +190,7 @@ impl ExecutionPlan {
                 sources,
                 inputs,
                 outputs,
+                takes_midi,
             } = &mut rest[0];
 
             // Inputs are summing buses, so they start from silence.
@@ -211,7 +226,7 @@ impl ExecutionPlan {
             node.process(
                 &ins[..num_inputs],
                 &mut outs[..num_outputs],
-                &[],
+                if *takes_midi { midi } else { &[] },
                 &mut self.midi_out,
                 context,
             );
@@ -392,7 +407,7 @@ mod tests {
     /// Applies pending node changes (a no-op after the first call) and runs a block.
     fn run(plan: &mut ExecutionPlan, arena: &mut NodeArena, n: usize) {
         arena.apply(plan);
-        plan.process(arena, &ctx(n));
+        plan.process(arena, &ctx(n), &[]);
     }
 
     fn ctx(n: usize) -> ProcessContext {
@@ -534,6 +549,50 @@ mod tests {
         let mut plan = scheduled(1);
         plan.remove(one);
         assert_eq!(live.check(&plan).err(), Some(PlanError::UnknownNode(one)));
+    }
+
+    /// Writes the number of MIDI events it received to every output frame.
+    struct MidiCount;
+
+    impl AudioNode for MidiCount {
+        fn process(
+            &mut self,
+            _inputs: &[&[f32]],
+            outputs: &mut [&mut [f32]],
+            midi_in: &[MidiEvent],
+            _midi_out: &mut Vec<MidiEvent>,
+            _context: &ProcessContext,
+        ) {
+            outputs[0].fill(midi_in.len() as f32);
+        }
+        fn reset(&mut self) {}
+    }
+
+    #[test]
+    fn live_midi_reaches_only_routed_steps() {
+        let mut arena = NodeArena::default();
+        let mut plan = ExecutionPlan::new(4);
+        let routed = add(&mut plan, Box::new(MidiCount), vec![], 1).unwrap();
+        let other = add(&mut plan, Box::new(MidiCount), vec![], 1).unwrap();
+        assert!(plan.route_midi(routed));
+        assert!(!plan.route_midi(StepId(9)));
+        let gain = Box::new(GainNode { gain: 1.0 });
+        // 10 x routed count + other count, so both show up in the output.
+        add(
+            &mut plan,
+            gain,
+            vec![vec![src(routed); 10], vec![src(other)]],
+            2,
+        )
+        .unwrap();
+        arena.apply(&mut plan);
+        let note = MidiEvent {
+            sample_offset: 1,
+            data: [0x90, 60, 100],
+        };
+        plan.process(&mut arena, &ctx(4), &[note, note]);
+        assert_eq!(plan.output()[0][0], 20.0);
+        assert_eq!(plan.output()[1][0], 0.0);
     }
 
     #[test]

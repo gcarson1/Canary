@@ -32,6 +32,8 @@ pub trait AudioNode: Send {
 }
 ```
 
+Live MIDI reaches only steps marked with `ExecutionPlan::route_midi`; every other node gets an empty `midi_in`. `TrackNode` sums its inputs before gain/pan, so an instrument node feeds a track through its inputs.
+
 ### Buffer Contract
 
 Scratch buffers are allocated to `max_block_size` and reused across the schedule, so they always hold stale audio.

@@ -2,11 +2,13 @@
 //! The PDC calculator comes later.
 
 mod plan;
+mod synth;
 mod track;
 
 pub use plan::{
     ExecutionPlan, LiveNodes, NodeArena, PlanError, Source, StepId, MAX_CHANNELS, MAX_NODES,
 };
+pub use synth::SynthNode;
 pub use track::TrackNode;
 
 use std::any::Any;

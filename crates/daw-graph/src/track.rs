@@ -11,13 +11,14 @@ use crate::AudioNode;
 /// How long gain, pan and mute changes take to glide, in seconds.
 const SMOOTHING_SECONDS: f32 = 0.005;
 
-/// A stereo audio track: plays its clips at the transport position, then applies
-/// smoothed gain, equal-power pan, mute and solo from its shared `TrackParams`.
+/// A stereo audio track: plays its clips at the transport position, adds whatever
+/// feeds its inputs (an instrument, for an instrument track), then applies smoothed
+/// gain, equal-power pan, mute and solo from its shared `TrackParams`.
 ///
 /// Its clip list is replaced with `plan.update(id, TrackNode::clips_update(clips))`.
 ///
-/// Writes output channels 0 and 1. Mono clips play on both; any further output
-/// channels are zeroed.
+/// Writes output channels 0 and 1. Mono clips and a mono input play on both; any
+/// further output channels are zeroed.
 pub struct TrackNode {
     clips: Box<[Clip]>,
     params: Arc<TrackParams>,
@@ -59,14 +60,17 @@ fn target_gains(params: &TrackParams) -> (f32, f32) {
 impl AudioNode for TrackNode {
     fn process(
         &mut self,
-        _inputs: &[&[f32]],
+        inputs: &[&[f32]],
         outputs: &mut [&mut [f32]],
         _midi_in: &[MidiEvent],
         _midi_out: &mut Vec<MidiEvent>,
         context: &ProcessContext,
     ) {
-        for output in outputs.iter_mut() {
-            output.fill(0.0);
+        for (ch, output) in outputs.iter_mut().enumerate() {
+            match inputs.len() {
+                n if n > 0 && ch < 2 => output.copy_from_slice(inputs[ch.min(n - 1)]),
+                _ => output.fill(0.0),
+            }
         }
 
         if context.playing {
@@ -265,5 +269,27 @@ mod tests {
         assert!(l[0] < 1.0 && l[0] > 0.9, "first sample {}", l[0]);
         assert!(l.windows(2).all(|w| w[1] <= w[0]));
         assert_eq!(l[8191], 0.0);
+    }
+
+    #[test]
+    fn mono_input_feeds_both_channels_even_when_stopped() {
+        let mut node = TrackNode::new(vec![], params(0.0));
+        let input = [1.0; 4];
+        let (mut l, mut r, mut extra) = ([9.0; 4], [9.0; 4], [9.0; 4]);
+        node.process(
+            &[&input],
+            &mut [&mut l, &mut r, &mut extra],
+            &[],
+            &mut Vec::new(),
+            &ProcessContext {
+                sample_rate: 48_000.0,
+                num_samples: 4,
+                playhead: 0,
+                playing: false,
+            },
+        );
+        let g = FRAC_PI_4.cos();
+        assert!(l.iter().chain(&r).all(|v| (v - g).abs() < 1e-6));
+        assert_eq!(extra, [0.0; 4]);
     }
 }

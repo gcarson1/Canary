@@ -1,17 +1,25 @@
 //! Real-time thread coordinator: audio streams, lock-free queues, plan swapping, disk streaming and garbage collection.
 
 mod load;
+mod midi;
 mod output;
+mod record;
 mod transport;
 
 pub use load::{load_audio, resample, LoadError};
+pub use midi::{connect_midi, midi_input_ports, MidiError, MidiSender};
 pub use output::{start_output, OutputError};
+pub use record::{recorder, start_input, InputError, RecordError, RecordInput, Recorder, Take};
 pub use transport::Transport;
 
 use std::fmt;
+use std::mem;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use daw_core::{Command, ProcessContext, Telemetry};
 use daw_graph::{ExecutionPlan, LiveNodes, NodeArena, PlanError};
+use midi::{midi_queue, MidiReceiver};
 use rtrb::{Consumer, Producer, RingBuffer};
 
 /// Plans waiting to be swapped in, and retired plans waiting to be dropped.
@@ -21,10 +29,14 @@ const PLAN_QUEUE_CAPACITY: usize = 8;
 pub struct EngineHandle {
     pub commands: Producer<Command>,
     pub telemetry: Consumer<Telemetry>,
+    /// Live MIDI input for steps added with `ExecutionPlan::route_midi`. Take it to
+    /// hand to `connect_midi` or another MIDI source.
+    pub midi: Option<MidiSender>,
     plans: Producer<Box<ExecutionPlan>>,
     garbage: Consumer<Box<ExecutionPlan>>,
     /// Nodes the audio thread will hold once every queued plan is applied.
     live: LiveNodes,
+    playhead: Arc<AtomicU64>,
 }
 
 #[derive(Debug)]
@@ -61,6 +73,12 @@ impl EngineHandle {
         &self.live
     }
 
+    /// The playhead at the start of the block now rendering, updated every callback.
+    /// Other real-time threads (the input callback) read it without a queue.
+    pub fn playhead_clock(&self) -> Arc<AtomicU64> {
+        self.playhead.clone()
+    }
+
     /// Drops plans the audio thread has retired, freeing their nodes, buffers and
     /// clip audio. Call it regularly from a non-real-time thread.
     pub fn collect_garbage(&mut self) {
@@ -74,9 +92,11 @@ pub struct AudioEngine {
     telemetry: Producer<Telemetry>,
     plans: Consumer<Box<ExecutionPlan>>,
     garbage: Producer<Box<ExecutionPlan>>,
+    midi: MidiReceiver,
     plan: Option<Box<ExecutionPlan>>,
     nodes: NodeArena,
     transport: Transport,
+    playhead: Arc<AtomicU64>,
     sample_rate: f32,
 }
 
@@ -87,22 +107,28 @@ pub fn engine(capacity: usize, sample_rate: f32) -> (EngineHandle, AudioEngine) 
     let (telemetry_tx, telemetry_rx) = RingBuffer::new(capacity);
     let (plan_tx, plan_rx) = RingBuffer::new(PLAN_QUEUE_CAPACITY);
     let (garbage_tx, garbage_rx) = RingBuffer::new(PLAN_QUEUE_CAPACITY);
+    let (midi_tx, midi_rx) = midi_queue();
+    let playhead = Arc::new(AtomicU64::new(0));
     (
         EngineHandle {
             commands: command_tx,
             telemetry: telemetry_rx,
+            midi: Some(midi_tx),
             plans: plan_tx,
             garbage: garbage_rx,
             live: LiveNodes::default(),
+            playhead: playhead.clone(),
         },
         AudioEngine {
             commands: command_rx,
             telemetry: telemetry_tx,
             plans: plan_rx,
             garbage: garbage_tx,
+            midi: midi_rx,
             plan: None,
             nodes: NodeArena::default(),
             transport: Transport::default(),
+            playhead,
             sample_rate,
         },
     )
@@ -137,6 +163,9 @@ impl AudioEngine {
         }
 
         let channels = channels.max(1);
+        self.playhead
+            .store(self.transport.playhead(), Ordering::Relaxed);
+        let mut midi = self.midi.drain(output.len() / channels, self.sample_rate);
         match self.plan.as_deref_mut() {
             None => {
                 output.fill(0.0);
@@ -144,8 +173,17 @@ impl AudioEngine {
             }
             Some(plan) => {
                 // The device may hand us more frames than the plan's buffers hold.
-                for chunk in output.chunks_mut(plan.max_block() * channels) {
+                for (i, chunk) in output.chunks_mut(plan.max_block() * channels).enumerate() {
                     let frames = chunk.len() / channels;
+                    // Events are in offset order: take this chunk's, made chunk-relative.
+                    let first = (i * plan.max_block()) as u32;
+                    let end = first + frames as u32;
+                    let count = midi.iter().take_while(|e| e.sample_offset < end).count();
+                    let (now, later) = mem::take(&mut midi).split_at_mut(count);
+                    for e in now.iter_mut() {
+                        e.sample_offset -= first;
+                    }
+                    midi = later;
                     plan.process(
                         &mut self.nodes,
                         &ProcessContext {
@@ -154,6 +192,7 @@ impl AudioEngine {
                             playhead: self.transport.playhead(),
                             playing: self.transport.is_playing(),
                         },
+                        now,
                     );
                     let master = plan.output();
                     for (frame, out) in chunk.chunks_exact_mut(channels).enumerate() {
@@ -179,7 +218,7 @@ mod tests {
     use super::*;
     use assert_no_alloc::{assert_no_alloc, AllocDisabler};
     use daw_core::{Clip, NodeId, SampleData, TimeSignature, TrackParams};
-    use daw_graph::{AudioNode, GainNode, Source, TrackNode};
+    use daw_graph::{AudioNode, GainNode, Source, SynthNode, TrackNode};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -557,5 +596,156 @@ mod tests {
         assert_eq!(drops.load(Ordering::SeqCst), 0);
         handle.collect_garbage();
         assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    /// Instrument track: a synth taking live MIDI, feeding a track, as the master.
+    fn instrument_plan(max_block: usize) -> Box<ExecutionPlan> {
+        let mut plan = ExecutionPlan::new(max_block);
+        plan.insert(NodeId(0), Box::new(SynthNode::new()));
+        plan.insert(
+            NodeId(1),
+            Box::new(TrackNode::new(
+                vec![],
+                Arc::new(TrackParams::new(Arc::default())),
+            )),
+        );
+        let synth = plan.add(NodeId(0), vec![], 1).unwrap();
+        plan.route_midi(synth);
+        let mono = vec![Source {
+            step: synth,
+            channel: 0,
+        }];
+        plan.add(NodeId(1), vec![mono], 2).unwrap();
+        Box::new(plan)
+    }
+
+    #[test]
+    fn live_midi_plays_an_instrument_track_without_allocating() {
+        let (mut handle, mut audio) = engine(16, 48_000.0);
+        handle.send_plan(instrument_plan(64)).unwrap();
+        let mut block = vec![0.0; 2 * 1024]; // 16 chunks of 64 frames
+        audio.process(&mut block, 2); // sets the MIDI clock reference
+        assert!(block.iter().all(|&v| v == 0.0));
+
+        let midi = handle.midi.as_mut().unwrap();
+        assert!(midi.send(&[0x90, 69, 127]));
+        assert_no_alloc(|| audio.process(&mut block, 2));
+        // Stopped transport: live instruments still play.
+        assert!(block.iter().any(|v| v.abs() > 0.01));
+        assert!(block.iter().all(|v| v.is_finite()));
+
+        assert!(handle.midi.as_mut().unwrap().send(&[0x80, 69, 0]));
+        assert_no_alloc(|| {
+            for _ in 0..8 {
+                audio.process(&mut block, 2); // past the release
+            }
+        });
+        assert!(block.iter().all(|&v| v == 0.0));
+    }
+
+    /// `(call index, chunk-relative offset)` of each MIDI event, packed as
+    /// `call << 32 | offset` in lock-free slots (a Mutex would allocate on macOS).
+    #[derive(Default)]
+    struct Seen {
+        len: AtomicUsize,
+        slots: [AtomicU64; 16],
+    }
+
+    impl Seen {
+        fn list(&self) -> Vec<(u64, u64)> {
+            let n = self.len.load(Ordering::SeqCst);
+            let slot = |s: &AtomicU64| {
+                (
+                    s.load(Ordering::SeqCst) >> 32,
+                    s.load(Ordering::SeqCst) & 0xFFFF_FFFF,
+                )
+            };
+            self.slots[..n].iter().map(slot).collect()
+        }
+    }
+
+    /// Records every MIDI event it receives into `Seen`.
+    struct MidiProbe {
+        calls: u64,
+        seen: Arc<Seen>,
+    }
+
+    impl AudioNode for MidiProbe {
+        fn process(
+            &mut self,
+            _inputs: &[&[f32]],
+            _outputs: &mut [&mut [f32]],
+            midi_in: &[daw_core::MidiEvent],
+            _midi_out: &mut Vec<daw_core::MidiEvent>,
+            _context: &ProcessContext,
+        ) {
+            for e in midi_in {
+                let i = self.seen.len.fetch_add(1, Ordering::SeqCst);
+                let packed = self.calls << 32 | u64::from(e.sample_offset);
+                self.seen.slots[i].store(packed, Ordering::SeqCst);
+            }
+            self.calls += 1;
+        }
+        fn reset(&mut self) {}
+    }
+
+    fn midi_probe_plan(seen: &Arc<Seen>) -> Box<ExecutionPlan> {
+        let mut plan = ExecutionPlan::new(64);
+        let node = MidiProbe {
+            calls: 0,
+            seen: seen.clone(),
+        };
+        plan.insert(NodeId(0), Box::new(node));
+        let step = plan.add(NodeId(0), vec![], 1).unwrap();
+        plan.route_midi(step);
+        Box::new(plan)
+    }
+
+    #[test]
+    fn midi_events_land_in_their_chunk_at_a_chunk_relative_offset() {
+        let (mut handle, mut audio) = engine(16, 1_000.0); // 1 frame = 1 ms
+        let seen = Arc::<Seen>::default();
+        handle.send_plan(midi_probe_plan(&seen)).unwrap();
+        audio.midi.set_reference(0);
+        let tx = handle.midi.as_mut().unwrap();
+        // 200 frames in chunks of 64: [0,64) [64,128) [128,192) [192,200).
+        for frame in [5, 63, 64, 130, 199] {
+            tx.send_at(frame * 1_000_000, [0x90, 60, 100]);
+        }
+
+        let mut block = vec![0.0; 200];
+        assert_no_alloc(|| audio.process(&mut block, 1));
+
+        assert_eq!(seen.list(), [(0, 5), (0, 63), (1, 0), (2, 2), (3, 7)]);
+    }
+
+    #[test]
+    fn midi_without_a_plan_is_discarded() {
+        let (mut handle, mut audio) = engine(16, 1_000.0);
+        let seen = Arc::<Seen>::default();
+        audio.midi.set_reference(0);
+        let tx = handle.midi.as_mut().unwrap();
+        tx.send_at(5_000_000, [0x90, 60, 100]);
+        let mut block = vec![1.0; 64];
+        assert_no_alloc(|| audio.process(&mut block, 1));
+        assert!(block.iter().all(|&v| v == 0.0));
+
+        // The stale event is gone, not replayed into the plan that arrives later.
+        handle.send_plan(midi_probe_plan(&seen)).unwrap();
+        audio.process(&mut block, 1);
+        assert!(seen.list().is_empty());
+    }
+
+    #[test]
+    fn engine_publishes_the_playhead_for_other_threads() {
+        let (mut handle, mut audio) = engine(16, 48_000.0);
+        let clock = handle.playhead_clock();
+        handle.commands.push(Command::Seek(500)).unwrap();
+        handle.commands.push(Command::Play).unwrap();
+        let mut block = [0.0; 128];
+        audio.process(&mut block, 2);
+        assert_eq!(clock.load(Ordering::Relaxed), 500, "start of the block");
+        audio.process(&mut block, 2);
+        assert_eq!(clock.load(Ordering::Relaxed), 564);
     }
 }

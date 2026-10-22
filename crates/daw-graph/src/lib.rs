@@ -4,8 +4,12 @@
 mod plan;
 mod track;
 
-pub use plan::{ExecutionPlan, PlanError, Source, StepId, MAX_CHANNELS};
+pub use plan::{
+    ExecutionPlan, LiveNodes, NodeArena, PlanError, Source, StepId, MAX_CHANNELS, MAX_NODES,
+};
 pub use track::TrackNode;
+
+use std::any::Any;
 
 use daw_core::{MidiEvent, ProcessContext};
 
@@ -32,6 +36,11 @@ pub trait AudioNode: Send {
         0
     }
     fn reset(&mut self);
+    /// Swaps in data the main thread sent with `ExecutionPlan::update`, such as a
+    /// track's clip list, leaving the node's old data in `data` so it is dropped off
+    /// the audio thread. Runs on the audio thread: never allocate or drop here.
+    /// Data of a type the node does not expect is ignored.
+    fn exchange(&mut self, _data: &mut (dyn Any + Send)) {}
 }
 
 /// Multiplies each input channel by a fixed linear gain into the matching output

@@ -1,4 +1,6 @@
+use std::any::Any;
 use std::f32::consts::FRAC_PI_4;
+use std::mem;
 use std::sync::Arc;
 
 use daw_core::{Clip, MidiEvent, ProcessContext, TrackParams};
@@ -11,6 +13,8 @@ const SMOOTHING_SECONDS: f32 = 0.005;
 
 /// A stereo audio track: plays its clips at the transport position, then applies
 /// smoothed gain, equal-power pan, mute and solo from its shared `TrackParams`.
+///
+/// Its clip list is replaced with `plan.update(id, TrackNode::clips_update(clips))`.
 ///
 /// Writes output channels 0 and 1. Mono clips play on both; any further output
 /// channels are zeroed.
@@ -32,6 +36,13 @@ impl TrackNode {
             left: Smoother::new(left),
             right: Smoother::new(right),
         }
+    }
+}
+
+impl TrackNode {
+    /// Payload for `ExecutionPlan::update` that replaces a live track's clips.
+    pub fn clips_update(clips: Vec<Clip>) -> Box<dyn Any + Send> {
+        Box::new(clips.into_boxed_slice())
     }
 }
 
@@ -99,6 +110,12 @@ impl AudioNode for TrackNode {
                 }
             }
             [] => {}
+        }
+    }
+
+    fn exchange(&mut self, data: &mut (dyn Any + Send)) {
+        if let Some(clips) = data.downcast_mut::<Box<[Clip]>>() {
+            mem::swap(&mut self.clips, clips);
         }
     }
 

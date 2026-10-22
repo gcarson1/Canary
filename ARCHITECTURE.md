@@ -10,7 +10,11 @@ In Phase 2, starting with a flat `Vec<Track>` that sums into a Master Bus is fin
 
 * **The Modular Solution:** Represent *everything*—tracks, buses, plugins, hardware inputs, and master outputs—as a uniform trait: `AudioNode`.
 * **How it scales:** The audio engine doesn't care what a node does; it only traverses a compiled **execution schedule** (a topologically sorted flat array of node IDs and buffer indices).
-* **Lock-Free Graph Swapping:** When the user drags a new plugin onto a track or adds a sidechain route in the UI, the **Main Thread** clones the topological structure, compiles a new execution plan, pre-allocates any needed intermediate mixing buffers, wraps the new plan in a `Box<ExecutionPlan>`, and sends the pointer through the `rtrb` command queue. The **Audio Thread** swaps the pointer at the top of the next block and sends the old `Box<ExecutionPlan>` to the Garbage Collector thread.
+* **Lock-Free Graph Swapping:** Nodes live in a persistent `NodeArena` (`MAX_NODES` = 4096 slots, indexed by `NodeId`) owned by the **Audio Thread**, so node state (smoothers, later delay lines and plugins) survives graph edits. An `ExecutionPlan` holds the schedule plus all its pre-allocated scratch buffers, and the node changes to make when it goes live:
+    * **Schedule:** steps by `NodeId`, acyclic by construction (a step may only read from earlier steps; the last step is the master output).
+    * **Node changes:** `insert`, `remove`, and `update` (new data swapped into a live node in place via `AudioNode::exchange`; the old data stays in the plan).
+    * **Main Thread:** `LiveNodes` mirrors the arena. `EngineHandle::send_plan` validates the plan against it, then queues the `Box<ExecutionPlan>` through the `rtrb` command queue.
+    * **Audio Thread:** at the top of a block, and only if the garbage queue has room, it calls `NodeArena::apply` (removals, inserts, updates), moves removed nodes into the retiring plan, and pushes the old plan to the garbage queue. `EngineHandle::collect_garbage` frees it on the Main Thread. Nothing is allocated or dropped on the Audio Thread.
 
 ```rust
 pub trait AudioNode: Send {
@@ -24,6 +28,7 @@ pub trait AudioNode: Send {
     );
     fn latency_samples(&self) -> u32 { 0 }
     fn reset(&mut self);
+    fn exchange(&mut self, _data: &mut (dyn Any + Send)) {} // Audio thread: no alloc, no drop
 }
 ```
 

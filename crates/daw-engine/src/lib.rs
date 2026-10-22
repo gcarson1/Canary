@@ -8,8 +8,10 @@ pub use load::{load_audio, LoadError};
 pub use output::{start_output, OutputError};
 pub use transport::Transport;
 
+use std::fmt;
+
 use daw_core::{Command, ProcessContext, Telemetry};
-use daw_graph::ExecutionPlan;
+use daw_graph::{ExecutionPlan, LiveNodes, NodeArena, PlanError};
 use rtrb::{Consumer, Producer, RingBuffer};
 
 /// Plans waiting to be swapped in, and retired plans waiting to be dropped.
@@ -19,12 +21,46 @@ const PLAN_QUEUE_CAPACITY: usize = 8;
 pub struct EngineHandle {
     pub commands: Producer<Command>,
     pub telemetry: Consumer<Telemetry>,
-    /// New plans for the audio thread, swapped in at the start of a block.
-    pub plans: Producer<Box<ExecutionPlan>>,
+    plans: Producer<Box<ExecutionPlan>>,
     garbage: Consumer<Box<ExecutionPlan>>,
+    /// Nodes the audio thread will hold once every queued plan is applied.
+    live: LiveNodes,
 }
 
+#[derive(Debug)]
+pub enum SendPlanError {
+    Invalid(PlanError),
+    /// The plan queue is full; the plan is handed back unsent.
+    QueueFull(Box<ExecutionPlan>),
+}
+
+impl fmt::Display for SendPlanError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Invalid(e) => write!(f, "invalid plan: {e}"),
+            Self::QueueFull(_) => write!(f, "plan queue is full"),
+        }
+    }
+}
+
+impl std::error::Error for SendPlanError {}
+
 impl EngineHandle {
+    /// Checks `plan` against the nodes the audio thread will have, then queues it to
+    /// be swapped in at the start of a block.
+    pub fn send_plan(&mut self, plan: Box<ExecutionPlan>) -> Result<(), SendPlanError> {
+        let next = self.live.check(&plan).map_err(SendPlanError::Invalid)?;
+        self.plans
+            .push(plan)
+            .map_err(|rtrb::PushError::Full(plan)| SendPlanError::QueueFull(plan))?;
+        self.live = next;
+        Ok(())
+    }
+
+    pub fn live_nodes(&self) -> &LiveNodes {
+        &self.live
+    }
+
     /// Drops plans the audio thread has retired, freeing their nodes, buffers and
     /// clip audio. Call it regularly from a non-real-time thread.
     pub fn collect_garbage(&mut self) {
@@ -39,6 +75,7 @@ pub struct AudioEngine {
     plans: Consumer<Box<ExecutionPlan>>,
     garbage: Producer<Box<ExecutionPlan>>,
     plan: Option<Box<ExecutionPlan>>,
+    nodes: NodeArena,
     transport: Transport,
     sample_rate: f32,
 }
@@ -56,6 +93,7 @@ pub fn engine(capacity: usize, sample_rate: f32) -> (EngineHandle, AudioEngine) 
             telemetry: telemetry_rx,
             plans: plan_tx,
             garbage: garbage_rx,
+            live: LiveNodes::default(),
         },
         AudioEngine {
             commands: command_rx,
@@ -63,6 +101,7 @@ pub fn engine(capacity: usize, sample_rate: f32) -> (EngineHandle, AudioEngine) 
             plans: plan_rx,
             garbage: garbage_tx,
             plan: None,
+            nodes: NodeArena::default(),
             transport: Transport::default(),
             sample_rate,
         },
@@ -82,9 +121,16 @@ impl AudioEngine {
         }
 
         // Retire the old plan before taking a new one; if the garbage queue is full
-        // the new plan waits, so nothing is ever dropped on this thread.
+        // the new plan waits, so nothing is ever dropped on this thread. Nodes the
+        // new plan removes ride out with the old plan.
         while !self.garbage.is_full() {
-            let Ok(plan) = self.plans.pop() else { break };
+            let Ok(mut plan) = self.plans.pop() else {
+                break;
+            };
+            self.nodes.apply(&mut plan);
+            if let Some(old) = self.plan.as_deref_mut() {
+                plan.hand_retired_to(old);
+            }
             if let Some(old) = self.plan.replace(plan) {
                 let _ = self.garbage.push(old); // cannot fail: checked not full
             }
@@ -100,12 +146,15 @@ impl AudioEngine {
                 // The device may hand us more frames than the plan's buffers hold.
                 for chunk in output.chunks_mut(plan.max_block() * channels) {
                     let frames = chunk.len() / channels;
-                    plan.process(&ProcessContext {
-                        sample_rate: self.sample_rate,
-                        num_samples: frames,
-                        playhead: self.transport.playhead(),
-                        playing: self.transport.is_playing(),
-                    });
+                    plan.process(
+                        &mut self.nodes,
+                        &ProcessContext {
+                            sample_rate: self.sample_rate,
+                            num_samples: frames,
+                            playhead: self.transport.playhead(),
+                            playing: self.transport.is_playing(),
+                        },
+                    );
                     let master = plan.output();
                     for (frame, out) in chunk.chunks_exact_mut(channels).enumerate() {
                         for (ch, sample) in out.iter_mut().enumerate() {
@@ -129,8 +178,9 @@ impl AudioEngine {
 mod tests {
     use super::*;
     use assert_no_alloc::{assert_no_alloc, AllocDisabler};
-    use daw_core::{Clip, SampleData, TimeSignature, TrackParams};
-    use daw_graph::{GainNode, Source, TrackNode};
+    use daw_core::{Clip, NodeId, SampleData, TimeSignature, TrackParams};
+    use daw_graph::{AudioNode, GainNode, Source, TrackNode};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     #[global_allocator]
@@ -209,24 +259,23 @@ mod tests {
             start_sample: 0,
             audio: Arc::new(audio),
         };
+        let (track, master) = (NodeId(0), NodeId(1));
         let mut plan = ExecutionPlan::new(max_block);
-        let track = plan
-            .add(
-                Box::new(TrackNode::new(vec![clip], Arc::new(params))),
-                vec![],
-                2,
-            )
-            .unwrap();
+        plan.insert(
+            track,
+            Box::new(TrackNode::new(vec![clip], Arc::new(params))),
+        );
+        plan.insert(master, Box::new(GainNode { gain: 1.0 }));
+        let track_step = plan.add(track, vec![], 2).unwrap();
         let inputs = (0..2)
             .map(|channel| {
                 vec![Source {
-                    step: track,
+                    step: track_step,
                     channel,
                 }]
             })
             .collect();
-        plan.add(Box::new(GainNode { gain: 1.0 }), inputs, 2)
-            .unwrap();
+        plan.add(master, inputs, 2).unwrap();
         Box::new(plan)
     }
 
@@ -276,5 +325,207 @@ mod tests {
 
         assert_eq!(block[0], 1.0);
         assert_eq!(audio.transport().playhead(), 1024);
+    }
+
+    /// Writes its call count to output 0 and counts its own drops.
+    struct Probe {
+        calls: f32,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl AudioNode for Probe {
+        fn process(
+            &mut self,
+            _inputs: &[&[f32]],
+            outputs: &mut [&mut [f32]],
+            _midi_in: &[daw_core::MidiEvent],
+            _midi_out: &mut Vec<daw_core::MidiEvent>,
+            _context: &ProcessContext,
+        ) {
+            self.calls += 1.0;
+            outputs[0].fill(self.calls);
+        }
+        fn reset(&mut self) {}
+    }
+
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn probe(drops: &Arc<AtomicUsize>) -> Box<Probe> {
+        Box::new(Probe {
+            calls: 0.0,
+            drops: drops.clone(),
+        })
+    }
+
+    /// Schedules the already-live node `id` as the plan's only step.
+    fn reschedule(mut plan: ExecutionPlan, id: u32) -> Box<ExecutionPlan> {
+        plan.add(NodeId(id), vec![], 1).unwrap();
+        Box::new(plan)
+    }
+
+    /// Runs one 8-frame mono block and returns its first sample.
+    fn first_sample(audio: &mut AudioEngine) -> f32 {
+        let mut block = [0.0; 8];
+        audio.process(&mut block, 1);
+        block[0]
+    }
+
+    #[test]
+    fn node_state_survives_a_plan_that_only_reschedules_it() {
+        let (mut handle, mut audio) = engine(16, 48_000.0);
+        let drops = Arc::default();
+        let mut first = ExecutionPlan::new(8);
+        first.insert(NodeId(0), probe(&drops));
+        handle.send_plan(reschedule(first, 0)).unwrap();
+        assert_eq!(first_sample(&mut audio), 1.0);
+        assert_eq!(first_sample(&mut audio), 2.0);
+
+        handle
+            .send_plan(reschedule(ExecutionPlan::new(8), 0))
+            .unwrap();
+        assert_eq!(first_sample(&mut audio), 3.0);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn removed_node_drops_only_through_garbage() {
+        let (mut handle, mut audio) = engine(16, 48_000.0);
+        let drops = Arc::default();
+        let mut first = ExecutionPlan::new(8);
+        first.insert(NodeId(0), probe(&drops));
+        first.insert(NodeId(1), probe(&drops));
+        handle.send_plan(reschedule(first, 0)).unwrap();
+        first_sample(&mut audio);
+
+        let mut second = ExecutionPlan::new(8);
+        second.remove(NodeId(1));
+        handle.send_plan(reschedule(second, 0)).unwrap();
+        assert!(!handle.live_nodes().is_live(NodeId(1)));
+        first_sample(&mut audio); // swap: the first plan carries node 1 to garbage
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert_eq!(handle.garbage.slots(), 1);
+
+        handle.collect_garbage();
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    /// Clip of ones-times-`value` and a stereo playing engine with it on a track.
+    fn clip(value: f32) -> (Clip, Arc<SampleData>) {
+        let audio = Arc::new(SampleData::new(48_000, vec![vec![value; 64]]).unwrap());
+        let clip = Clip {
+            start_sample: 0,
+            audio: audio.clone(),
+        };
+        (clip, audio)
+    }
+
+    #[test]
+    fn update_swaps_track_clips_and_old_audio_is_freed_by_garbage() {
+        let (mut handle, mut audio) = engine(16, 48_000.0);
+        let (old, old_audio) = clip(1.0);
+        let params = TrackParams::new(Arc::default());
+        params.set_pan(-1.0);
+        let mut first = ExecutionPlan::new(8);
+        first.insert(
+            NodeId(0),
+            Box::new(TrackNode::new(vec![old], Arc::new(params))),
+        );
+        handle.send_plan(reschedule(first, 0)).unwrap();
+        handle.commands.push(Command::Play).unwrap();
+        let left = |audio: &mut AudioEngine| {
+            let mut block = [0.0; 16];
+            audio.process(&mut block, 2);
+            block[0]
+        };
+        assert_eq!(left(&mut audio), 1.0);
+        assert_eq!(Arc::strong_count(&old_audio), 2);
+
+        let (new, _new_audio) = clip(0.5);
+        let mut second = ExecutionPlan::new(8);
+        second.update(NodeId(0), TrackNode::clips_update(vec![new]));
+        handle.send_plan(reschedule(second, 0)).unwrap();
+        handle.commands.push(Command::Seek(0)).unwrap();
+        assert_eq!(left(&mut audio), 0.5);
+        // The old clips now sit in the live plan's update, not dropped.
+        assert_eq!(Arc::strong_count(&old_audio), 2);
+
+        handle
+            .send_plan(reschedule(ExecutionPlan::new(8), 0))
+            .unwrap();
+        left(&mut audio); // retires the second plan, which holds the old clips
+        assert_eq!(Arc::strong_count(&old_audio), 2);
+        handle.collect_garbage();
+        assert_eq!(Arc::strong_count(&old_audio), 1);
+    }
+
+    #[test]
+    fn send_plan_rejects_invalid_and_hands_back_when_full() {
+        let (mut handle, mut audio) = engine(16, 48_000.0);
+        let drops = Arc::default();
+
+        let mut bad = ExecutionPlan::new(8);
+        bad.remove(NodeId(0));
+        assert!(matches!(
+            handle.send_plan(Box::new(bad)),
+            Err(SendPlanError::Invalid(PlanError::UnknownNode(NodeId(0))))
+        ));
+        assert!(handle.plans.slots() == PLAN_QUEUE_CAPACITY);
+
+        let mut first = ExecutionPlan::new(8);
+        first.insert(NodeId(0), probe(&drops));
+        handle.send_plan(Box::new(first)).unwrap();
+        for _ in 1..PLAN_QUEUE_CAPACITY {
+            handle.send_plan(Box::new(ExecutionPlan::new(8))).unwrap();
+        }
+        let mut late = ExecutionPlan::new(8);
+        late.insert(NodeId(1), probe(&drops));
+        let Err(SendPlanError::QueueFull(late)) = handle.send_plan(Box::new(late)) else {
+            panic!("queue should be full");
+        };
+        assert!(!handle.live_nodes().is_live(NodeId(1)));
+        assert!(handle.live_nodes().is_live(NodeId(0)));
+
+        first_sample(&mut audio); // drains the queue
+        handle.send_plan(late).unwrap();
+        assert!(handle.live_nodes().is_live(NodeId(1)));
+    }
+
+    #[test]
+    fn swap_that_inserts_removes_and_updates_does_not_allocate() {
+        let (mut handle, mut audio) = engine(16, 48_000.0);
+        let drops = Arc::default();
+        let (old, _old_audio) = clip(1.0);
+        let (new, _new_audio) = clip(0.5);
+        let mut first = ExecutionPlan::new(64);
+        first.insert(
+            NodeId(0),
+            Box::new(TrackNode::new(
+                vec![old],
+                Arc::new(TrackParams::new(Arc::default())),
+            )),
+        );
+        first.insert(NodeId(1), probe(&drops));
+        handle.send_plan(reschedule(first, 0)).unwrap();
+        handle.commands.push(Command::Play).unwrap();
+        let mut block = vec![0.0; 1024];
+        audio.process(&mut block, 2);
+
+        let mut second = ExecutionPlan::new(64);
+        second.remove(NodeId(1));
+        second.insert(NodeId(2), Box::new(GainNode { gain: 1.0 }));
+        second.update(NodeId(0), TrackNode::clips_update(vec![new]));
+        handle.send_plan(reschedule(second, 0)).unwrap();
+
+        assert_no_alloc(|| {
+            audio.process(&mut block, 2); // applies every change and retires the first plan
+            audio.process(&mut block, 2);
+        });
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        handle.collect_garbage();
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 }

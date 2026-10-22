@@ -1,20 +1,24 @@
+use std::any::Any;
 use std::fmt;
+use std::mem;
 
-use daw_core::{MidiEvent, ProcessContext};
+use daw_core::{MidiEvent, NodeId, ProcessContext};
 
 use crate::AudioNode;
 
 /// Most input or output channels one node can have. The executor builds its
 /// per-node slice arrays on the stack at this size, so it never allocates.
 pub const MAX_CHANNELS: usize = 8;
+/// Node slots in a `NodeArena`; every `NodeId` must be below this.
+pub const MAX_NODES: usize = 4096;
 /// MIDI events a node may emit per block without the executor allocating.
 const MIDI_CAPACITY: usize = 1024;
 
-/// Index of a node in an `ExecutionPlan`, in the order it was added.
+/// Index of a step in an `ExecutionPlan`, in the order it was added.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StepId(pub usize);
 
-/// One output channel of an earlier node, feeding an input channel.
+/// One output channel of an earlier step, feeding an input channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Source {
     pub step: StepId,
@@ -24,8 +28,14 @@ pub struct Source {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanError {
     TooManyChannels(usize),
-    /// A source names a node that is not earlier in the plan, or a channel it lacks.
+    /// A source names a step that is not earlier in the plan, or a channel it lacks.
     BadSource(Source),
+    /// The id is at least `MAX_NODES`.
+    IdOutOfRange(NodeId),
+    /// Removed, updated or scheduled, but not live once the plan applies.
+    UnknownNode(NodeId),
+    /// Inserted while live, or listed twice in the same role.
+    DuplicateNode(NodeId),
 }
 
 impl fmt::Display for PlanError {
@@ -34,9 +44,12 @@ impl fmt::Display for PlanError {
             Self::TooManyChannels(n) => write!(f, "{n} channels, the limit is {MAX_CHANNELS}"),
             Self::BadSource(s) => write!(
                 f,
-                "source step {} channel {} is not an earlier node's output",
+                "source step {} channel {} is not an earlier step's output",
                 s.step.0, s.channel
             ),
+            Self::IdOutOfRange(id) => write!(f, "node {} is past the {MAX_NODES} limit", id.0),
+            Self::UnknownNode(id) => write!(f, "node {} is not live", id.0),
+            Self::DuplicateNode(id) => write!(f, "node {} is already live or listed twice", id.0),
         }
     }
 }
@@ -44,22 +57,30 @@ impl fmt::Display for PlanError {
 impl std::error::Error for PlanError {}
 
 struct Step {
-    node: Box<dyn AudioNode>,
+    node: NodeId,
     /// `sources[ch]` are summed into input channel `ch`.
     sources: Vec<Vec<Source>>,
     inputs: Vec<Box<[f32]>>,
     outputs: Vec<Box<[f32]>>,
 }
 
-/// A compiled, topologically ordered schedule of nodes with every buffer allocated
-/// up front. Built on the main thread, then handed to the audio thread whole.
+/// A topologically ordered schedule with every buffer allocated up front, plus the
+/// node changes to make when it goes live. Built on the main thread, then handed to
+/// the audio thread whole.
 ///
-/// Nodes may only read from nodes added before them, so the plan is acyclic by
-/// construction. The last node added is the plan's output (the master bus).
+/// Nodes themselves live in the audio thread's `NodeArena` and survive from plan to
+/// plan, so delay lines, filters and smoothers keep their state across graph edits.
+/// Steps may only read from steps added before them, so the plan is acyclic by
+/// construction. The last step added is the plan's output (the master bus).
 pub struct ExecutionPlan {
     steps: Vec<Step>,
     max_block: usize,
     midi_out: Vec<MidiEvent>,
+    inserts: Vec<(NodeId, Option<Box<dyn AudioNode>>)>,
+    removals: Vec<NodeId>,
+    /// Receives removed nodes on the audio thread; capacity reserved in `remove`.
+    retired: Vec<Box<dyn AudioNode>>,
+    updates: Vec<(NodeId, Box<dyn Any + Send>)>,
 }
 
 impl ExecutionPlan {
@@ -71,6 +92,10 @@ impl ExecutionPlan {
             steps: Vec::new(),
             max_block,
             midi_out: Vec::with_capacity(MIDI_CAPACITY),
+            inserts: Vec::new(),
+            removals: Vec::new(),
+            retired: Vec::new(),
+            updates: Vec::new(),
         }
     }
 
@@ -78,11 +103,28 @@ impl ExecutionPlan {
         self.max_block
     }
 
-    /// Appends `node`. `inputs[ch]` lists the earlier outputs summed into input
-    /// channel `ch`; an empty list means that input is silence.
+    /// Adds a new node to the arena when this plan goes live.
+    pub fn insert(&mut self, id: NodeId, node: Box<dyn AudioNode>) {
+        self.inserts.push((id, Some(node)));
+    }
+
+    /// Takes a node out of the arena when this plan goes live. It is dropped later,
+    /// off the audio thread, with the plan it was running in.
+    pub fn remove(&mut self, id: NodeId) {
+        self.removals.push(id);
+        self.retired.reserve_exact(self.removals.len());
+    }
+
+    /// Hands `data` to a live node's `AudioNode::exchange` when this plan goes live.
+    pub fn update(&mut self, id: NodeId, data: Box<dyn Any + Send>) {
+        self.updates.push((id, data));
+    }
+
+    /// Schedules node `id` to run next. `inputs[ch]` lists the earlier outputs summed
+    /// into input channel `ch`; an empty list means that input is silence.
     pub fn add(
         &mut self,
-        node: Box<dyn AudioNode>,
+        id: NodeId,
         inputs: Vec<Vec<Source>>,
         num_outputs: usize,
     ) -> Result<StepId, PlanError> {
@@ -102,7 +144,7 @@ impl ExecutionPlan {
         }
         let buffer = || vec![0.0; self.max_block].into_boxed_slice();
         self.steps.push(Step {
-            node,
+            node: id,
             inputs: (0..inputs.len()).map(|_| buffer()).collect(),
             outputs: (0..num_outputs).map(|_| buffer()).collect(),
             sources: inputs,
@@ -110,14 +152,20 @@ impl ExecutionPlan {
         Ok(StepId(self.steps.len() - 1))
     }
 
-    /// The last node's output buffers, valid for `num_samples` frames after `process`.
+    /// The last step's output buffers, valid for `num_samples` frames after `process`.
     pub fn output(&self) -> &[Box<[f32]>] {
         self.steps.last().map_or(&[], |s| &s.outputs)
     }
 
-    /// Runs every node once. Never allocates, locks or blocks.
+    /// Moves the nodes this plan removed into `old`, so they are dropped with it.
+    /// Allocation-free; call it on the audio thread right after `NodeArena::apply`.
+    pub fn hand_retired_to(&mut self, old: &mut ExecutionPlan) {
+        mem::swap(&mut self.retired, &mut old.retired);
+    }
+
+    /// Runs every step once. Never allocates, locks or blocks.
     /// `context.num_samples` must not exceed `max_block`.
-    pub fn process(&mut self, context: &ProcessContext) {
+    pub fn process(&mut self, arena: &mut NodeArena, context: &ProcessContext) {
         let n = context.num_samples;
         assert!(n <= self.max_block, "block of {n} frames exceeds plan max");
 
@@ -152,6 +200,13 @@ impl ExecutionPlan {
                 *slot = &mut buffer[..n];
             }
 
+            // `LiveNodes::check` guarantees the node exists; stay silent if not.
+            let Some(node) = arena.get_mut(*node) else {
+                for out in &mut outs[..num_outputs] {
+                    out.fill(0.0);
+                }
+                continue;
+            };
             self.midi_out.clear();
             node.process(
                 &ins[..num_inputs],
@@ -161,6 +216,124 @@ impl ExecutionPlan {
                 context,
             );
         }
+    }
+}
+
+impl fmt::Debug for ExecutionPlan {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExecutionPlan")
+            .field("steps", &self.steps.len())
+            .field("max_block", &self.max_block)
+            .field("inserts", &self.inserts.len())
+            .field("removals", &self.removals)
+            .field("updates", &self.updates.len())
+            .finish()
+    }
+}
+
+/// The audio thread's nodes, indexed by `NodeId`. Allocated once on the main thread.
+pub struct NodeArena {
+    slots: Box<[Option<Box<dyn AudioNode>>]>,
+}
+
+impl Default for NodeArena {
+    fn default() -> Self {
+        Self {
+            slots: (0..MAX_NODES).map(|_| None).collect(),
+        }
+    }
+}
+
+impl NodeArena {
+    fn get_mut(&mut self, id: NodeId) -> Option<&mut (dyn AudioNode + 'static)> {
+        self.slots.get_mut(id.0 as usize)?.as_deref_mut()
+    }
+
+    /// Makes `plan`'s node changes: removals, then inserts, then updates. Never
+    /// allocates or drops a node; anything it cannot place stays in the plan.
+    pub fn apply(&mut self, plan: &mut ExecutionPlan) {
+        for &id in &plan.removals {
+            // Capacity was reserved in `remove`, so this push never allocates.
+            if plan.retired.len() < plan.retired.capacity() {
+                if let Some(node) = self.slots.get_mut(id.0 as usize).and_then(Option::take) {
+                    plan.retired.push(node);
+                }
+            }
+        }
+        for (id, node) in &mut plan.inserts {
+            if let Some(slot @ None) = self.slots.get_mut(id.0 as usize) {
+                *slot = node.take();
+            }
+        }
+        for (id, data) in &mut plan.updates {
+            if let Some(node) = self.get_mut(*id) {
+                node.exchange(data.as_mut());
+            }
+        }
+    }
+}
+
+/// The main thread's record of which nodes the audio thread will have once every
+/// plan sent so far is applied. Checks a plan against it before sending.
+#[derive(Clone)]
+pub struct LiveNodes {
+    live: Vec<bool>,
+}
+
+impl Default for LiveNodes {
+    fn default() -> Self {
+        Self {
+            live: vec![false; MAX_NODES],
+        }
+    }
+}
+
+impl LiveNodes {
+    pub fn is_live(&self, id: NodeId) -> bool {
+        self.live.get(id.0 as usize).copied().unwrap_or(false)
+    }
+
+    /// Validates `plan` and returns the live set after it applies. Keep the old set
+    /// until the plan is actually queued.
+    pub fn check(&self, plan: &ExecutionPlan) -> Result<LiveNodes, PlanError> {
+        let in_range = |id: NodeId| {
+            if (id.0 as usize) < MAX_NODES {
+                Ok(id.0 as usize)
+            } else {
+                Err(PlanError::IdOutOfRange(id))
+            }
+        };
+        let mut next = self.clone();
+        for &id in &plan.removals {
+            let i = in_range(id)?;
+            if !next.live[i] {
+                return Err(PlanError::UnknownNode(id));
+            }
+            next.live[i] = false;
+        }
+        for (id, _) in &plan.inserts {
+            let i = in_range(*id)?;
+            if next.live[i] {
+                return Err(PlanError::DuplicateNode(*id));
+            }
+            next.live[i] = true;
+        }
+        for (id, _) in &plan.updates {
+            if !next.is_live(*id) {
+                return Err(PlanError::UnknownNode(*id));
+            }
+        }
+        let mut scheduled = vec![false; MAX_NODES];
+        for step in &plan.steps {
+            let i = in_range(step.node)?;
+            if !next.live[i] {
+                return Err(PlanError::UnknownNode(step.node));
+            }
+            if mem::replace(&mut scheduled[i], true) {
+                return Err(PlanError::DuplicateNode(step.node));
+            }
+        }
+        Ok(next)
     }
 }
 
@@ -204,6 +377,24 @@ mod tests {
         Source { step, channel: 0 }
     }
 
+    /// Inserts `node` under the next free id and schedules it.
+    fn add(
+        plan: &mut ExecutionPlan,
+        node: Box<dyn AudioNode>,
+        inputs: Vec<Vec<Source>>,
+        num_outputs: usize,
+    ) -> Result<StepId, PlanError> {
+        let id = NodeId(plan.inserts.len() as u32);
+        plan.insert(id, node);
+        plan.add(id, inputs, num_outputs)
+    }
+
+    /// Applies pending node changes (a no-op after the first call) and runs a block.
+    fn run(plan: &mut ExecutionPlan, arena: &mut NodeArena, n: usize) {
+        arena.apply(plan);
+        plan.process(arena, &ctx(n));
+    }
+
     fn ctx(n: usize) -> ProcessContext {
         ProcessContext {
             sample_rate: 48_000.0,
@@ -215,22 +406,23 @@ mod tests {
 
     #[test]
     fn sources_are_summed_and_input_does_not_keep_stale_data() {
+        let mut arena = NodeArena::default();
         let mut plan = ExecutionPlan::new(4);
-        let a = plan.add(script(&[1.0, 0.0]), vec![], 1).unwrap();
-        let b = plan.add(script(&[2.0, 0.0]), vec![], 1).unwrap();
+        let a = add(&mut plan, script(&[1.0, 0.0]), vec![], 1).unwrap();
+        let b = add(&mut plan, script(&[2.0, 0.0]), vec![], 1).unwrap();
         let gain = Box::new(GainNode { gain: 1.0 });
-        plan.add(gain, vec![vec![src(a), src(b)]], 1).unwrap();
+        add(&mut plan, gain, vec![vec![src(a), src(b)]], 1).unwrap();
 
-        plan.process(&ctx(4));
+        run(&mut plan, &mut arena, 4);
         assert_eq!(&*plan.output()[0], &[3.0; 4]);
-        plan.process(&ctx(4));
+        run(&mut plan, &mut arena, 4);
         assert_eq!(&*plan.output()[0], &[0.0; 4]);
     }
 
     #[test]
     fn add_rejects_bad_sources_and_too_many_channels() {
         let mut plan = ExecutionPlan::new(4);
-        let a = plan.add(script(&[]), vec![], 1).unwrap();
+        let a = add(&mut plan, script(&[]), vec![], 1).unwrap();
         let node = || Box::new(GainNode { gain: 1.0 });
 
         let later = Source {
@@ -238,7 +430,7 @@ mod tests {
             channel: 0,
         }; // would be this node itself
         assert_eq!(
-            plan.add(node(), vec![vec![later]], 1),
+            add(&mut plan, node(), vec![vec![later]], 1),
             Err(PlanError::BadSource(later))
         );
         let channel = Source {
@@ -246,38 +438,110 @@ mod tests {
             channel: 1,
         };
         assert_eq!(
-            plan.add(node(), vec![vec![channel]], 1),
+            add(&mut plan, node(), vec![vec![channel]], 1),
             Err(PlanError::BadSource(channel))
         );
         let too_many = MAX_CHANNELS + 1;
         assert_eq!(
-            plan.add(node(), vec![], too_many),
+            add(&mut plan, node(), vec![], too_many),
             Err(PlanError::TooManyChannels(too_many))
         );
         assert_eq!(
-            plan.add(node(), vec![vec![]; too_many], 1),
+            add(&mut plan, node(), vec![vec![]; too_many], 1),
             Err(PlanError::TooManyChannels(too_many))
         );
-        assert!(plan.add(node(), vec![vec![src(a)]], MAX_CHANNELS).is_ok());
+        assert!(add(&mut plan, node(), vec![vec![src(a)]], MAX_CHANNELS).is_ok());
     }
 
     #[test]
     fn short_block_only_touches_first_frames() {
+        let mut arena = NodeArena::default();
         let mut plan = ExecutionPlan::new(8);
-        plan.add(script(&[1.0, 2.0]), vec![], 1).unwrap();
-        plan.process(&ctx(8));
-        plan.process(&ctx(3));
+        add(&mut plan, script(&[1.0, 2.0]), vec![], 1).unwrap();
+        run(&mut plan, &mut arena, 8);
+        run(&mut plan, &mut arena, 3);
         assert_eq!(
             &*plan.output()[0],
             &[2.0, 2.0, 2.0, 1.0, 1.0, 1.0, 1.0, 1.0]
         );
     }
 
+    fn gain() -> Box<dyn AudioNode> {
+        Box::new(GainNode { gain: 1.0 })
+    }
+
+    /// A plan scheduling `id` once.
+    fn scheduled(id: u32) -> ExecutionPlan {
+        let mut plan = ExecutionPlan::new(4);
+        plan.add(NodeId(id), vec![], 1).unwrap();
+        plan
+    }
+
+    fn live_with(ids: &[u32]) -> LiveNodes {
+        let mut plan = ExecutionPlan::new(4);
+        for &id in ids {
+            plan.insert(NodeId(id), gain());
+        }
+        LiveNodes::default().check(&plan).unwrap()
+    }
+
+    #[test]
+    fn check_rejects_bad_node_changes_and_accepts_replace() {
+        let live = live_with(&[1]);
+        let (one, two) = (NodeId(1), NodeId(2));
+        let bad = NodeId(MAX_NODES as u32);
+
+        let mut plan = ExecutionPlan::new(4);
+        plan.remove(two);
+        assert_eq!(live.check(&plan).err(), Some(PlanError::UnknownNode(two)));
+
+        let mut plan = ExecutionPlan::new(4);
+        plan.insert(one, gain());
+        assert_eq!(live.check(&plan).err(), Some(PlanError::DuplicateNode(one)));
+
+        let mut plan = ExecutionPlan::new(4);
+        plan.update(two, Box::new(()));
+        assert_eq!(live.check(&plan).err(), Some(PlanError::UnknownNode(two)));
+
+        assert_eq!(
+            live.check(&scheduled(2)).err(),
+            Some(PlanError::UnknownNode(two))
+        );
+
+        let mut plan = scheduled(1);
+        plan.add(one, vec![], 1).unwrap();
+        assert_eq!(live.check(&plan).err(), Some(PlanError::DuplicateNode(one)));
+
+        let mut plan = ExecutionPlan::new(4);
+        plan.remove(bad);
+        assert_eq!(live.check(&plan).err(), Some(PlanError::IdOutOfRange(bad)));
+        let mut plan = ExecutionPlan::new(4);
+        plan.insert(bad, gain());
+        assert_eq!(live.check(&plan).err(), Some(PlanError::IdOutOfRange(bad)));
+        assert_eq!(
+            live.check(&scheduled(bad.0)).err(),
+            Some(PlanError::IdOutOfRange(bad))
+        );
+
+        // Remove then insert the same id in one plan, and use the new node.
+        let mut plan = scheduled(1);
+        plan.remove(one);
+        plan.insert(one, gain());
+        plan.update(one, Box::new(()));
+        assert!(live.check(&plan).unwrap().is_live(one));
+
+        // A node removed in a plan cannot be scheduled by it.
+        let mut plan = scheduled(1);
+        plan.remove(one);
+        assert_eq!(live.check(&plan).err(), Some(PlanError::UnknownNode(one)));
+    }
+
     #[test]
     #[should_panic(expected = "exceeds plan max")]
     fn oversized_block_panics() {
+        let mut arena = NodeArena::default();
         let mut plan = ExecutionPlan::new(4);
-        plan.add(script(&[]), vec![], 1).unwrap();
-        plan.process(&ctx(5));
+        add(&mut plan, script(&[]), vec![], 1).unwrap();
+        run(&mut plan, &mut arena, 5);
     }
 }

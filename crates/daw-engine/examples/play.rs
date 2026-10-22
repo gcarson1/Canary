@@ -5,7 +5,7 @@
 use std::sync::Arc;
 use std::{env, path::Path, thread, time::Duration};
 
-use daw_core::{Clip, Command, Telemetry, TrackParams};
+use daw_core::{Clip, Command, NodeId, Telemetry, TrackParams};
 use daw_graph::{ExecutionPlan, GainNode, Source, TrackNode};
 
 /// Frames per plan buffer; larger device callbacks are rendered in chunks.
@@ -24,29 +24,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         let params = Arc::new(TrackParams::new(Arc::default()));
+        let (track, master) = (NodeId(0), NodeId(1));
         let mut plan = ExecutionPlan::new(MAX_BLOCK);
-        let track = plan.add(
-            Box::new(TrackNode::new(
-                vec![Clip {
-                    start_sample: 0,
-                    audio,
-                }],
-                params,
-            )),
-            vec![],
-            2,
-        )?;
+        let clips = vec![Clip {
+            start_sample: 0,
+            audio,
+        }];
+        plan.insert(track, Box::new(TrackNode::new(clips, params)));
+        plan.insert(master, Box::new(GainNode { gain: 1.0 }));
+        let track_step = plan.add(track, vec![], 2)?;
         let from = |channel| {
             vec![Source {
-                step: track,
+                step: track_step,
                 channel,
             }]
         };
-        // Master bus: the last node added is what the device hears.
-        plan.add(Box::new(GainNode { gain: 1.0 }), vec![from(0), from(1)], 2)?;
-        if handle.plans.push(Box::new(plan)).is_err() {
-            return Err("plan queue full".into());
-        }
+        // The last step added is what the device hears.
+        plan.add(master, vec![from(0), from(1)], 2)?;
+        handle.send_plan(Box::new(plan))?;
     }
 
     handle.commands.push(Command::Play)?;

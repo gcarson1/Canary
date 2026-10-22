@@ -1,4 +1,11 @@
-//! The `AudioNode` trait, and later the topological sorter, PDC calculator and `ExecutionPlan` compiler.
+//! The `AudioNode` trait, the `ExecutionPlan` executor and the built-in nodes.
+//! The PDC calculator comes later.
+
+mod plan;
+mod track;
+
+pub use plan::{ExecutionPlan, PlanError, Source, StepId, MAX_CHANNELS};
+pub use track::TrackNode;
 
 use daw_core::{MidiEvent, ProcessContext};
 
@@ -65,6 +72,8 @@ mod tests {
         ProcessContext {
             sample_rate: 48_000.0,
             num_samples,
+            playhead: 0,
+            playing: false,
         }
     }
 

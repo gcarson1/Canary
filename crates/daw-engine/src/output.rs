@@ -47,7 +47,7 @@ pub fn start_output(
     let config = supported.config();
     let channels = config.channels as usize;
 
-    let (handle, mut audio) = engine(queue_capacity);
+    let (handle, mut audio) = engine(queue_capacity, config.sample_rate as f32);
     let stream = device.build_output_stream(
         config,
         move |data: &mut [f32], _| audio.process(data, channels),

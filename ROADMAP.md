@@ -45,10 +45,10 @@ The UI follows Styles.md whichever framework is chosen.
 - [x] `rtrb` command/telemetry queues: Play/Stop and tempo changes reach the audio thread without locks
 
 ### Phase 2: Multi-Track Mixing and Clip Scheduling
-- [ ] `Track` with a pre-allocated scratch buffer sized to the max block (for example 4096 frames). Per ARCHITECTURE.md, tracks become `AudioNode`s in the DAG, not a flat `Vec<Track>`.
-- [ ] Load samples with `symphonia` into `Arc<[f32]>` on the main thread and send `Arc` clones over the queue
-- [ ] Schedule clips by comparing `start_sample`/`end_sample` against the block's sample range
-- [ ] Lock-free / smoothed parameters for Gain, Pan, Mute, Solo
+- [x] `Track` with a pre-allocated scratch buffer sized to the max block (for example 4096 frames). Per ARCHITECTURE.md, tracks become `AudioNode`s in the DAG, not a flat `Vec<Track>`. `TrackNode` runs in an `ExecutionPlan` that owns every buffer; plans swap through an `rtrb` queue and retire to a garbage queue.
+- [x] Load samples with `symphonia` into `Arc<SampleData>` (planar `f32`) on the main thread and send `Arc` clones over the queue (inside the plan). Resampling to the device rate is not done yet.
+- [x] Schedule clips by comparing `start_sample`/`end_sample` against the block's sample range
+- [x] Lock-free / smoothed parameters for Gain, Pan, Mute, Solo
 
 ### Phase 3: Arrangement Timeline UI and Waveform Rendering
 - [ ] Mip-mapped waveform pyramid (min/max at 64, 256, 1024 and 4096 samples per pixel), 60+ FPS at any zoom

@@ -255,10 +255,7 @@ mod tests {
         let params = TrackParams::new(Arc::default());
         params.set_pan(-1.0);
         let audio = SampleData::new(48_000, vec![vec![1.0; clip_frames]]).unwrap();
-        let clip = Clip {
-            start_sample: 0,
-            audio: Arc::new(audio),
-        };
+        let clip = Clip::new(0, Arc::new(audio));
         let (track, master) = (NodeId(0), NodeId(1));
         let mut plan = ExecutionPlan::new(max_block);
         plan.insert(
@@ -325,6 +322,42 @@ mod tests {
 
         assert_eq!(block[0], 1.0);
         assert_eq!(audio.transport().playhead(), 1024);
+    }
+
+    #[test]
+    fn playing_trimmed_crossfaded_clips_does_not_allocate() {
+        let (mut handle, mut audio) = engine(16, 48_000.0);
+        let src = Arc::new(SampleData::new(48_000, vec![vec![1.0; 4096]]).unwrap());
+        let mut a = Clip::new(0, src.clone());
+        let mut b = Clip::new(1_500, src);
+        a.trim_end(2_000);
+        b.trim_start(1_600);
+        b.trim_end(3_800);
+        assert!(Clip::crossfade(&mut a, &mut b));
+        let params = TrackParams::new(Arc::default());
+        params.set_pan(-1.0);
+        let mut p = ExecutionPlan::new(64);
+        p.insert(
+            NodeId(0),
+            Box::new(TrackNode::new(vec![a, b], Arc::new(params))),
+        );
+        let step = p.add(NodeId(0), vec![], 2).unwrap();
+        p.insert(NodeId(1), Box::new(GainNode { gain: 1.0 }));
+        let inputs = (0..2)
+            .map(|channel| vec![Source { step, channel }])
+            .collect();
+        p.add(NodeId(1), inputs, 2).unwrap();
+        handle.plans.push(Box::new(p)).ok().unwrap();
+        handle.commands.push(Command::Play).unwrap();
+
+        let mut block = vec![0.0; 2 * 1024];
+        assert_no_alloc(|| {
+            for _ in 0..4 {
+                audio.process(&mut block, 2); // crosses the fades and both clip edges
+            }
+        });
+        assert_eq!(audio.transport().playhead(), 4096);
+        assert!(block.iter().all(|v| v.is_finite()));
     }
 
     /// Writes its call count to output 0 and counts its own drops.
@@ -416,10 +449,7 @@ mod tests {
     /// Clip of ones-times-`value` and a stereo playing engine with it on a track.
     fn clip(value: f32) -> (Clip, Arc<SampleData>) {
         let audio = Arc::new(SampleData::new(48_000, vec![vec![value; 64]]).unwrap());
-        let clip = Clip {
-            start_sample: 0,
-            audio: audio.clone(),
-        };
+        let clip = Clip::new(0, audio.clone());
         (clip, audio)
     }
 

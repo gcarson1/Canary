@@ -51,8 +51,9 @@ The UI follows Styles.md whichever framework is chosen.
 - [x] Lock-free / smoothed parameters for Gain, Pan, Mute, Solo
 
 ### Phase 3: Arrangement Timeline UI and Waveform Rendering
-- [ ] Mip-mapped waveform pyramid (min/max at 64, 256, 1024 and 4096 samples per pixel), 60+ FPS at any zoom
-- [ ] Non-destructive clip editing (split, trim via `offset_samples`, crossfade) through metadata, never by mutating audio
+- [x] Mip-mapped waveform pyramid (min/max at 64, 256, 1024 and 4096 samples per pixel), 60+ FPS at any zoom. `daw_dsp::WaveformPyramid`: `view()` costs O(pixels) at any zoom; `.pek` caching and drawing land with `daw-ui`
+- [x] Non-destructive clip editing (split, trim via `offset_samples`, crossfade) through metadata, never by mutating audio. `Clip` is a window (offset, length, equal-power fades) over shared `Arc<SampleData>`
+- [ ] Arrangement timeline UI (`daw-ui`, per Styles.md)
 
 ### Phase 4: Recording, MIDI and Plugin Graph
 - [ ] Duplex CoreAudio stream; input goes to an SPSC buffer drained by the disk writer thread

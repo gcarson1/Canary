@@ -21,10 +21,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let params = Arc::new(TrackParams::new(Arc::default()));
         let (track, master) = (NodeId(0), NodeId(1));
         let mut plan = ExecutionPlan::new(MAX_BLOCK);
-        let clips = vec![Clip {
-            start_sample: 0,
-            audio,
-        }];
+        let clips = vec![Clip::new(0, audio)];
         plan.insert(track, Box::new(TrackNode::new(clips, params)));
         plan.insert(master, Box::new(GainNode { gain: 1.0 }));
         let track_step = plan.add(track, vec![], 2)?;

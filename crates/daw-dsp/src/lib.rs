@@ -1,5 +1,9 @@
 //! Pure signal processing primitives: filters, envelopes, oscillators, delay lines. No OS or UI dependencies.
 
+mod waveform;
+
+pub use waveform::{MinMax, WaveformPyramid, LEVELS};
+
 /// One-pole smoother that glides a parameter toward its target to avoid zipper noise and clicks.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Smoother {

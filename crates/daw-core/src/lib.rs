@@ -57,7 +57,15 @@ pub enum Command {
 /// Audio thread → main thread. Sent once per block; dropped if the queue is full.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Telemetry {
-    Playhead { sample: u64, playing: bool },
+    Playhead {
+        sample: u64,
+        playing: bool,
+    },
+    /// Master output levels for the block, left and right, as linear amplitude.
+    Levels {
+        peak: [f32; 2],
+        rms: [f32; 2],
+    },
 }
 
 /// Decoded audio, one plane per channel. Built on the main thread and shared with

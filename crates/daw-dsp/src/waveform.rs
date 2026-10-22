@@ -5,6 +5,9 @@ use daw_core::SampleData;
 /// Frames per bin at each pyramid level, finest first. Each level is 4x the last.
 pub const LEVELS: [usize; 4] = [64, 256, 1024, 4096];
 
+/// First bytes of a `.pek` cache file (format version 1).
+const PEK_MAGIC: [u8; 4] = *b"PEK1";
+
 /// Lowest and highest sample in a stretch of audio. `EMPTY` (min > max) means
 /// the stretch held no audio.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -79,6 +82,58 @@ impl WaveformPyramid {
 
     pub fn audio(&self) -> &Arc<SampleData> {
         &self.audio
+    }
+
+    /// The bins as a `.pek` cache file: magic, channel and frame counts, then every
+    /// level's bins as little-endian `f32` min/max pairs.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::from(PEK_MAGIC);
+        bytes.extend((self.audio.num_channels() as u32).to_le_bytes());
+        bytes.extend((self.audio.frames() as u64).to_le_bytes());
+        for bin in self.levels.iter().flatten().flat_map(|bins| bins.iter()) {
+            bytes.extend(bin.min.to_le_bytes());
+            bytes.extend(bin.max.to_le_bytes());
+        }
+        bytes
+    }
+
+    /// Rebuilds a pyramid of `audio` from `to_bytes` output. `None` if the bytes are
+    /// not a `.pek` of audio with this channel and frame count, so a stale or
+    /// corrupt cache is rebuilt rather than trusted.
+    pub fn from_bytes(audio: Arc<SampleData>, bytes: &[u8]) -> Option<Self> {
+        let (channels, frames) = (audio.num_channels(), audio.frames());
+        let header = bytes.get(..16)?;
+        if header[..4] != PEK_MAGIC
+            || u32::from_le_bytes(header[4..8].try_into().ok()?) as usize != channels
+            || u64::from_le_bytes(header[8..16].try_into().ok()?) != frames as u64
+        {
+            return None;
+        }
+        let mut pairs = bytes[16..].chunks_exact(8).map(|p| MinMax {
+            min: f32::from_le_bytes(p[..4].try_into().unwrap()),
+            max: f32::from_le_bytes(p[4..].try_into().unwrap()),
+        });
+        let mut bins_at = frames;
+        let mut levels = Vec::with_capacity(LEVELS.len());
+        for (l, &bin) in LEVELS.iter().enumerate() {
+            // Level 0 bins frames; each coarser level bins 4 of the level below.
+            bins_at = if l == 0 {
+                frames.div_ceil(bin)
+            } else {
+                bins_at.div_ceil(4)
+            };
+            let level = (0..channels)
+                .map(|_| pairs.by_ref().take(bins_at).collect::<Box<[MinMax]>>())
+                .collect::<Vec<_>>();
+            if level.iter().any(|bins| bins.len() != bins_at) {
+                return None;
+            }
+            levels.push(level);
+        }
+        if pairs.next().is_some() || (bytes.len() - 16) % 8 != 0 {
+            return None;
+        }
+        Some(Self { audio, levels })
     }
 
     /// Fills `out[i]` with the min/max of source frames
@@ -183,5 +238,28 @@ mod tests {
             p.view(0, start, spp, &mut out[..2]);
             assert!(out[1].is_empty(), "start {start} spp {spp}");
         }
+    }
+
+    #[test]
+    fn pek_bytes_round_trip_and_reject_mismatches() {
+        let p = pyramid(10_001);
+        let bytes = p.to_bytes();
+        let back = WaveformPyramid::from_bytes(p.audio().clone(), &bytes).unwrap();
+        assert_eq!(back.levels, p.levels);
+
+        let other = Arc::new(SampleData::new(48_000, vec![vec![0.0; 10_000]]).unwrap());
+        assert!(
+            WaveformPyramid::from_bytes(other, &bytes).is_none(),
+            "frame count"
+        );
+        let audio = p.audio().clone();
+        assert!(WaveformPyramid::from_bytes(audio.clone(), &bytes[..bytes.len() - 8]).is_none());
+        assert!(WaveformPyramid::from_bytes(audio.clone(), &bytes[..bytes.len() - 3]).is_none());
+        let mut extra = bytes.clone();
+        extra.extend([0; 8]);
+        assert!(WaveformPyramid::from_bytes(audio.clone(), &extra).is_none());
+        let mut magic = bytes;
+        magic[0] = b'X';
+        assert!(WaveformPyramid::from_bytes(audio, &magic).is_none());
     }
 }

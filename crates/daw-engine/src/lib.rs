@@ -3,12 +3,14 @@
 mod load;
 mod midi;
 mod output;
+mod peaks;
 mod record;
 mod transport;
 
 pub use load::{load_audio, resample, LoadError};
 pub use midi::{connect_midi, midi_input_ports, MidiError, MidiSender};
 pub use output::{start_output, OutputError};
+pub use peaks::cached_waveform;
 pub use record::{recorder, start_input, InputError, RecordError, RecordInput, Recorder, Take};
 pub use transport::Transport;
 
@@ -210,6 +212,25 @@ impl AudioEngine {
             sample: self.transport.playhead(),
             playing: self.transport.is_playing(),
         });
+        let _ = self.telemetry.push(levels(output, channels));
+    }
+}
+
+/// Peak and RMS of the first two channels of interleaved `output`; a mono device
+/// reports the same level on both sides.
+fn levels(output: &[f32], channels: usize) -> Telemetry {
+    let (mut peak, mut sum) = ([0.0f32; 2], [0.0f32; 2]);
+    for frame in output.chunks_exact(channels) {
+        for side in 0..2 {
+            let s = frame[side.min(channels - 1)];
+            peak[side] = peak[side].max(s.abs());
+            sum[side] += s * s;
+        }
+    }
+    let frames = (output.len() / channels).max(1) as f32;
+    Telemetry::Levels {
+        peak,
+        rms: sum.map(|s| (s / frames).sqrt()),
     }
 }
 
@@ -243,6 +264,23 @@ mod tests {
                 playing: true
             })
         );
+    }
+
+    #[test]
+    fn levels_report_peak_and_rms_per_side() {
+        let mono = [0.5, -1.0, 0.5, -1.0];
+        assert_eq!(
+            levels(&[0.5, -1.0, -0.5, 1.0], 2),
+            Telemetry::Levels {
+                peak: [0.5, 1.0],
+                rms: [0.5, 1.0]
+            }
+        );
+        let Telemetry::Levels { peak, rms } = levels(&mono, 1) else {
+            unreachable!()
+        };
+        assert_eq!(peak, [1.0, 1.0]);
+        assert!((rms[0] - 0.625f32.sqrt()).abs() < 1e-6 && rms[0] == rms[1]);
     }
 
     #[test]

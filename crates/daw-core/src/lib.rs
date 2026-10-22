@@ -21,3 +21,35 @@ pub struct ProcessContext {
     /// it can vary per callback, up to the plan's max block size.
     pub num_samples: usize,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimeSignature {
+    pub numerator: u8,
+    pub denominator: u8,
+}
+
+impl Default for TimeSignature {
+    fn default() -> Self {
+        Self {
+            numerator: 4,
+            denominator: 4,
+        }
+    }
+}
+
+/// Main thread → audio thread. Applied at the start of the next block.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Command {
+    Play,
+    Stop,
+    /// Move the playhead to an absolute sample position.
+    Seek(u64),
+    SetTempo(f64),
+    SetTimeSignature(TimeSignature),
+}
+
+/// Audio thread → main thread. Sent once per block; dropped if the queue is full.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Telemetry {
+    Playhead { sample: u64, playing: bool },
+}

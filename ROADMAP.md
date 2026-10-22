@@ -40,9 +40,9 @@ The UI follows Styles.md whichever framework is chosen.
 ### Phase 1: Real-Time Engine and Transport Skeleton
 - [x] Cargo workspace. ARCHITECTURE.md's seven-crate layout replaces the three crates first planned.
 - [x] `AudioNode` trait, buffer contract, `GainNode` with tests (`daw-graph`)
-- [ ] `cpal` / `coreaudio-rs` output stream
-- [ ] Sample-accurate `Transport` (playhead in samples, BPM, time signature)
-- [ ] `rtrb` command/telemetry queues: Play/Stop and tempo changes reach the audio thread without locks
+- [x] `cpal` / `coreaudio-rs` output stream
+- [x] `Transport` (playhead in samples, BPM, time signature). Commands apply at block boundaries; per-sample command offsets come later
+- [x] `rtrb` command/telemetry queues: Play/Stop and tempo changes reach the audio thread without locks
 
 ### Phase 2: Multi-Track Mixing and Clip Scheduling
 - [ ] `Track` with a pre-allocated scratch buffer sized to the max block (for example 4096 frames). Per ARCHITECTURE.md, tracks become `AudioNode`s in the DAG, not a flat `Vec<Track>`.

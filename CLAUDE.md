@@ -21,6 +21,7 @@ Phases and progress live in ROADMAP.md: tick its checkboxes as work lands. The s
 - Build: `cargo build --workspace` (crates live in `crates/`)
 - Test: `cargo test --workspace` (single crate: `cargo test -p <crate>`)
 - Lint/format: `cargo clippy --workspace -- -D warnings` and `cargo fmt --all`
+- Gate before committing: `scripts/check.sh` (fmt check, clippy `-D warnings`, all tests)
 - Run the app: `cargo run --release -p canary -- [project.daw] [--samples DIR]` (samples default to `~/Music/Canary`)
 - Signed app bundle: `scripts/bundle.sh` (optional `SIGN_IDENTITY="Developer ID Application: …"`)
 - `cargo test -p daw-ui` runs the Styles.md QA protocol and writes renders to `target/qa/`

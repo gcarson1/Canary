@@ -50,6 +50,8 @@ Third-party AU and VST3/CLAP plugins are the #1 cause of DAW crashes. Furthermor
 * **The Modular Solution:** Design `PluginNode` so it can operate either **In-Process** (direct function pointer call) or **Out-of-Process** (via macOS XPC / POSIX shared memory `shm_open` + Mach semaphores).
 * **Future Growth:** By abstracting plugin hosting behind the `AudioNode` trait now, you can start by running plugins in-process and later move them into separate worker processes (like Bitwig's sandboxing) without touching a single line of the core Audio Engine or UI code. If a buggy synth segfaults, only the child process dies, and the DAW stays open.
 * **In-Process Split (CLAP, `daw-host`):** `ClapPlugin` is not `Send` and stays on the Main Thread (params, state, callbacks). Its `PluginNode` runs in the arena and gets pre-zeroed buffers. The node is dropped on the Main Thread through garbage collection, so it must be removed from the graph and collected before its `ClapPlugin` is dropped, or the plugin leaks.
+* **Formats (`daw-host`):** CLAP (`clack`), Audio Units (AU v2 via `objc2-audio-toolbox`) and VST3 (`vst3` crate) each pair a main-thread handle with an `AudioNode`. `daw_host::Catalog` scans all three and instantiates any of them behind the `Hosted` trait. Plugins with more than one audio bus/port per direction are rejected for now.
+* **In the app:** plugin nodes persist across plan rebuilds (ids from 2048 up). A removed plugin's handle is dropped only after its node has left the engine.
 
 ---
 
@@ -66,7 +68,7 @@ Initially, the CoreAudio callback runs on a single high-priority thread. Once a 
 
 Lookahead limiters or linear-phase EQs introduce a fixed sample delay (e.g., 512 samples). Without modularity for this, tracks with plugins will play out of phase with dry tracks.
 
-* **Building it into the trait now:** By including `fn latency_samples(&self) -> u32` on the `AudioNode` trait from day one, the graph compiler on the Main Thread can walk the DAG, calculate the maximum latency path, and automatically insert hidden `DelayCompensationNode` ring buffers onto parallel tracks with lower latency.
+* **Building it into the trait now:** By including `fn latency_samples(&self) -> u32` on the `AudioNode` trait from day one, the graph compiler on the Main Thread can walk the DAG, calculate the maximum latency path, and automatically insert hidden `DelayCompensationNode` ring buffers onto parallel tracks with lower latency. Nodes report latency today, but the PDC compiler is not built yet (ROADMAP Phase 5).
 
 ---
 
@@ -80,10 +82,10 @@ To enforce strict boundaries at compile time (so a UI developer or contributor c
 | **`daw-dsp`** | Pure signal processing primitives (biquad filters, envelopes, oscillators, delay lines, FFT). | `daw-core`, `realfft`, `dasp`. **Zero OS or UI dependencies.** |
 | **`daw-graph`** | The `AudioNode` trait, topological sorter, PDC calculator, and `ExecutionPlan` compiler. | `daw-core`, `daw-dsp`. |
 | **`daw-engine`** | Real-time thread coordinator, `cpal`/`coreaudio-rs` stream management, `rtrb` queues, disk streamer, and garbage collector. | `daw-core`, `daw-dsp` (`.pek` waveform cache), `daw-graph`, `rtrb`, `symphonia`, `hound`, `midir`. |
-| **`daw-host`** | CLAP (`clack`), VST3, and AudioUnit wrappers that implement `AudioNode`. | `daw-core`, `daw-graph`, `clack`, `objc2`. |
-| **`daw-project`** | Undo/Redo command pattern (`Action` trait), serialization (`serde`), `.daw` project file bundles, and state management. | `daw-core`, `serde`, `serde_json` (`.daw` files). |
+| **`daw-host`** | CLAP (`clack`), VST3, and AudioUnit wrappers that implement `AudioNode`. | `daw-core`, `daw-graph`, `clack-host`/`clack-extensions`, `vst3`, `libloading`, `rtrb`; macOS: `objc2-audio-toolbox`, `objc2-core-audio-types`, `objc2-core-foundation`. |
+| **`daw-project`** | Undo/Redo command pattern (`Action` trait), serialization (`serde`), `.daw` project file bundles, and state management. Stores track devices (plugin format, bundle, id, base64 state). | `daw-core`, `serde`, `serde_json` (`.daw` files). |
 | **`daw-ui`** | macOS windowing, timeline canvas, mixer views, and user input translation into `daw-project` actions. | `daw-core`, `daw-dsp` (pure data only: `WaveformPyramid`/`MinMax`), `daw-project`, `egui` (custom-painted). |
-| **`canary`** | The `eframe` app binary: wires `daw-ui`, `daw-engine` and `daw-project`; builds engine plans from the project, loads audio on worker threads, records takes, saves. | `daw-core`, `daw-dsp`, `daw-graph`, `daw-engine`, `daw-project`, `daw-ui`, `eframe`, `egui`, `cpal`. |
+| **`canary`** | The `eframe` app binary: wires `daw-ui`, `daw-engine` and `daw-project`; builds engine plans from the project, loads audio on worker threads, records takes, saves. | `daw-core`, `daw-dsp`, `daw-graph`, `daw-engine`, `daw-host`, `daw-project`, `daw-ui`, `eframe`, `egui`, `cpal`. |
 
 ### Why this workspace structure pays off
 

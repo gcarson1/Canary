@@ -14,7 +14,14 @@ use egui::epaint::ColorMode;
 use egui::{Color32, Shape, Vec2};
 use egui_kittest::Harness;
 
-const SIZES: [(f32, f32); 3] = [(1440.0, 900.0), (2560.0, 1440.0), (3840.0, 2160.0)];
+/// Logical viewports and pixel densities: the three sizes Styles.md requires,
+/// plus 1440x900 on a Retina display, where hairlines must stay one pixel.
+const SIZES: [(f32, f32, f32); 4] = [
+    (1440.0, 900.0, 1.0),
+    (2560.0, 1440.0, 1.0),
+    (3840.0, 2160.0, 1.0),
+    (1440.0, 900.0, 2.0),
+];
 
 /// A small arrangement: two tracks of synthetic audio, one clip trimmed with fades.
 fn fixture() -> (History, HashMap<PathBuf, WaveformPyramid>, Vec<PathBuf>) {
@@ -68,7 +75,7 @@ fn fixture() -> (History, HashMap<PathBuf, WaveformPyramid>, Vec<PathBuf>) {
     (h, waveforms, vec![kick, pad])
 }
 
-fn harness(size: (f32, f32), theme: Theme, engine: EngineView) -> Harness<'static> {
+fn harness(size: (f32, f32, f32), theme: Theme, engine: EngineView) -> Harness<'static> {
     let (mut history, waveforms, files) = fixture();
     let mut ws = Workspace::default();
     ws.theme = theme;
@@ -76,7 +83,7 @@ fn harness(size: (f32, f32), theme: Theme, engine: EngineView) -> Harness<'stati
     ws.selected_clip = Some((1, 0));
     Harness::builder()
         .with_size(Vec2::new(size.0, size.1))
-        .with_pixels_per_point(1.0)
+        .with_pixels_per_point(size.2)
         .with_context_setup(theme::install_fonts)
         .build_ui(move |ui| {
             full_window(ui, |ui| {
@@ -164,36 +171,109 @@ fn every_viewport_and_theme_renders_and_passes_the_audits() {
 
             let image = h.render().expect("wgpu render");
             image
-                .save(dir.join(format!("workspace-{name}-{}x{}.png", size.0, size.1)))
+                .save(dir.join(format!(
+                    "workspace-{name}-{}x{}@{}x.png",
+                    size.0, size.1, size.2
+                )))
                 .unwrap();
         }
     }
 }
 
-#[test]
-fn transport_and_track_controls_send_requests_and_edits() {
-    let (mut history, waveforms, files) = fixture();
+/// Drives the workspace at 1440x900 (u = 16pt) with scripted input.
+struct Rig {
+    history: History,
+    requests: Vec<daw_ui::Request>,
+}
+
+fn press(h: &mut Harness<'_, Rig>, pos: egui::Pos2, pressed: bool) {
+    h.event(egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    });
+}
+
+fn rig() -> Harness<'static, Rig> {
+    let (history, waveforms, files) = fixture();
     let engine = EngineView::default();
     let mut ws = Workspace::default();
-    let mut requests = Vec::new();
-    let mut h = Harness::builder()
+    Harness::builder()
         .with_size(Vec2::new(1440.0, 900.0))
         .with_context_setup(theme::install_fonts)
-        .build_ui(|ui| {
-            requests.extend(ws.show(
-                ui,
-                Inputs {
-                    history: &mut history,
-                    engine: &engine,
-                    waveforms: &waveforms,
-                    files: &files,
-                },
-            ));
-        });
+        .build_ui_state(
+            move |ui, rig: &mut Rig| {
+                full_window(ui, |ui| {
+                    let out = ws.show(
+                        ui,
+                        Inputs {
+                            history: &mut rig.history,
+                            engine: &engine,
+                            waveforms: &waveforms,
+                            files: &files,
+                        },
+                    );
+                    rig.requests.extend(out);
+                })
+            },
+            Rig {
+                history,
+                requests: Vec::new(),
+            },
+        )
+}
+
+#[test]
+fn space_plays_once_per_press() {
+    let mut h = rig();
     h.run();
     h.key_press(egui::Key::Space);
     h.run();
-    drop(h);
-    assert_eq!(requests, [daw_ui::Request::Play]);
-    assert_eq!(history.project().tracks.len(), 3);
+    assert_eq!(h.state().requests, [daw_ui::Request::Play]);
+}
+
+#[test]
+fn dragging_a_clip_moves_it_across_lanes_and_delete_mid_drag_is_safe() {
+    // Lanes start at x = 280 + 120 = 400 and y = 56 + 40 + 28 = 124, 64pt each;
+    // 400 samples per point. Track 0's first clip spans x 400..640.
+    let mut h = rig();
+    h.run();
+    let start = egui::Pos2::new(500.0, 165.0);
+    h.hover_at(start);
+    press(&mut h, start, true);
+    h.run();
+    for step in 1..=10 {
+        h.hover_at(start + Vec2::new(2.0 * step as f32, 6.0 * step as f32));
+        h.run();
+    }
+    let end = start + Vec2::new(20.0, 60.0); // one lane down, 8 000 samples right
+    press(&mut h, end, false);
+    h.run();
+    let tracks = &h.state().history.project().tracks;
+    assert_eq!(tracks[0].clips.len(), 1, "moved off track 0");
+    assert_eq!(tracks[1].clips.len(), 2, "landed on track 1");
+    assert_eq!(tracks[1].clips[1].start, 6_000, "snapped to the 1/16 grid");
+
+    // Start dragging the same clip, delete it mid-drag, then let go.
+    let before = tracks[1].clips[0].clone();
+    let grab = egui::Pos2::new(410.0, 230.0);
+    h.hover_at(grab);
+    press(&mut h, grab, true);
+    h.run();
+    for step in 1..=5 {
+        h.hover_at(grab + Vec2::new(4.0 * step as f32, 0.0));
+        h.run();
+    }
+    h.key_press(egui::Key::Backspace);
+    h.run();
+    press(&mut h, grab + Vec2::new(40.0, 0.0), false);
+    h.run();
+    let tracks = &h.state().history.project().tracks;
+    assert_eq!(
+        tracks[1].clips,
+        [before],
+        "only the dragged clip went; no other clip was overwritten"
+    );
+    assert_eq!(tracks.len(), 3, "one Backspace removes one thing");
 }

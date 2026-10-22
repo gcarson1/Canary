@@ -21,6 +21,8 @@ pub(crate) struct View {
     /// Lanes scrolled up by this many points.
     scroll_y: f32,
     drag: Option<Drag>,
+    /// Playhead last frame, to page only when it crosses the right edge.
+    last_playhead: u64,
 }
 
 impl Default for View {
@@ -30,6 +32,7 @@ impl Default for View {
             zoom: 400.0,
             scroll_y: 0.0,
             drag: None,
+            last_playhead: 0,
         }
     }
 }
@@ -50,6 +53,9 @@ struct Drag {
     /// Where the clip would land if released now.
     preview: ClipRef,
     to_track: usize,
+    /// Project revision at the start; any other edit cancels the drag, since its
+    /// indices may no longer point at the clip.
+    revision: u64,
 }
 
 /// Snap grid length in samples, or `None` for no snapping.
@@ -64,11 +70,6 @@ fn grid(snap: Snap, bpm: f64, sample_rate: u32) -> Option<f64> {
 }
 
 impl View {
-    /// `sample` rounded to the snap grid.
-    pub(crate) fn snap_sample(&self, sample: u64, snap: Snap, bpm: f64, sample_rate: u32) -> u64 {
-        snap_f(sample as f64, snap, bpm, sample_rate) as u64
-    }
-
     fn x_of(&self, lanes: Rect, sample: f64) -> f32 {
         lanes.min.x + ((sample - self.start) / self.zoom) as f32
     }
@@ -78,7 +79,8 @@ impl View {
     }
 }
 
-fn snap_f(sample: f64, snap: Snap, bpm: f64, sample_rate: u32) -> f64 {
+/// `sample` rounded to the snap grid, never below zero.
+pub(crate) fn snap_f(sample: f64, snap: Snap, bpm: f64, sample_rate: u32) -> f64 {
     match grid(snap, bpm, sample_rate) {
         Some(g) => (sample / g).round() * g,
         None => sample,
@@ -154,19 +156,14 @@ pub(crate) fn show(
     let clip_p = p.with_clip_rect(lanes);
     let label_p = p.with_clip_rect(labels);
 
-    // Scroll: wheel pans, cmd/ctrl + wheel or pinch zooms around the pointer.
+    // Scroll: wheel pans, cmd + wheel or pinch zooms around the pointer.
     let hover = ui.rect_contains_pointer(r);
     if hover {
-        let (delta, zoom, cmd, pointer) = ui.input(|i| {
-            (
-                i.smooth_scroll_delta,
-                i.zoom_delta(),
-                i.modifiers.command,
-                i.pointer.hover_pos(),
-            )
-        });
+        // egui turns cmd + wheel into zoom_delta itself.
+        let (delta, zoom, pointer) =
+            ui.input(|i| (i.smooth_scroll_delta, i.zoom_delta(), i.pointer.hover_pos()));
         let v = &mut ws.timeline;
-        let factor = if cmd { (-delta.y * 0.004).exp() } else { 1.0 } / zoom.max(1e-3);
+        let factor = 1.0 / zoom.max(1e-3);
         if factor != 1.0 {
             let x = pointer.map_or(lanes.center().x, |p| p.x);
             let anchor = v.sample_at(lanes, x);
@@ -196,8 +193,11 @@ pub(crate) fn show(
         if x > lanes.max.x {
             break;
         }
+        if b % every != 0 {
+            continue;
+        }
         clip_p.vline(x, lanes.y_range(), m.hair(t.line_2));
-        if b % every == 0 {
+        {
             p.with_clip_rect(ruler).text(
                 Pos2::new(x + 0.25 * u, ruler.center().y),
                 Align2::LEFT_CENTER,
@@ -275,6 +275,26 @@ pub(crate) fn show(
     let edge = 0.375 * u;
     let lanes_resp = ui.interact(lanes, ui.scope_id().with("lanes"), Sense::click_and_drag());
     let pointer = lanes_resp.interact_pointer_pos().or(lanes_resp.hover_pos());
+    // A drag starts only after the pointer has moved a few points, so hit-test
+    // where the button went down, or a quick edge pull misses the edge.
+    let press = ui.input(|i| i.pointer.press_origin());
+    let probe = if lanes_resp.drag_started() {
+        press.or(pointer)
+    } else {
+        pointer
+    };
+    // Any other edit (undo, delete) may have moved the clip under the drag.
+    let stale = ws.timeline.drag.as_ref().is_some_and(|d| {
+        d.revision != inputs.history.revision()
+            || project
+                .tracks
+                .get(d.track)
+                .and_then(|t| t.clips.get(d.index))
+                .is_none()
+    });
+    if stale {
+        ws.timeline.drag = None;
+    }
     let mut hit = None;
     for (ti, track) in project.tracks.iter().enumerate() {
         for (ci, clip) in track.clips.iter().enumerate() {
@@ -294,15 +314,15 @@ pub(crate) fn show(
                 x0..=x1.max(x0 + m.px),
                 lane.min.y + m.px..=lane.max.y - m.px,
             ));
-            if pointer.is_some_and(|p| rect.contains(p)) && !dragging {
-                let grab = match pointer {
+            if probe.is_some_and(|p| rect.contains(p)) && !dragging {
+                let grab = match probe {
                     Some(p) if p.x - rect.min.x < edge => Grab::Start,
                     Some(p) if rect.max.x - p.x < edge => Grab::End,
                     _ => Grab::Body,
                 };
                 hit = Some((ti, ci, grab));
             }
-            if rect.max.x < lanes.min.x || rect.min.x > lanes.max.x {
+            if !rect.intersects(lanes) {
                 continue;
             }
             draw_clip(ws, &clip_p, m, rect, shown, inputs);
@@ -323,7 +343,8 @@ pub(crate) fn show(
     }
     let pointer_sample = pointer.map(|p| ws.timeline.sample_at(lanes, p.x));
     if lanes_resp.drag_started() && ws.tool == Tool::Draw {
-        if let (Some((ti, ci, grab)), Some(at)) = (hit, pointer_sample) {
+        let at = probe.map(|p| ws.timeline.sample_at(lanes, p.x));
+        if let (Some((ti, ci, grab)), Some(at)) = (hit, at) {
             let clip = project.tracks[ti].clips[ci].clone();
             ws.selected_clip = Some((ti, ci));
             ws.selected_track = Some(ti);
@@ -334,6 +355,7 @@ pub(crate) fn show(
                 offset: at - clip.start as f64,
                 preview: clip,
                 to_track: ti,
+                revision: inputs.history.revision(),
             });
         }
     }
@@ -439,15 +461,19 @@ pub(crate) fn show(
             egui::Stroke::NONE,
         ));
     }
-    // Follow the playhead while playing, a page at a time.
+    // Page forward when the playing playhead crosses the right edge; the view is
+    // otherwise free to pan while it plays.
     let v = &mut ws.timeline;
-    if inputs.engine.playing && ws.selected_clip.is_none() && v.drag.is_none() {
-        let width = f64::from(lanes.width()) * v.zoom;
-        let ph = inputs.engine.playhead as f64;
-        if ph > v.start + width || ph < v.start {
-            v.start = ph;
-        }
+    let right = v.start + f64::from(lanes.width()) * v.zoom;
+    let ph = inputs.engine.playhead;
+    if inputs.engine.playing
+        && v.drag.is_none()
+        && (v.last_playhead as f64) < right
+        && ph as f64 >= right
+    {
+        v.start = ph as f64;
     }
+    v.last_playhead = ph;
 }
 
 fn draw_clip(
@@ -480,7 +506,7 @@ fn draw_clip(
     if let Some(w) = inputs
         .waveforms
         .get(&clip.source)
-        .filter(|_| visible.width() > 0.0)
+        .filter(|_| visible.is_positive())
     {
         let channels = w.audio().num_channels().min(2);
         let zoom = ws.timeline.zoom;
@@ -488,6 +514,8 @@ fn draw_clip(
         let mut bins = vec![MinMax::EMPTY; cols];
         // Source frame under the first visible column.
         let first = clip.offset as f64 + f64::from(visible.min.x - rect.min.x) * zoom;
+        // One mesh per clip, a one-pixel quad per column, not a shape per column.
+        let mut mesh = egui::Mesh::default();
         for ch in 0..channels {
             let band_h = body.height() / channels as f32;
             let mid = body.min.y + band_h * (ch as f32 + 0.5);
@@ -499,15 +527,18 @@ fn draw_clip(
                 if b.is_empty() || frame >= end {
                     continue;
                 }
-                let x = visible.min.x + (i as f32 + 0.5) * m.px;
+                let x = visible.min.x + i as f32 * m.px;
                 let (lo, hi) = (b.min.clamp(-1.0, 1.0), b.max.clamp(-1.0, 1.0));
-                p.vline(
-                    x,
-                    (mid - hi * half)..=(mid - lo * half + m.px),
-                    egui::Stroke::new(m.px, t.muted),
+                mesh.add_colored_rect(
+                    Rect::from_x_y_ranges(
+                        x..=x + m.px,
+                        (mid - hi * half)..=(mid - lo * half + m.px),
+                    ),
+                    t.muted,
                 );
             }
         }
+        p.add(mesh);
     }
     // Fades as straight guides from the clip edge to full level.
     for (fade, left) in [(clip.fade_in, true), (clip.fade_out, false)] {

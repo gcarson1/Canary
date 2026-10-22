@@ -261,16 +261,23 @@ impl Workspace {
 
     fn keys(&mut self, ui: &egui::Ui, inputs: &Inputs<'_>, out: &mut Vec<Request>) {
         // Text fields own the keyboard while focused.
-        if ui.ctx().memory(|mem| mem.focused().is_some()) {
+        if ui.ctx().text_edit_focused() {
             return;
         }
         let (space, undo, redo, delete) = ui.input(|i| {
             let cmd = i.modifiers.command;
+            // Space and Delete act once per press: a held key must not toggle the
+            // transport or delete one track after another.
+            let fresh = |k: Key| {
+                i.events.iter().any(|e| {
+                    matches!(e, egui::Event::Key { key, pressed: true, repeat: false, .. } if *key == k)
+                })
+            };
             (
-                i.key_pressed(Key::Space),
+                fresh(Key::Space),
                 cmd && !i.modifiers.shift && i.key_pressed(Key::Z),
                 cmd && i.modifiers.shift && i.key_pressed(Key::Z),
-                i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace),
+                fresh(Key::Delete) || fresh(Key::Backspace),
             )
         });
         if space {
@@ -295,6 +302,7 @@ impl Workspace {
             if let Some(action) = action {
                 self.edit(action);
                 self.selected_clip = None;
+                self.selected_track = None;
             }
         }
     }
@@ -527,12 +535,12 @@ impl Workspace {
                 out.push(Request::AddFile {
                     track: self.selected_track,
                     path: path.clone(),
-                    at: self.timeline.snap_sample(
-                        inputs.engine.playhead,
+                    at: timeline::snap_f(
+                        inputs.engine.playhead as f64,
                         self.snap,
                         inputs.history.project().bpm,
                         inputs.engine.sample_rate,
-                    ),
+                    ) as u64,
                 });
             }
             y = row.max.y;
@@ -611,7 +619,7 @@ impl Workspace {
         let (t, u) = (self.theme, m.u);
         let mut y = header(p, m, &t, r, "03 // SOUND_MANIFEST");
         let row_h = 2.875 * u;
-        let tracks = history.project().tracks.clone();
+        let tracks = &history.project().tracks;
         let mut edit = None;
         for (i, track) in tracks.iter().enumerate() {
             if y + row_h > r.max.y - 2.0 * u {
@@ -643,6 +651,22 @@ impl Workspace {
             ));
             if timeline::sounding(track, engine) {
                 p.rect_filled(led, 0.0, t.good);
+            } else if track.mute {
+                // Muted: dashed border (section 4.4).
+                let r = led.shrink(m.px / 2.0);
+                let ring = [
+                    r.left_top(),
+                    r.right_top(),
+                    r.right_bottom(),
+                    r.left_bottom(),
+                    r.left_top(),
+                ];
+                p.extend(Shape::dashed_line(
+                    &ring,
+                    m.hair(t.line_2),
+                    2.0 * m.px,
+                    2.0 * m.px,
+                ));
             } else {
                 p.rect_filled(led, 0.0, t.bg_void);
                 p.rect_stroke(led, 0.0, m.hair(t.line_2), StrokeKind::Inside);
@@ -774,7 +798,8 @@ impl Workspace {
                 Pos2::new(body.min.x - 0.15 * u, ty + 0.75 * u),
                 Align2::LEFT_TOP,
                 db(value),
-                m.mono_bold(body.height().min(9.0 * u) / u * 0.25 + 1.0),
+                // fs_68 (4.25u) when the dock is tall enough for both readouts.
+                m.mono_bold((body.height() / u / 2.0 - 1.5).clamp(1.5, 4.25)),
                 t.text,
             );
             ty = g.max.y + 0.5 * u;
@@ -789,7 +814,7 @@ impl Workspace {
             body.max.y - f * (body.max.y - meter_top)
         };
         for (i, side) in [1, 0].into_iter().enumerate() {
-            let x1 = right - i as f32 * (w + 0.25 * u);
+            let x1 = right - i as f32 * (w + 0.125 * u); // sp_0h stereo gap
             let trough = m.snap_rect(Rect::from_x_y_ranges(x1 - w..=x1, meter_top..=body.max.y));
             p.rect_filled(trough, 0.0, t.bg_void);
             p.rect_stroke(trough, 0.0, m.hair(t.line_2), StrokeKind::Inside);

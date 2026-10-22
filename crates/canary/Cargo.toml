@@ -1,0 +1,18 @@
+[package]
+name = "canary"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "Canary: a native macOS DAW"
+
+[dependencies]
+cpal = "0.18"
+daw-core = { path = "../daw-core" }
+daw-dsp = { path = "../daw-dsp" }
+daw-engine = { path = "../daw-engine" }
+daw-graph = { path = "../daw-graph" }
+daw-project = { path = "../daw-project" }
+daw-ui = { path = "../daw-ui" }
+egui = "0.37"
+eframe = { version = "0.37", default-features = false, features = ["wgpu", "accesskit"] }
+

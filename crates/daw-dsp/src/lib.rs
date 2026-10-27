@@ -1,7 +1,10 @@
 //! Pure signal processing primitives: filters, envelopes, oscillators, delay lines. No OS or UI dependencies.
 
+pub mod effects;
+mod filter;
 mod waveform;
 
+pub use filter::{db_to_gain, gain_to_db, Biquad, Envelope, FilterKind};
 pub use waveform::{MinMax, WaveformPyramid, LEVELS};
 
 /// One-pole smoother that glides a parameter toward its target to avoid zipper noise and clicks.

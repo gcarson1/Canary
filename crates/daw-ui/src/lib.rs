@@ -130,6 +130,8 @@ pub struct Workspace {
     edits: Vec<Edit>,
     /// The device picker's scroll offset while it is open.
     picker: Option<f32>,
+    /// The rack device being dragged to a new slot.
+    device_drag: Option<usize>,
 }
 
 impl Default for Workspace {
@@ -146,6 +148,7 @@ impl Default for Workspace {
             clip_latch: [false; 2],
             edits: Vec::new(),
             picker: None,
+            device_drag: None,
         }
     }
 }

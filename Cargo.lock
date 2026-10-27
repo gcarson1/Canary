@@ -932,6 +932,7 @@ dependencies = [
  "clack-host",
  "clack-plugin",
  "daw-core",
+ "daw-dsp",
  "daw-engine",
  "daw-graph",
  "libloading 0.8.9",

@@ -3,6 +3,7 @@
 
 #[cfg(target_os = "macos")]
 mod au;
+mod builtin;
 mod catalog;
 mod clap;
 mod vst3;

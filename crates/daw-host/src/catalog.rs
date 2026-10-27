@@ -15,6 +15,8 @@ pub enum Format {
     Clap,
     AudioUnit,
     Vst3,
+    /// Canary's own effects.
+    Builtin,
 }
 
 /// An installed plugin: its format, the bundle it lives in (none for Audio Units,
@@ -159,6 +161,15 @@ impl Catalog {
     /// can crash the scan; bundles that fail to load are skipped.
     pub fn scan() -> Self {
         let mut c = Catalog::default();
+        c.available.extend(
+            crate::builtin::builtins()
+                .into_iter()
+                .map(|info| Available {
+                    format: Format::Builtin,
+                    bundle: None,
+                    info,
+                }),
+        );
         #[cfg(target_os = "macos")]
         c.available
             .extend(crate::audio_units().into_iter().map(|(info, _)| Available {
@@ -234,6 +245,7 @@ impl Catalog {
             }
             #[cfg(not(target_os = "macos"))]
             Format::AudioUnit => Err(missing()),
+            Format::Builtin => crate::builtin::instantiate(id, sample_rate, max_block),
         }
     }
 }

@@ -405,7 +405,8 @@ fn lists_binds_params_and_reports_latency() {
             name: "Gain".into(),
             min: 0.0,
             max: 1.0,
-            default: 1.0
+            default: 1.0,
+            log: false,
         }]
     );
     assert_eq!((plugin.latency_samples(), node.latency_samples()), (16, 16));

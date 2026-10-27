@@ -22,6 +22,8 @@ struct Live {
     /// The node, until a plan inserts it into the engine.
     node: Option<Box<dyn AudioNode>>,
     instrument: bool,
+    /// The latency the last plan compensated for; a change needs a new plan.
+    latency: u32,
 }
 
 pub struct Devices {
@@ -44,6 +46,7 @@ fn to_host(f: PluginFormat) -> Format {
         PluginFormat::Clap => Format::Clap,
         PluginFormat::AudioUnit => Format::AudioUnit,
         PluginFormat::Vst3 => Format::Vst3,
+        PluginFormat::Builtin => Format::Builtin,
     }
 }
 
@@ -52,6 +55,7 @@ fn to_project(f: Format) -> PluginFormat {
         Format::Clap => PluginFormat::Clap,
         Format::AudioUnit => PluginFormat::AudioUnit,
         Format::Vst3 => PluginFormat::Vst3,
+        Format::Builtin => PluginFormat::Builtin,
     }
 }
 
@@ -68,6 +72,7 @@ impl Devices {
                     Format::AudioUnit => "AU",
                     Format::Clap => "CLAP",
                     Format::Vst3 => "VST3",
+                    Format::Builtin => "CANARY",
                 },
             })
             .collect();
@@ -146,6 +151,7 @@ impl Devices {
                 id: NodeId(raw),
                 node: Some(node),
                 instrument,
+                latency: 0,
             },
         );
         Ok(())
@@ -186,9 +192,13 @@ impl Devices {
         errors
     }
 
-    /// True if `plan` must be rebuilt to match: devices were added or removed.
+    /// True if `plan` must be rebuilt to match: devices were added or removed, or
+    /// an effect's latency changed (its settings or loaded state).
     pub fn changed(&self) -> bool {
-        !self.removing.is_empty() || self.live.values().any(|l| l.node.is_some())
+        !self.removing.is_empty()
+            || self.live.values().any(|l| {
+                l.node.is_some() || (!l.instrument && l.hosted.latency_samples() != l.latency)
+            })
     }
 
     /// Puts pending inserts and removals into `plan`. Call once per plan sent.
@@ -210,24 +220,28 @@ impl Devices {
         let instrument = live.clone().find(|l| l.instrument)?;
         let step = plan.add(instrument.id, vec![], 2).ok()?;
         plan.route_midi(step);
-        plan.set_latency(step, instrument.hosted.latency_samples());
+        // shortcut: instruments only play live MIDI, which PDC does not compensate,
+        // and the track node sums its clips with the instrument; delaying the
+        // others would put this track's clips early. Revisit with sequenced notes.
+        plan.set_latency(step, 0);
         Some(step)
     }
 
     /// Chains `track`'s effects after `step` and returns the last step.
     pub fn effects_after(
-        &self,
+        &mut self,
         plan: &mut ExecutionPlan,
         track: &Track,
         mut step: StepId,
     ) -> StepId {
         for d in &track.devices {
-            let Some(l) = self.live.get(&d.uid).filter(|l| !l.instrument) else {
+            let Some(l) = self.live.get_mut(&d.uid).filter(|l| !l.instrument) else {
                 continue;
             };
             let from = |channel| vec![Source { step, channel }];
             if let Ok(next) = plan.add(l.id, vec![from(0), from(1)], 2) {
-                plan.set_latency(next, l.hosted.latency_samples());
+                l.latency = l.hosted.latency_samples();
+                plan.set_latency(next, l.latency);
                 step = next;
             }
         }
@@ -270,6 +284,7 @@ impl Devices {
                             name: p.name,
                             min: p.min,
                             max: p.max,
+                            log: p.log,
                         })
                         .collect()
                 }),

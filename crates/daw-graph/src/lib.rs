@@ -1,10 +1,12 @@
 //! The `AudioNode` trait, the `ExecutionPlan` executor and PDC compiler, and the
 //! built-in nodes.
 
+mod effect;
 mod plan;
 mod synth;
 mod track;
 
+pub use effect::{EffectNode, EffectParams};
 pub use plan::{
     ExecutionPlan, LiveNodes, NodeArena, PlanError, Source, StepId, MAX_CHANNELS, MAX_LATENCY,
     MAX_NODES,

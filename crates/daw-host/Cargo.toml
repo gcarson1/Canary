@@ -8,6 +8,7 @@ publish.workspace = true
 clack-extensions = { version = "0.2", features = ["clack-host", "audio-ports", "latency", "params", "state"] }
 clack-host = "0.2"
 daw-core = { path = "../daw-core" }
+daw-dsp = { path = "../daw-dsp" }
 daw-graph = { path = "../daw-graph" }
 rtrb = "0.4"
 vst3 = "0.3"

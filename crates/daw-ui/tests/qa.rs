@@ -115,7 +115,7 @@ fn plugins() -> Vec<PluginChoice> {
         .collect()
 }
 
-/// One effect on the selected track with a few parameters at different values.
+/// Two effects on the selected track with parameters at different values.
 fn devices() -> Vec<DeviceView> {
     let param = |id: u32, name: &str, value: f64| ParamView {
         id,
@@ -123,16 +123,44 @@ fn devices() -> Vec<DeviceView> {
         value,
         min: 0.0,
         max: 100.0,
+        log: false,
     };
-    vec![DeviceView {
-        name: "AUDelay".into(),
-        params: vec![
-            param(0, "Dry Wet Mix", 50.0),
-            param(1, "Delay Time", 10.0),
-            param(2, "Feedback", 0.0),
-            param(3, "Lowpass", 100.0),
-        ],
-    }]
+    vec![
+        DeviceView {
+            name: "AUDelay".into(),
+            params: vec![
+                param(0, "Dry Wet Mix", 50.0),
+                param(1, "Delay Time", 10.0),
+                param(2, "Feedback", 0.0),
+                param(3, "Lowpass", 100.0),
+            ],
+        },
+        DeviceView {
+            // A full built-in module: eight dials, a log-scaled frequency first.
+            name: "Dynamic EQ".into(),
+            params: [
+                ("FREQ", 20.0, 20_000.0, 200.0, true),
+                ("Q", 0.3, 10.0, 1.0, false),
+                ("THRESH", -60.0, 0.0, -24.0, false),
+                ("RANGE", 0.0, 24.0, 12.0, false),
+                ("LOWCUT", 0.0, 1.0, 1.0, false),
+                ("MIX", 0.0, 100.0, 100.0, false),
+                ("MATCH", 0.0, 1.0, 1.0, false),
+                ("DELTA", 0.0, 1.0, 0.0, false),
+            ]
+            .iter()
+            .enumerate()
+            .map(|(i, &(name, min, max, value, log))| ParamView {
+                id: i as u32,
+                name: name.into(),
+                value,
+                min,
+                max,
+                log,
+            })
+            .collect(),
+        },
+    ]
 }
 
 /// The harness insets the ui by a margin; the app draws edge to edge, so do that.
@@ -333,11 +361,11 @@ fn dragging_a_clip_moves_it_across_lanes_and_delete_mid_drag_is_safe() {
 
 #[test]
 fn picker_adds_a_device_and_dials_set_params() {
-    // Rack: x 280..1100, y 520..900 (45% of the body), header 32pt. The one
-    // device is 16u = 256pt wide, so + DEVICE (96 x 24) starts at x 548, y 564.
+    // Rack: x 280..1100, y 520..900 (45% of the body), header 32pt. The two
+    // devices are 16u = 256pt wide, so + DEVICE (96 x 24) starts at x 804, y 564.
     let mut h = rig();
     h.run();
-    let add = egui::Pos2::new(596.0, 576.0);
+    let add = egui::Pos2::new(852.0, 576.0);
     click(&mut h, add);
     std::fs::create_dir_all("../../target/qa").unwrap();
     h.render()
@@ -397,4 +425,50 @@ fn picker_opens_on_a_track_with_no_devices() {
         "{:?}",
         h.state().requests
     );
+}
+
+#[test]
+fn dragging_a_module_title_moves_the_device() {
+    use daw_project::{Action, Device, PluginFormat};
+    let mut h = rig();
+    for (index, id) in ["a", "b"].into_iter().enumerate() {
+        let device = Device {
+            uid: index as u64 + 100,
+            format: PluginFormat::Builtin,
+            bundle: None,
+            id: id.into(),
+            name: id.into(),
+            state: Vec::new(),
+        };
+        let insert = Action::InsertDevice {
+            track: 0,
+            index,
+            device,
+        };
+        h.state_mut().history.apply(insert).unwrap();
+    }
+    h.run();
+    // First module's title row: x 280..~480, y 552..584. Drop on the second
+    // module (x 536..792).
+    let grab = egui::Pos2::new(330.0, 570.0);
+    h.hover_at(grab);
+    press(&mut h, grab, true);
+    h.run();
+    for step in 1..=10 {
+        h.hover_at(grab + Vec2::new(30.0 * step as f32, 0.0));
+        h.run();
+    }
+    std::fs::create_dir_all("../../target/qa").unwrap();
+    h.render()
+        .unwrap()
+        .save("../../target/qa/rack-drag.png")
+        .unwrap();
+    press(&mut h, grab + Vec2::new(300.0, 0.0), false);
+    h.run();
+    let ids: Vec<&str> = h.state().history.project().tracks[0]
+        .devices
+        .iter()
+        .map(|d| d.id.as_str())
+        .collect();
+    assert_eq!(ids, ["b", "a"]);
 }

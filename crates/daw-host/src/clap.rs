@@ -82,6 +82,8 @@ pub struct ParamInfo {
     pub min: f64,
     pub max: f64,
     pub default: f64,
+    /// Turns logarithmically (a frequency, say).
+    pub log: bool,
 }
 
 impl ParamInfo {
@@ -104,6 +106,7 @@ impl ParamInfo {
             min,
             max,
             default,
+            log: false,
         })
     }
 }
@@ -569,7 +572,8 @@ mod tests {
                 name: "Gain".into(),
                 min: 0.0,
                 max: 4.0,
-                default: 1.0
+                default: 1.0,
+                log: false,
             }]
         );
         assert_eq!(

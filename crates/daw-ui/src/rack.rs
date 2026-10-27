@@ -35,6 +35,8 @@ pub struct ParamView {
     pub value: f64,
     pub min: f64,
     pub max: f64,
+    /// Turns logarithmically (a frequency, say); needs `min > 0`.
+    pub log: bool,
 }
 
 pub(crate) fn show(
@@ -66,11 +68,34 @@ pub(crate) fn show(
     // While the picker is open it owns the pointer: nothing under it reacts.
     let was_open = ws.picker.is_some();
     let module_w = 16.0 * u;
+    let count = inputs.devices.len();
+    // Drag a module by its title to move it: the slot under the pointer.
+    let slot =
+        |x: f32| (((x - body.min.x) / module_w).max(0.0) as usize).min(count.saturating_sub(1));
+    let pointer = ui.input(|i| i.pointer.interact_pos());
+    let target = ws.device_drag.zip(pointer).map(|(_, at)| slot(at.x));
     let mut x = body.min.x;
     for (di, device) in inputs.devices.iter().enumerate() {
         let module = Rect::from_x_y_ranges(x..=m.snap(x + module_w), body.y_range());
         let p = p.with_clip_rect(module.intersect(p.clip_rect()));
         let top = module.min.y + 1.25 * u;
+        if ws.device_drag == Some(di) {
+            p.rect_filled(module, 0.0, t.sel);
+        }
+        if target == Some(di) && ws.device_drag != Some(di) {
+            // Insertion bar on the side the device will land.
+            let from = ws.device_drag.unwrap_or(di);
+            let edge = if from < di {
+                module.max.x - 0.1875 * u
+            } else {
+                module.min.x
+            };
+            p.rect_filled(
+                Rect::from_x_y_ranges(edge..=edge + 0.1875 * u, module.y_range()),
+                0.0,
+                t.accent_amber,
+            );
+        }
         p.text(
             Pos2::new(module.min.x + 0.75 * u, top),
             Align2::LEFT_CENTER,
@@ -95,6 +120,28 @@ pub(crate) fn show(
         }
         if resp.clicked() && !was_open {
             ws.edit(Action::RemoveDevice { track, index: di });
+        }
+        let title = Rect::from_x_y_ranges(
+            module.min.x..=remove.min.x - 0.5 * u,
+            module.min.y..=top + 0.75 * u,
+        );
+        let grab = ui.interact(
+            title,
+            ui.scope_id().with(("move-device", di)),
+            Sense::drag(),
+        );
+        if grab.drag_started() && !was_open {
+            ws.device_drag = Some(di);
+        }
+        if grab.drag_stopped() && ws.device_drag == Some(di) {
+            ws.device_drag = None;
+            if let Some(to) = pointer.map(|at| slot(at.x)).filter(|&to| to != di) {
+                ws.edit(Action::MoveDevice {
+                    track,
+                    from: di,
+                    to,
+                });
+            }
         }
 
         // Dials in two rows of four.
@@ -172,7 +219,24 @@ fn dial(
     let radius = 1.125 * u;
     let center = Pos2::new(area.center().x, area.min.y + 0.5 * u + radius);
     let span = (param.max - param.min).max(f64::MIN_POSITIVE);
-    let frac = ((param.value - param.min) / span).clamp(0.0, 1.0) as f32;
+    // Position on the dial (0..=1) and back; log ranges spread octaves evenly.
+    let log = param.log && param.min > 0.0;
+    let to_frac = |v: f64| {
+        let f = if log {
+            (v / param.min).ln() / (param.max / param.min).ln()
+        } else {
+            (v - param.min) / span
+        };
+        f.clamp(0.0, 1.0)
+    };
+    let from_frac = |f: f64| {
+        if log {
+            param.min * (param.max / param.min).powf(f)
+        } else {
+            param.min + f * span
+        }
+    };
+    let frac = to_frac(param.value) as f32;
     // From 225° (lower left) clockwise through the top to -45° (lower right).
     let angle = |f: f32| PI * 1.25 - f * PI * 1.5;
     let arc = |from: f32, to: f32| -> Vec<Pos2> {
@@ -227,7 +291,7 @@ fn dial(
             1.0
         };
         // max() then min(), not clamp(): a bad range must not panic the UI.
-        let v = (param.value + dy / 200.0 * span * fine)
+        let v = from_frac(to_frac(param.value) + dy / 200.0 * fine)
             .max(param.min)
             .min(param.max);
         return (v != param.value).then_some(v);

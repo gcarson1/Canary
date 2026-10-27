@@ -49,6 +49,8 @@ pub enum PluginFormat {
     Clap,
     AudioUnit,
     Vst3,
+    /// One of Canary's own effects.
+    Builtin,
 }
 
 /// A plugin on a track: what to load, and its saved state.
@@ -184,6 +186,12 @@ pub enum Action {
     RemoveDevice {
         track: usize,
         index: usize,
+    },
+    /// Takes the device at `from` out and puts it back so it ends up at `to`.
+    MoveDevice {
+        track: usize,
+        from: usize,
+        to: usize,
     },
     /// Several edits that undo as one step (a split, say). All or nothing.
     Batch(Vec<Action>),
@@ -332,6 +340,23 @@ impl Action {
                     track: ti,
                     index,
                     device: t.devices.remove(index),
+                }
+            }
+            MoveDevice {
+                track: ti,
+                from,
+                to,
+            } => {
+                let t = track(p, ti)?;
+                if from >= t.devices.len() || to >= t.devices.len() {
+                    return Err(ActionError::OutOfRange);
+                }
+                let device = t.devices.remove(from);
+                t.devices.insert(to, device);
+                MoveDevice {
+                    track: ti,
+                    from: to,
+                    to: from,
                 }
             }
             Batch(actions) => {
@@ -767,6 +792,62 @@ mod tests {
         assert!(h.undo());
         assert_eq!(h.project().tracks[0].devices[0].state.len(), 256);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn move_device_reorders_undoes_and_rejects_bad_slots() {
+        let mut h = History::default();
+        h.apply(Action::InsertTrack {
+            index: 0,
+            track: Track::new("Bus"),
+        })
+        .unwrap();
+        for (i, id) in ["canary.compressor", "canary.saturator", "canary.deesser"]
+            .iter()
+            .enumerate()
+        {
+            let device = Device {
+                uid: h.new_device_uid(),
+                format: PluginFormat::Builtin,
+                bundle: None,
+                id: (*id).into(),
+                name: (*id).into(),
+                state: Vec::new(),
+            };
+            h.apply(Action::InsertDevice {
+                track: 0,
+                index: i,
+                device,
+            })
+            .unwrap();
+        }
+        let order = |h: &History| -> Vec<String> {
+            h.project().tracks[0]
+                .devices
+                .iter()
+                .map(|d| d.id.clone())
+                .collect()
+        };
+        let before = order(&h);
+        h.apply(Action::MoveDevice {
+            track: 0,
+            from: 0,
+            to: 2,
+        })
+        .unwrap();
+        assert_eq!(
+            order(&h),
+            ["canary.saturator", "canary.deesser", "canary.compressor"]
+        );
+        assert!(h.undo());
+        assert_eq!(order(&h), before);
+        let bad = Action::MoveDevice {
+            track: 0,
+            from: 1,
+            to: 3,
+        };
+        assert_eq!(h.apply(bad), Err(ActionError::OutOfRange));
+        assert_eq!(order(&h), before);
     }
 
     #[test]

@@ -69,6 +69,6 @@ The UI follows Styles.md whichever framework is chosen.
 - [ ] ARA2 on timeline clips (needs the ARA SDK; no Rust bindings yet)
 - [x] Every built-in effect has dry/wet and automatic level matching; insert racks can be reordered by drag and drop. `daw_graph::EffectNode` adds MIX/MATCH/DELTA to every `daw_dsp::effects::Effect`; drag a module's title to move it
 - [x] Built-in dynamics and tone: dynamic EQ (incl. threshold-triggered low cut), de-esser, compressor, saturator. In the device picker as `CANARY`; saturator uses ADAA against aliasing
-- [ ] Sampler: one-shot/classic/slice modes (transient, grid, manual), slice to pads, key and velocity zones, round robin
+- [x] Sampler: one-shot/classic/slice modes (transient, grid, manual), slice to pads, key and velocity zones, round robin. Built-in `Sampler` instrument: drop files from 01 (Shift round robin, Option velocity zone, Cmd key zone), click the waveform to add slice points, right-click to remove. Pads do not preview yet (no MIDI path from the UI)
 - [ ] Metering and QC: LUFS (integrated/short-term), oversampled true peak, delta monitoring, mid/side, level-matched A/B reference
 - [ ] Plugin GUIs drawn through Metal; SIMD where profiling shows a hot loop

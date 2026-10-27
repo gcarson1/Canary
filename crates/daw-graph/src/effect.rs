@@ -45,16 +45,15 @@ const MATCH_FLOOR: f32 = 1e-7;
 /// The match gain stays within ±24 dB.
 const MATCH_LIMIT: f32 = 16.0;
 
-/// An effect's parameter values, written by the main thread and read by the
-/// audio thread each block. Ids are indexes into `specs`.
-pub struct EffectParams {
+/// A built-in device's parameter values, written by the main thread and read by
+/// the audio thread each block. Ids are indexes into `specs`.
+pub struct ParamBank {
     specs: Vec<ParamSpec>,
     values: Box<[AtomicU32]>,
 }
 
-impl EffectParams {
-    fn new(own: &[ParamSpec]) -> Self {
-        let specs: Vec<ParamSpec> = own.iter().chain(&COMMON).copied().collect();
+impl ParamBank {
+    pub fn new(specs: Vec<ParamSpec>) -> Self {
         let values = specs
             .iter()
             .map(|p| AtomicU32::new(p.default.to_bits()))
@@ -86,7 +85,7 @@ impl EffectParams {
 
 pub struct EffectNode {
     effect: Box<dyn Effect>,
-    params: Arc<EffectParams>,
+    params: Arc<ParamBank>,
     /// The values last handed to `effect`; NaN forces the first update.
     seen: Box<[f32]>,
     dry: [Box<[f32]>; 2],
@@ -105,8 +104,9 @@ impl EffectNode {
         effect: Box<dyn Effect>,
         sample_rate: f32,
         max_block: usize,
-    ) -> (Self, Arc<EffectParams>) {
-        let params = Arc::new(EffectParams::new(effect.params()));
+    ) -> (Self, Arc<ParamBank>) {
+        let specs = effect.params().iter().chain(&COMMON).copied().collect();
+        let params = Arc::new(ParamBank::new(specs));
         let coef = |seconds: f32| 1.0 - (-1.0 / (seconds * sample_rate)).exp();
         let node = Self {
             seen: vec![f32::NAN; effect.params().len()].into_boxed_slice(),
@@ -249,7 +249,7 @@ mod tests {
         (out_rms, in_rms)
     }
 
-    fn saturator() -> (EffectNode, Arc<EffectParams>) {
+    fn saturator() -> (EffectNode, Arc<ParamBank>) {
         let fx = effect("canary.saturator", SR).unwrap();
         EffectNode::new(fx, SR, 256)
     }

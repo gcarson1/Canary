@@ -6,7 +6,7 @@
 
 mod devices;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
 use std::sync::{mpsc, Arc};
@@ -17,8 +17,9 @@ use daw_core::{Clip, Command, NodeId, SampleData, Telemetry, TrackParams};
 use daw_dsp::WaveformPyramid;
 use daw_engine::{EngineHandle, Recorder};
 use daw_graph::{ExecutionPlan, GainNode, Source, TrackNode};
+use daw_host::LayerKind;
 use daw_project::{Action, ClipRef, History, Track};
-use daw_ui::{theme, EngineView, Inputs, Request, Status, Workspace};
+use daw_ui::{theme, EngineView, Inputs, Request, SampleDrop, Status, Workspace};
 use devices::Devices;
 
 /// Frames per plan buffer; larger device callbacks render in chunks.
@@ -41,6 +42,8 @@ struct App {
     _output: cpal::Stream,
     view: EngineView,
     audio: HashMap<PathBuf, Arc<SampleData>>,
+    /// Sampler files already sent to load, so a failed one is not retried forever.
+    sample_requests: HashSet<PathBuf>,
     waveforms: HashMap<PathBuf, WaveformPyramid>,
     /// Files being loaded, with the placements waiting on each.
     pending: HashMap<PathBuf, Vec<(Option<usize>, u64)>>,
@@ -134,6 +137,7 @@ impl App {
                 ..EngineView::default()
             },
             audio: HashMap::new(),
+            sample_requests: HashSet::new(),
             waveforms: HashMap::new(),
             pending: HashMap::new(),
             loads_tx,
@@ -231,6 +235,20 @@ impl App {
         };
         if let Err(e) = self.history.apply(action) {
             self.error(format!("could not add {}: {e}", path.display()));
+        }
+    }
+
+    fn device_uid(&self, track: usize, device: usize) -> Option<u64> {
+        let tracks = &self.history.project().tracks;
+        tracks.get(track)?.devices.get(device).map(|d| d.uid)
+    }
+
+    /// Gives samplers the audio they wait for, loading each file once.
+    fn feed_samplers(&mut self) {
+        for path in self.devices.feed_samplers(&self.audio) {
+            if self.sample_requests.insert(path.clone()) {
+                self.load(path, None);
+            }
         }
     }
 
@@ -443,16 +461,39 @@ impl App {
                 param,
                 value,
             } => {
-                let uid = self
-                    .history
-                    .project()
-                    .tracks
-                    .get(track)
-                    .and_then(|t| t.devices.get(device))
-                    .map(|d| d.uid);
-                if let Some(uid) = uid {
+                if let Some(uid) = self.device_uid(track, device) {
                     self.devices.set_param(uid, param, value);
                     self.history.mark_dirty(); // so quitting saves the plugin's state
+                }
+            }
+            Request::LoadSample {
+                track,
+                device,
+                path,
+                drop,
+            } => {
+                let kind = match drop {
+                    SampleDrop::Replace => LayerKind::Replace,
+                    SampleDrop::RoundRobin => LayerKind::RoundRobin,
+                    SampleDrop::Velocity => LayerKind::Velocity,
+                    SampleDrop::Key => LayerKind::Key,
+                };
+                let uid = self.device_uid(track, device);
+                if let Some(s) = uid.and_then(|uid| self.devices.sampler(uid)) {
+                    s.add_layer(path, kind);
+                    self.history.mark_dirty();
+                }
+            }
+            Request::SliceMarker {
+                track,
+                device,
+                at,
+                add,
+            } => {
+                let uid = self.device_uid(track, device);
+                if let Some(s) = uid.and_then(|uid| self.devices.sampler(uid)) {
+                    s.edit_marker(at, add);
+                    self.history.mark_dirty();
                 }
             }
         }
@@ -544,6 +585,7 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
 
+        self.feed_samplers();
         self.devices.idle(self.queued.is_some());
         let views = self
             .ws

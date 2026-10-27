@@ -10,7 +10,8 @@ use daw_core::SampleData;
 use daw_dsp::WaveformPyramid;
 use daw_project::{Action, ClipRef, History, Track};
 use daw_ui::{
-    theme, DeviceView, EngineView, Inputs, ParamView, PluginChoice, Request, Theme, Workspace,
+    theme, DeviceView, EngineView, Inputs, ParamView, PluginChoice, Request, SampleDrop,
+    SamplerView, Theme, Workspace,
 };
 use egui::epaint::ColorMode;
 use egui::{Color32, Shape, Vec2};
@@ -97,7 +98,7 @@ fn harness(size: (f32, f32, f32), theme: Theme, engine: EngineView) -> Harness<'
                         waveforms: &waveforms,
                         files: &files,
                         plugins: &plugins(),
-                        devices: &devices(),
+                        devices: &[vec![sampler()], devices()].concat(),
                     },
                 );
             })
@@ -134,6 +135,7 @@ fn devices() -> Vec<DeviceView> {
                 param(2, "Feedback", 0.0),
                 param(3, "Lowpass", 100.0),
             ],
+            sampler: None,
         },
         DeviceView {
             // A full built-in module: eight dials, a log-scaled frequency first.
@@ -159,8 +161,43 @@ fn devices() -> Vec<DeviceView> {
                 log,
             })
             .collect(),
+            sampler: None,
         },
     ]
+}
+
+/// A sampler in slice mode with four slices of a loaded file and two layers.
+fn sampler() -> DeviceView {
+    let params = [
+        ("MODE", 0.0, 2.0, 2.0),
+        ("SLICER", 0.0, 2.0, 1.0),
+        ("SENS", 0.0, 1.0, 0.5),
+        ("GRID", 1.0, 64.0, 4.0),
+        ("ATTACK", 0.0, 500.0, 1.0),
+        ("RELEASE", 1.0, 2000.0, 100.0),
+        ("ROOT", 0.0, 127.0, 36.0),
+        ("GAIN", -24.0, 12.0, 0.0),
+    ];
+    DeviceView {
+        name: "Sampler".into(),
+        params: params
+            .iter()
+            .enumerate()
+            .map(|(i, &(name, min, max, value))| ParamView {
+                id: i as u32,
+                name: name.into(),
+                value,
+                min,
+                max,
+                log: false,
+            })
+            .collect(),
+        sampler: Some(SamplerView {
+            path: Some(PathBuf::from("/samples/808_Thermal_Sub.wav")),
+            slices: vec![0.0, 0.25, 0.5, 0.75],
+            layers: 2,
+        }),
+    }
 }
 
 /// The harness insets the ui by a margin; the app draws edge to edge, so do that.
@@ -471,4 +508,61 @@ fn dragging_a_module_title_moves_the_device() {
         .map(|d| d.id.as_str())
         .collect();
     assert_eq!(ids, ["b", "a"]);
+}
+
+#[test]
+fn sampler_takes_dropped_files_and_slice_clicks() {
+    // The sampler is 32u = 512pt wide from x 280; its waveform spans x 292..524,
+    // y 592..672, with the pads below it.
+    let mut h = rig_with(vec![sampler()]);
+    h.run();
+    click(&mut h, egui::Pos2::new(408.0, 630.0));
+    let marker = h.state().requests.iter().find_map(|r| match r {
+        Request::SliceMarker {
+            track: 0,
+            device: 0,
+            at,
+            add: true,
+        } => Some(*at),
+        _ => None,
+    });
+    assert!(
+        marker.is_some_and(|at| (at - 0.5).abs() < 0.02),
+        "{:?}",
+        h.state().requests
+    );
+
+    // Drag the first browser file onto the pads and let go.
+    let file = egui::Pos2::new(100.0, 104.0);
+    h.hover_at(file);
+    press(&mut h, file, true);
+    h.run();
+    let pads = egui::Pos2::new(420.0, 780.0);
+    for step in 1..=10 {
+        h.hover_at(file + (pads - file) * step as f32 / 10.0);
+        h.run();
+    }
+    std::fs::create_dir_all("../../target/qa").unwrap();
+    h.render()
+        .unwrap()
+        .save("../../target/qa/sampler-drop.png")
+        .unwrap();
+    press(&mut h, pads, false);
+    h.run();
+    assert!(
+        h.state().requests.iter().any(|r| matches!(
+            r,
+            Request::LoadSample { track: 0, device: 0, path, drop: SampleDrop::Replace }
+                if path.ends_with("808_Thermal_Sub.wav")
+        )),
+        "{:?}",
+        h.state().requests
+    );
+    assert!(
+        !h.state()
+            .requests
+            .iter()
+            .any(|r| matches!(r, Request::AddFile { .. })),
+        "a drag is not a click"
+    );
 }

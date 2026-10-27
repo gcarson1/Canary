@@ -14,7 +14,7 @@ use daw_dsp::WaveformPyramid;
 use daw_project::{Action, History, Track, TrackProps};
 use egui::{Align2, Color32, Key, Pos2, Rect, Sense, Shape, StrokeKind, Vec2};
 
-pub use rack::{DeviceView, ParamView, PluginChoice};
+pub use rack::{DeviceView, ParamView, PluginChoice, SampleDrop, SamplerView};
 use theme::Metrics;
 pub use theme::Theme;
 
@@ -67,6 +67,20 @@ pub enum Request {
         device: usize,
         param: u32,
         value: f64,
+    },
+    /// A file dropped on a sampler device.
+    LoadSample {
+        track: usize,
+        device: usize,
+        path: PathBuf,
+        drop: SampleDrop,
+    },
+    /// Add a slice point at `at` (a fraction of the sample), or remove the nearest.
+    SliceMarker {
+        track: usize,
+        device: usize,
+        at: f64,
+        add: bool,
     },
 }
 
@@ -132,6 +146,8 @@ pub struct Workspace {
     picker: Option<f32>,
     /// The rack device being dragged to a new slot.
     device_drag: Option<usize>,
+    /// An asset browser file being dragged (onto a sampler).
+    file_drag: Option<PathBuf>,
 }
 
 impl Default for Workspace {
@@ -149,6 +165,7 @@ impl Default for Workspace {
             edits: Vec::new(),
             picker: None,
             device_drag: None,
+            file_drag: None,
         }
     }
 }
@@ -267,6 +284,25 @@ impl Workspace {
         rack::show(self, ui, &p, &m, z.rack, &inputs, &mut out);
         self.manifest(ui, &p, &m, z.manifest, inputs.history, inputs.engine);
         self.dock(ui, &p, &m, z.dock, inputs.engine);
+        if let Some(path) = &self.file_drag {
+            // The file follows the pointer; the rack takes the drop.
+            if let Some(at) = ui.input(|i| i.pointer.hover_pos()) {
+                let fp = ui.ctx().layer_painter(egui::LayerId::new(
+                    egui::Order::Tooltip,
+                    ui.scope_id().with("file-drag"),
+                ));
+                fp.text(
+                    at + Vec2::new(0.75 * m.u, 0.0),
+                    Align2::LEFT_CENTER,
+                    file_name(path),
+                    m.mono(0.6875),
+                    t.accent_amber,
+                );
+            }
+            if ui.input(|i| i.pointer.any_released()) {
+                self.file_drag = None;
+            }
+        }
 
         for edit in std::mem::take(&mut self.edits) {
             match edit {
@@ -282,7 +318,7 @@ impl Workspace {
 
     /// True while a clip is being dragged; the app holds back its own edits then.
     pub fn is_dragging(&self) -> bool {
-        self.timeline.is_dragging()
+        self.timeline.is_dragging() || self.device_drag.is_some() || self.file_drag.is_some()
     }
 
     /// Queues a project edit for the end of the frame.
@@ -554,7 +590,14 @@ impl Workspace {
                 break;
             }
             let row = Rect::from_x_y_ranges(r.x_range(), y..=m.snap(y + row_h));
-            let resp = ui.interact(row, ui.scope_id().with(("file", i)), Sense::click());
+            let resp = ui.interact(
+                row,
+                ui.scope_id().with(("file", i)),
+                Sense::click_and_drag(),
+            );
+            if resp.drag_started() {
+                self.file_drag = Some(path.clone());
+            }
             let name = file_name(path);
             let label = p.text(
                 Pos2::new(r.min.x + 0.75 * u, row.center().y),

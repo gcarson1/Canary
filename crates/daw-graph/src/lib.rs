@@ -3,14 +3,16 @@
 
 mod effect;
 mod plan;
+mod sampler;
 mod synth;
 mod track;
 
-pub use effect::{EffectNode, EffectParams};
+pub use effect::{EffectNode, ParamBank};
 pub use plan::{
     ExecutionPlan, LiveNodes, NodeArena, PlanError, Source, StepId, MAX_CHANNELS, MAX_LATENCY,
     MAX_NODES,
 };
+pub use sampler::{SamplerData, SamplerNode, Zone, SAMPLER_PARAMS};
 pub use synth::SynthNode;
 pub use track::TrackNode;
 

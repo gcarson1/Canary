@@ -44,6 +44,10 @@ pub trait Hosted {
     fn has_audio_input(&self) -> bool;
     /// Main-thread work the plugin asked for; call regularly.
     fn idle(&mut self) {}
+    /// The built-in sampler's own controls; None for everything else.
+    fn sampler(&mut self) -> Option<&mut crate::Sampler> {
+        None
+    }
 }
 
 impl Hosted for ClapPlugin {

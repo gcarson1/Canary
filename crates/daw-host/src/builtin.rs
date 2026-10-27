@@ -4,14 +4,15 @@
 use std::sync::Arc;
 
 use daw_dsp::effects::{effect, EFFECTS};
-use daw_graph::{EffectNode, EffectParams};
+use daw_graph::{EffectNode, ParamBank};
 
 use crate::{HostError, Hosted, Instance, ParamInfo, PluginInfo};
 
 /// The built-in effects, for the catalog.
 pub fn builtins() -> Vec<PluginInfo> {
-    EFFECTS
+    [(crate::sampler::ID, "Sampler")]
         .iter()
+        .chain(&EFFECTS)
         .map(|(id, name)| PluginInfo {
             id: (*id).into(),
             name: (*name).into(),
@@ -21,6 +22,9 @@ pub fn builtins() -> Vec<PluginInfo> {
 }
 
 pub fn instantiate(id: &str, sample_rate: f32, max_block: usize) -> Result<Instance, HostError> {
+    if id == crate::sampler::ID {
+        return Ok(crate::sampler::instantiate());
+    }
     let fx = effect(id, sample_rate).ok_or_else(|| HostError::UnknownPlugin(id.into()))?;
     let (node, params) = EffectNode::new(fx, sample_rate, max_block);
     let infos = params
@@ -40,7 +44,7 @@ pub fn instantiate(id: &str, sample_rate: f32, max_block: usize) -> Result<Insta
 }
 
 struct Builtin {
-    params: Arc<EffectParams>,
+    params: Arc<ParamBank>,
     infos: Vec<ParamInfo>,
 }
 

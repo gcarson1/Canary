@@ -2,6 +2,7 @@
 
 pub mod effects;
 mod filter;
+pub mod slice;
 mod waveform;
 
 pub use filter::{db_to_gain, gain_to_db, Biquad, Envelope, FilterKind};

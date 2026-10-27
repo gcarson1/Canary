@@ -2,12 +2,14 @@
 //! across plan rebuilds so plugin state survives edits.
 
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use daw_core::NodeId;
+use daw_core::{NodeId, SampleData};
 use daw_graph::{AudioNode, ExecutionPlan, Source, StepId, MAX_NODES};
-use daw_host::{Catalog, Format, Hosted};
+use daw_host::{Catalog, Format, Hosted, Sampler};
 use daw_project::{Device, PluginFormat, Project, Track};
-use daw_ui::{DeviceView, ParamView, PluginChoice};
+use daw_ui::{DeviceView, ParamView, PluginChoice, SamplerView};
 
 /// Node ids from here up belong to devices; tracks and the master use those below.
 pub const FIRST_DEVICE_NODE: u32 = 2048;
@@ -261,6 +263,29 @@ impl Devices {
         }
     }
 
+    /// The sampler behind device `uid`, if it is one.
+    pub fn sampler(&mut self, uid: u64) -> Option<&mut Sampler> {
+        self.live.get_mut(&uid)?.hosted.sampler()
+    }
+
+    /// Hands loaded audio to samplers waiting for it; returns the files still
+    /// to load.
+    pub fn feed_samplers(&mut self, audio: &HashMap<PathBuf, Arc<SampleData>>) -> Vec<PathBuf> {
+        let mut wanted = Vec::new();
+        for l in self.live.values_mut() {
+            let Some(s) = l.hosted.sampler() else {
+                continue;
+            };
+            for path in s.missing() {
+                match audio.get(&path) {
+                    Some(a) => s.set_audio(&path, a),
+                    None => wanted.push(path),
+                }
+            }
+        }
+        wanted
+    }
+
     pub fn set_param(&mut self, uid: u64, id: u32, value: f64) {
         if let Some(l) = self.live.get_mut(&uid) {
             l.hosted.set_param(id, value);
@@ -288,6 +313,15 @@ impl Devices {
                         })
                         .collect()
                 }),
+                sampler: self
+                    .live
+                    .get_mut(&d.uid)
+                    .and_then(|l| l.hosted.sampler())
+                    .map(|s| SamplerView {
+                        path: s.main_path().map(Path::to_path_buf),
+                        slices: s.slice_points(),
+                        layers: s.layer_count(),
+                    }),
             })
             .collect()
     }

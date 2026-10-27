@@ -166,9 +166,20 @@ impl Effect for Compressor {
 pub struct Saturator {
     /// Per channel: drive (linear) and bias, gliding to the knob.
     glide: [(Smoother, Smoother); 2],
-    /// Per channel: last driven input, DC blocker input and output.
-    state: [(f64, f32, f32); 2],
+    /// Per channel: last driven input and its ln(cosh), DC blocker input and
+    /// output, and the last bias with its tanh.
+    state: [Channel; 2],
     dc_coef: f32,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct Channel {
+    x1: f64,
+    f1: f64,
+    dc_in: f32,
+    dc_out: f32,
+    bias: f64,
+    rest: f64,
 }
 
 /// ln(cosh(x)), the antiderivative of tanh, without overflow for large |x|.
@@ -182,24 +193,29 @@ impl Saturator {
 
     fn channel(&mut self, ch: usize, samples: &mut [f32]) {
         let (drive, bias) = &mut self.glide[ch];
-        let (mut x1, mut dc_in, mut dc_out) = self.state[ch];
+        let mut c = self.state[ch];
         for s in samples {
-            let bias = f64::from(bias.tick());
-            let rest = bias.tanh();
-            let x = f64::from(*s) * f64::from(drive.tick()) + bias;
-            let d = x - x1;
+            let b = f64::from(bias.tick());
+            if b != c.bias {
+                // Only while the bias knob glides: tanh is the costly part.
+                (c.bias, c.rest) = (b, b.tanh());
+            }
+            let x = f64::from(*s) * f64::from(drive.tick()) + b;
+            let d = x - c.x1;
+            // Each sample's ln(cosh) is kept for the next: one per sample, not two.
+            let f = ln_cosh(x);
             let y = if d.abs() < 1e-5 {
-                (0.5 * (x + x1)).tanh()
+                (0.5 * (x + c.x1)).tanh()
             } else {
-                (ln_cosh(x) - ln_cosh(x1)) / d
+                (f - c.f1) / d
             };
-            x1 = x;
-            let y = (y - rest) as f32;
-            dc_out = y - dc_in + self.dc_coef * dc_out;
-            dc_in = y;
-            *s = dc_out;
+            (c.x1, c.f1) = (x, f);
+            let y = (y - c.rest) as f32;
+            c.dc_out = y - c.dc_in + self.dc_coef * c.dc_out;
+            c.dc_in = y;
+            *s = c.dc_out;
         }
-        self.state[ch] = (x1, dc_in, dc_out);
+        self.state[ch] = c;
     }
 }
 

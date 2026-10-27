@@ -169,8 +169,12 @@ const TAPS: usize = 12;
 /// Peak of a channel oversampled 4x (a Hann-windowed sinc, 48 taps), catching
 /// inter-sample peaks a sample-peak meter misses.
 pub struct TruePeak {
-    phases: [[f32; TAPS]; 4],
-    history: [f32; TAPS],
+    /// `taps[j][p]`: phase `p`'s weight for the sample `j` back. The four phases
+    /// are four lanes, so each tap is one 4-wide multiply-add (NEON/SSE).
+    taps: [[f32; 4]; TAPS],
+    /// The last `TAPS` samples, stored twice so the window is always one
+    /// contiguous slice, newest first: no wraparound inside the hot loop.
+    history: [f32; 2 * TAPS],
     pos: usize,
 }
 
@@ -178,9 +182,9 @@ impl Default for TruePeak {
     fn default() -> Self {
         let n = 4 * TAPS;
         let center = (n as f32 - 1.0) / 2.0;
-        let mut phases = [[0.0; TAPS]; 4];
-        for (p, phase) in phases.iter_mut().enumerate() {
-            for (j, tap) in phase.iter_mut().enumerate() {
+        let mut taps = [[0.0; 4]; TAPS];
+        for p in 0..4 {
+            for (j, tap) in taps.iter_mut().enumerate() {
                 let m = p + 4 * j;
                 let t = (m as f32 - center) / 4.0;
                 let sinc = if t == 0.0 {
@@ -189,15 +193,15 @@ impl Default for TruePeak {
                     (PI * t).sin() / (PI * t)
                 };
                 let window = 0.5 - 0.5 * (2.0 * PI * (m as f32 + 0.5) / n as f32).cos();
-                *tap = sinc * window;
+                tap[p] = sinc * window;
             }
             // Unity gain at DC for every phase.
-            let sum: f32 = phase.iter().sum();
-            phase.iter_mut().for_each(|t| *t /= sum);
+            let sum: f32 = taps.iter().map(|t| t[p]).sum();
+            taps.iter_mut().for_each(|t| t[p] /= sum);
         }
         Self {
-            phases,
-            history: [0.0; TAPS],
+            taps,
+            history: [0.0; 2 * TAPS],
             pos: 0,
         }
     }
@@ -208,23 +212,27 @@ impl TruePeak {
     pub fn process(&mut self, x: &[f32]) -> f32 {
         let mut peak = 0.0f32;
         for &s in x {
+            self.pos = if self.pos == 0 {
+                TAPS - 1
+            } else {
+                self.pos - 1
+            };
             self.history[self.pos] = s;
-            peak = peak.max(s.abs());
-            for phase in &self.phases {
-                // Newest sample first: history runs backwards from `pos`.
-                let mut y = 0.0;
-                for (j, tap) in phase.iter().enumerate() {
-                    y += tap * self.history[(self.pos + TAPS - j) % TAPS];
+            self.history[self.pos + TAPS] = s;
+            let window = &self.history[self.pos..self.pos + TAPS];
+            let mut acc = [0.0f32; 4];
+            for (tap, &v) in self.taps.iter().zip(window) {
+                for (a, t) in acc.iter_mut().zip(tap) {
+                    *a += t * v;
                 }
-                peak = peak.max(y.abs());
             }
-            self.pos = (self.pos + 1) % TAPS;
+            peak = acc.iter().fold(peak.max(s.abs()), |m, a| m.max(a.abs()));
         }
         peak
     }
 
     pub fn reset(&mut self) {
-        self.history = [0.0; TAPS];
+        self.history = [0.0; 2 * TAPS];
     }
 }
 

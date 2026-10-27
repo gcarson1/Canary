@@ -198,6 +198,7 @@ impl SamplerNode {
                 data.channel(0),
                 data.channel(data.num_channels().min(2) - 1),
             );
+            let mono = data.num_channels() == 1;
             for (ol, or) in left.iter_mut().zip(right.iter_mut()) {
                 let remaining = end as f64 - v.pos;
                 let sustaining = (v.held || zone.one_shot) && !v.choked;
@@ -214,8 +215,14 @@ impl SamplerNode {
                 }
                 let fade = (remaining as f32 / EDGE_FADE).min(1.0);
                 let g = v.level * v.velocity * gain * fade;
-                *ol += cubic(l, v.pos, zone.start, end) * g;
-                *or += cubic(r, v.pos, zone.start, end) * g;
+                let sl = cubic(l, v.pos, zone.start, end);
+                let sr = if mono {
+                    sl
+                } else {
+                    cubic(r, v.pos, zone.start, end)
+                };
+                *ol += sl * g;
+                *or += sr * g;
                 v.pos += v.step;
             }
         }
@@ -223,6 +230,8 @@ impl SamplerNode {
 }
 
 /// Cubic Hermite interpolation of `x` at `pos`, reading only inside start..end.
+// An unclamped fast path away from the edges profiled slower (the branch costs
+// more than the clamps), so every read clamps.
 fn cubic(x: &[f32], pos: f64, start: usize, end: usize) -> f32 {
     let i = pos as usize;
     let t = (pos - i as f64) as f32;

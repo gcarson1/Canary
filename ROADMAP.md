@@ -65,7 +65,7 @@ The UI follows Styles.md whichever framework is chosen.
 - [x] Signed `.app` bundle: `scripts/bundle.sh` builds `target/release/Canary.app` with `NSMicrophoneUsageDescription`, signed ad-hoc or with `SIGN_IDENTITY` (hardened runtime, mic and plugin entitlements). No `cargo-bundle` needed. Notarization is a manual step
 
 ### Phase 5: Production Toolkit (later)
-- [ ] PDC compiler: delay lines so tracks with plugin latency stay in sync
+- [x] PDC compiler: delay lines so tracks with plugin latency stay in sync. `ExecutionPlan::compensate` (run by `send_plan`) delays faster edges; delays keep their audio across plan swaps
 - [ ] ARA2 on timeline clips (needs the ARA SDK; no Rust bindings yet)
 - [ ] Every built-in effect has dry/wet and automatic level matching; insert racks can be reordered by drag and drop
 - [ ] Built-in dynamics and tone: dynamic EQ (incl. threshold-triggered low cut), de-esser, compressor, saturator

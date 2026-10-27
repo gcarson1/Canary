@@ -1,12 +1,13 @@
-//! The `AudioNode` trait, the `ExecutionPlan` executor and the built-in nodes.
-//! The PDC calculator comes later.
+//! The `AudioNode` trait, the `ExecutionPlan` executor and PDC compiler, and the
+//! built-in nodes.
 
 mod plan;
 mod synth;
 mod track;
 
 pub use plan::{
-    ExecutionPlan, LiveNodes, NodeArena, PlanError, Source, StepId, MAX_CHANNELS, MAX_NODES,
+    ExecutionPlan, LiveNodes, NodeArena, PlanError, Source, StepId, MAX_CHANNELS, MAX_LATENCY,
+    MAX_NODES,
 };
 pub use synth::SynthNode;
 pub use track::TrackNode;

@@ -60,9 +60,10 @@ impl fmt::Display for SendPlanError {
 impl std::error::Error for SendPlanError {}
 
 impl EngineHandle {
-    /// Checks `plan` against the nodes the audio thread will have, then queues it to
-    /// be swapped in at the start of a block.
-    pub fn send_plan(&mut self, plan: Box<ExecutionPlan>) -> Result<(), SendPlanError> {
+    /// Runs the PDC compiler on `plan`, checks it against the nodes the audio thread
+    /// will have, then queues it to be swapped in at the start of a block.
+    pub fn send_plan(&mut self, mut plan: Box<ExecutionPlan>) -> Result<(), SendPlanError> {
+        plan.compensate();
         let next = self.live.check(&plan).map_err(SendPlanError::Invalid)?;
         self.plans
             .push(plan)
@@ -158,6 +159,7 @@ impl AudioEngine {
             self.nodes.apply(&mut plan);
             if let Some(old) = self.plan.as_deref_mut() {
                 plan.hand_retired_to(old);
+                plan.adopt_delays(old);
             }
             if let Some(old) = self.plan.replace(plan) {
                 let _ = self.garbage.push(old); // cannot fail: checked not full
@@ -399,6 +401,56 @@ mod tests {
 
         assert_eq!(block[0], 1.0);
         assert_eq!(audio.transport().playhead(), 1024);
+    }
+
+    /// A track of ones feeds the master directly and through a gain step said to
+    /// lag 7 samples, so PDC delays the direct path by 7.
+    fn latent_plan() -> Box<ExecutionPlan> {
+        let audio = SampleData::new(48_000, vec![vec![1.0; 4096]]).unwrap();
+        let params = Arc::new(TrackParams::new(Arc::default()));
+        let mut plan = ExecutionPlan::new(64);
+        plan.insert(
+            NodeId(0),
+            Box::new(TrackNode::new(vec![Clip::new(0, Arc::new(audio))], params)),
+        );
+        plan.insert(NodeId(1), Box::new(GainNode { gain: 1.0 }));
+        plan.insert(NodeId(2), Box::new(GainNode { gain: 1.0 }));
+        let track = plan.add(NodeId(0), vec![], 1).unwrap();
+        let src = |step| vec![Source { step, channel: 0 }];
+        let wet = plan.add(NodeId(1), vec![src(track)], 1).unwrap();
+        plan.set_latency(wet, 7);
+        plan.add(NodeId(2), vec![[src(track), src(wet)].concat()], 1)
+            .unwrap();
+        Box::new(plan)
+    }
+
+    #[test]
+    fn send_plan_compensates_and_delays_survive_swaps_without_allocating() {
+        let (mut handle, mut audio) = engine(16, 48_000.0);
+        handle.commands.push(Command::Play).unwrap();
+        handle.send_plan(latent_plan()).unwrap();
+        let mut first = vec![0.0; 10];
+        let mut second = vec![0.0; 10];
+        assert_no_alloc(|| audio.process(&mut first, 1));
+
+        // The same graph from the live nodes: the direct path's delay carries over.
+        let mut again = ExecutionPlan::new(64);
+        let track = again.add(NodeId(0), vec![], 1).unwrap();
+        let src = |step| vec![Source { step, channel: 0 }];
+        let wet = again.add(NodeId(1), vec![src(track)], 1).unwrap();
+        again.set_latency(wet, 7);
+        again
+            .add(NodeId(2), vec![[src(track), src(wet)].concat()], 1)
+            .unwrap();
+        handle.send_plan(Box::new(again)).unwrap();
+        assert_no_alloc(|| audio.process(&mut second, 1));
+
+        // Centre pan scales a mono track by the pan law; compare against frame 0.
+        let one = first[0];
+        assert!(one > 0.0);
+        assert_eq!(first[..7], [one; 7]);
+        assert_eq!(first[7..], [2.0 * one; 3]);
+        assert_eq!(second, vec![2.0 * one; 10]);
     }
 
     #[test]

@@ -68,7 +68,8 @@ Initially, the CoreAudio callback runs on a single high-priority thread. Once a 
 
 Lookahead limiters or linear-phase EQs introduce a fixed sample delay (e.g., 512 samples). Without modularity for this, tracks with plugins will play out of phase with dry tracks.
 
-* **Building it into the trait now:** By including `fn latency_samples(&self) -> u32` on the `AudioNode` trait from day one, the graph compiler on the Main Thread can walk the DAG, calculate the maximum latency path, and automatically insert hidden `DelayCompensationNode` ring buffers onto parallel tracks with lower latency. Nodes report latency today, but the PDC compiler is not built yet (ROADMAP Phase 5).
+* **Building it into the trait now:** By including `fn latency_samples(&self) -> u32` on the `AudioNode` trait from day one, the graph compiler on the Main Thread can walk the DAG, calculate the maximum latency path, and automatically insert hidden delay ring buffers onto parallel paths with lower latency.
+* **Built (`ExecutionPlan::compensate`):** `EngineHandle::send_plan` runs it on every plan. Each step's inputs arrive when its slowest source is ready; every faster source edge gets a ring buffer of the difference, and a step's output is ready that much plus its node's latency. Nodes inserted by the plan report their own `latency_samples()`; nodes live from an earlier plan (persistent plugins) need `ExecutionPlan::set_latency`. Latencies clamp at `MAX_LATENCY` (2^20 samples). On a plan swap `adopt_delays` hands each edge's in-flight audio to the new plan when the edge (step node, input, source node, channel) and its delay are unchanged, so edits during playback do not drop audio. `ExecutionPlan::latency()` is the master's total lag; live MIDI input is not compensated.
 
 ---
 

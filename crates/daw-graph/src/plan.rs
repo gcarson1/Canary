@@ -13,6 +13,10 @@ pub const MAX_CHANNELS: usize = 8;
 pub const MAX_NODES: usize = 4096;
 /// MIDI events a node may emit per block without the executor allocating.
 const MIDI_CAPACITY: usize = 1024;
+/// Most latency one node may report, and the longest compensation delay one edge
+/// gets (about 21 s at 48 kHz, 4 MiB). Larger values are clamped, so a plugin
+/// reporting garbage cannot exhaust memory.
+pub const MAX_LATENCY: u32 = 1 << 20;
 
 /// Index of a step in an `ExecutionPlan`, in the order it was added.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +68,37 @@ struct Step {
     outputs: Vec<Box<[f32]>>,
     /// Receives the live MIDI input (an instrument); other steps get none.
     takes_midi: bool,
+    /// Set by `set_latency`; otherwise read from this plan's inserted node, else 0.
+    latency: Option<u32>,
+    /// Compensation delays on this step's sources, in (input, source) order.
+    delays: Vec<Delay>,
+}
+
+/// Delays one source of one input so it lines up with the slowest path into the
+/// same step (plugin delay compensation).
+struct Delay {
+    /// (step node, input, source node, source channel): finds the same edge in the
+    /// next plan so the audio in flight carries over.
+    key: (NodeId, usize, NodeId, usize),
+    input: usize,
+    /// Index into `sources[input]`.
+    source: usize,
+    line: Box<[f32]>,
+    pos: usize,
+}
+
+impl Delay {
+    /// Adds `from`, delayed by the line's length, into `out`.
+    fn mix_into(&mut self, out: &mut [f32], from: &[f32]) {
+        for (o, &s) in out.iter_mut().zip(from) {
+            *o += self.line[self.pos];
+            self.line[self.pos] = s;
+            self.pos += 1;
+            if self.pos == self.line.len() {
+                self.pos = 0;
+            }
+        }
+    }
 }
 
 /// A topologically ordered schedule with every buffer allocated up front, plus the
@@ -83,6 +118,9 @@ pub struct ExecutionPlan {
     /// Receives removed nodes on the audio thread; capacity reserved in `remove`.
     retired: Vec<Box<dyn AudioNode>>,
     updates: Vec<(NodeId, Box<dyn Any + Send>)>,
+    /// (step, index into its `delays`) of every delay, sorted by `Delay::key`.
+    delay_order: Vec<(usize, usize)>,
+    latency: u32,
 }
 
 impl ExecutionPlan {
@@ -98,6 +136,8 @@ impl ExecutionPlan {
             removals: Vec::new(),
             retired: Vec::new(),
             updates: Vec::new(),
+            delay_order: Vec::new(),
+            latency: 0,
         }
     }
 
@@ -151,6 +191,8 @@ impl ExecutionPlan {
             outputs: (0..num_outputs).map(|_| buffer()).collect(),
             sources: inputs,
             takes_midi: false,
+            latency: None,
+            delays: Vec::new(),
         });
         Ok(StepId(self.steps.len() - 1))
     }
@@ -162,6 +204,96 @@ impl ExecutionPlan {
             .get_mut(step.0)
             .map(|s| s.takes_midi = true)
             .is_some()
+    }
+
+    /// Sets the latency `step`'s node reports. Needed for a node that went live in an
+    /// earlier plan, or whose latency changed; nodes inserted by this plan are read
+    /// directly. Returns false if there is no such step.
+    pub fn set_latency(&mut self, step: StepId, samples: u32) -> bool {
+        self.steps
+            .get_mut(step.0)
+            .map(|s| s.latency = Some(samples))
+            .is_some()
+    }
+
+    /// The PDC compiler. Walks the schedule, finds when each step's inputs arrive
+    /// (the slowest source path), and gives every faster source a delay line so all
+    /// of them line up. Run it once the plan is built; `EngineHandle::send_plan`
+    /// does. Running it again starts from scratch.
+    pub fn compensate(&mut self) {
+        let mut inserted = vec![0u32; MAX_NODES];
+        for (id, node) in &self.inserts {
+            if let (Some(slot), Some(node)) = (inserted.get_mut(id.0 as usize), node) {
+                *slot = node.latency_samples();
+            }
+        }
+        let nodes: Vec<NodeId> = self.steps.iter().map(|s| s.node).collect();
+        // When each step's output is ready, in samples behind the dry signal.
+        let mut ready: Vec<u32> = Vec::with_capacity(self.steps.len());
+        self.delay_order.clear();
+        for (i, step) in self.steps.iter_mut().enumerate() {
+            let arrive = step
+                .sources
+                .iter()
+                .flatten()
+                .map(|s| ready[s.step.0])
+                .max()
+                .unwrap_or(0);
+            step.delays.clear();
+            for (input, sources) in step.sources.iter().enumerate() {
+                for (k, s) in sources.iter().enumerate() {
+                    let delay = (arrive - ready[s.step.0]).min(MAX_LATENCY) as usize;
+                    if delay > 0 {
+                        self.delay_order.push((i, step.delays.len()));
+                        step.delays.push(Delay {
+                            key: (step.node, input, nodes[s.step.0], s.channel),
+                            input,
+                            source: k,
+                            line: vec![0.0; delay].into_boxed_slice(),
+                            pos: 0,
+                        });
+                    }
+                }
+            }
+            let own = step
+                .latency
+                .unwrap_or_else(|| inserted.get(step.node.0 as usize).copied().unwrap_or(0));
+            ready.push(arrive.saturating_add(own.min(MAX_LATENCY)));
+        }
+        let steps = &self.steps;
+        self.delay_order
+            .sort_by_key(|&(i, j)| steps[i].delays[j].key);
+        self.latency = ready.last().copied().unwrap_or(0);
+    }
+
+    /// How far the output lags the dry signal after `compensate`, in samples.
+    pub fn latency(&self) -> u32 {
+        self.latency
+    }
+
+    /// Takes over the audio in flight in `old`'s compensation delays for every edge
+    /// both plans share with the same delay, so a plan swap does not drop it.
+    /// Allocation-free; call it on the audio thread when this plan replaces `old`.
+    pub fn adopt_delays(&mut self, old: &mut ExecutionPlan) {
+        let (mut a, mut b) = (0, 0);
+        while a < self.delay_order.len() && b < old.delay_order.len() {
+            let (ni, nj) = self.delay_order[a];
+            let (oi, oj) = old.delay_order[b];
+            let new = &mut self.steps[ni].delays[nj];
+            let prev = &mut old.steps[oi].delays[oj];
+            match new.key.cmp(&prev.key) {
+                std::cmp::Ordering::Less => a += 1,
+                std::cmp::Ordering::Greater => b += 1,
+                std::cmp::Ordering::Equal => {
+                    if new.line.len() == prev.line.len() {
+                        mem::swap(&mut new.line, &mut prev.line);
+                        new.pos = prev.pos;
+                    }
+                    a += 1;
+                    b += 1;
+                }
+            }
+        }
     }
 
     /// The last step's output buffers, valid for `num_samples` frames after `process`.
@@ -191,16 +323,24 @@ impl ExecutionPlan {
                 inputs,
                 outputs,
                 takes_midi,
+                delays,
+                ..
             } = &mut rest[0];
 
             // Inputs are summing buses, so they start from silence.
-            for (input, sources) in inputs.iter_mut().zip(sources.iter()) {
+            let mut delays = delays.iter_mut().peekable();
+            for (ch, (input, sources)) in inputs.iter_mut().zip(sources.iter()).enumerate() {
                 let input = &mut input[..n];
                 input.fill(0.0);
-                for source in sources {
+                for (k, source) in sources.iter().enumerate() {
                     let from = &done[source.step.0].outputs[source.channel][..n];
-                    for (i, s) in input.iter_mut().zip(from) {
-                        *i += s;
+                    match delays.next_if(|d| d.input == ch && d.source == k) {
+                        Some(delay) => delay.mix_into(input, from),
+                        None => {
+                            for (i, s) in input.iter_mut().zip(from) {
+                                *i += s;
+                            }
+                        }
                     }
                 }
             }
@@ -242,6 +382,7 @@ impl fmt::Debug for ExecutionPlan {
             .field("inserts", &self.inserts.len())
             .field("removals", &self.removals)
             .field("updates", &self.updates.len())
+            .field("latency", &self.latency)
             .finish()
     }
 }
@@ -593,6 +734,137 @@ mod tests {
         plan.process(&mut arena, &ctx(4), &[note, note]);
         assert_eq!(plan.output()[0][0], 20.0);
         assert_eq!(plan.output()[1][0], 0.0);
+    }
+
+    /// Delays its one input by `line.len()` samples and reports that as latency.
+    struct Lag {
+        line: Vec<f32>,
+        pos: usize,
+    }
+
+    fn lag(samples: usize) -> Box<Lag> {
+        Box::new(Lag {
+            line: vec![0.0; samples],
+            pos: 0,
+        })
+    }
+
+    impl AudioNode for Lag {
+        fn process(
+            &mut self,
+            inputs: &[&[f32]],
+            outputs: &mut [&mut [f32]],
+            _midi_in: &[MidiEvent],
+            _midi_out: &mut Vec<MidiEvent>,
+            _context: &ProcessContext,
+        ) {
+            for (o, &i) in outputs[0].iter_mut().zip(inputs[0]) {
+                *o = self.line[self.pos];
+                self.line[self.pos] = i;
+                self.pos = (self.pos + 1) % self.line.len();
+            }
+        }
+        fn latency_samples(&self) -> u32 {
+            self.line.len() as u32
+        }
+        fn reset(&mut self) {}
+    }
+
+    /// An impulse into a dry path and a path lagging 3 samples, summed at a bus.
+    fn parallel_paths(plan: &mut ExecutionPlan) {
+        let src_id = NodeId(0);
+        plan.insert(src_id, script(&[1.0]));
+        let source = plan.add(src_id, vec![], 1).unwrap();
+        plan.insert(NodeId(1), lag(3));
+        let wet = plan.add(NodeId(1), vec![vec![src(source)]], 1).unwrap();
+        plan.insert(NodeId(2), gain());
+        plan.add(NodeId(2), vec![vec![src(source), src(wet)]], 1)
+            .unwrap();
+    }
+
+    #[test]
+    fn compensation_lines_up_parallel_paths() {
+        let mut arena = NodeArena::default();
+        let mut plan = ExecutionPlan::new(8);
+        parallel_paths(&mut plan);
+        plan.compensate();
+        plan.compensate(); // idempotent
+        assert_eq!(plan.latency(), 3);
+        run(&mut plan, &mut arena, 8);
+        // Script writes 1.0 for the whole first block, so both paths step up at 3.
+        assert_eq!(
+            &*plan.output()[0],
+            &[0.0, 0.0, 0.0, 2.0, 2.0, 2.0, 2.0, 2.0]
+        );
+    }
+
+    #[test]
+    fn without_compensation_paths_are_misaligned() {
+        let mut arena = NodeArena::default();
+        let mut plan = ExecutionPlan::new(8);
+        parallel_paths(&mut plan);
+        run(&mut plan, &mut arena, 8);
+        assert_eq!(plan.output()[0][0], 1.0);
+        assert_eq!(plan.latency(), 0);
+    }
+
+    #[test]
+    fn set_latency_covers_nodes_from_earlier_plans_and_delays_survive_swaps() {
+        let mut arena = NodeArena::default();
+        let mut first = ExecutionPlan::new(4);
+        parallel_paths(&mut first);
+        first.compensate();
+        arena.apply(&mut first);
+        // Last frame of a block: only one sample in, three still in the delay line.
+        first.process(&mut arena, &ctx(4), &[]);
+        assert_eq!(&*first.output()[0], &[0.0, 0.0, 0.0, 2.0]);
+
+        // Same graph from live nodes; the lag node's latency must be stated.
+        let mut second = ExecutionPlan::new(4);
+        let source = second.add(NodeId(0), vec![], 1).unwrap();
+        let wet = second.add(NodeId(1), vec![vec![src(source)]], 1).unwrap();
+        second
+            .add(NodeId(2), vec![vec![src(source), src(wet)]], 1)
+            .unwrap();
+        second.compensate();
+        assert_eq!(second.latency(), 0, "unknown latency counts as 0");
+        assert!(second.set_latency(wet, 3));
+        assert!(!second.set_latency(StepId(9), 3));
+        second.compensate();
+        assert_eq!(second.latency(), 3);
+        arena.apply(&mut second);
+        second.adopt_delays(&mut first);
+        // Script now writes 0.0: the dry path's 1.0s still in flight come out
+        // alongside the lag node's own tail.
+        second.process(&mut arena, &ctx(4), &[]);
+        assert_eq!(&*second.output()[0], &[2.0, 2.0, 2.0, 0.0]);
+    }
+
+    #[test]
+    fn huge_reported_latency_is_clamped() {
+        struct Liar;
+        impl AudioNode for Liar {
+            fn process(
+                &mut self,
+                _inputs: &[&[f32]],
+                outputs: &mut [&mut [f32]],
+                _midi_in: &[MidiEvent],
+                _midi_out: &mut Vec<MidiEvent>,
+                _context: &ProcessContext,
+            ) {
+                outputs[0].fill(0.0);
+            }
+            fn latency_samples(&self) -> u32 {
+                u32::MAX
+            }
+            fn reset(&mut self) {}
+        }
+        let mut plan = ExecutionPlan::new(4);
+        let a = add(&mut plan, Box::new(Liar), vec![], 1).unwrap();
+        let b = add(&mut plan, script(&[]), vec![], 1).unwrap();
+        add(&mut plan, gain(), vec![vec![src(a), src(b)]], 1).unwrap();
+        plan.compensate();
+        assert_eq!(plan.latency(), MAX_LATENCY);
     }
 
     #[test]

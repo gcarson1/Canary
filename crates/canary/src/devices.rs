@@ -210,6 +210,7 @@ impl Devices {
         let instrument = live.clone().find(|l| l.instrument)?;
         let step = plan.add(instrument.id, vec![], 2).ok()?;
         plan.route_midi(step);
+        plan.set_latency(step, instrument.hosted.latency_samples());
         Some(step)
     }
 
@@ -226,6 +227,7 @@ impl Devices {
             };
             let from = |channel| vec![Source { step, channel }];
             if let Ok(next) = plan.add(l.id, vec![from(0), from(1)], 2) {
+                plan.set_latency(next, l.hosted.latency_samples());
                 step = next;
             }
         }

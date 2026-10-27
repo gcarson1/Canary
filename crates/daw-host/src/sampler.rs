@@ -51,6 +51,9 @@ pub struct Sampler {
     markers: Vec<f64>,
     /// Slice starts in frames of the first layer, as last built.
     starts: Vec<usize>,
+    /// The slices need recomputing (slicer settings, markers or audio changed);
+    /// other edits reuse them, since a transient scan reads the whole file.
+    reslice: bool,
     to_node: Producer<Box<SamplerData>>,
     returned: Consumer<Box<SamplerData>>,
     out: usize,
@@ -110,6 +113,7 @@ pub fn instantiate() -> Instance {
         layers: Vec::new(),
         markers: Vec::new(),
         starts: Vec::new(),
+        reslice: true,
         to_node,
         returned,
         out: 0,
@@ -140,16 +144,19 @@ impl Sampler {
     /// Adds a sample file; its audio arrives later through `set_audio`.
     pub fn add_layer(&mut self, path: PathBuf, kind: LayerKind) {
         let last = self.layers.last().map_or((0, 0), |l| (l.key, l.velocity));
-        let next = |f: fn(&Layer) -> u8| self.layers.iter().map(f).max().map_or(0, |m| m + 1);
+        let next_key = self.layers.iter().map(|l| l.key).max().map_or(0, |m| m + 1);
+        // Velocity zones count within one key zone: the last layer's.
+        let next_velocity = self.velocities(last.0);
         let (key, velocity) = match kind {
             LayerKind::Replace => {
                 self.layers.clear();
                 self.markers.clear();
+                self.reslice = true;
                 (0, 0)
             }
             LayerKind::RoundRobin => last,
-            LayerKind::Velocity => (last.0, next(|l| l.velocity).min(126)),
-            LayerKind::Key => (next(|l| l.key).min(127), last.1),
+            LayerKind::Velocity => (last.0, next_velocity.min(126)),
+            LayerKind::Key => (next_key.min(127), 0),
         };
         self.layers.push(Layer {
             key,
@@ -158,6 +165,12 @@ impl Sampler {
             audio: None,
         });
         self.rebuild();
+    }
+
+    /// Velocity zones in key zone `key`.
+    fn velocities(&self, key: u8) -> u8 {
+        let in_key = self.layers.iter().filter(|l| l.key == key);
+        in_key.map(|l| l.velocity).max().map_or(0, |m| m + 1)
     }
 
     /// Files whose audio has not arrived yet.
@@ -177,6 +190,7 @@ impl Sampler {
             changed = true;
         }
         if changed {
+            self.reslice = true;
             self.rebuild();
         }
     }
@@ -227,6 +241,7 @@ impl Sampler {
         {
             self.markers.remove(i);
         }
+        self.reslice = true;
         self.rebuild();
     }
 
@@ -243,16 +258,20 @@ impl Sampler {
         let root = self.param(ROOT).round().clamp(0.0, 127.0) as u8;
         let mode = self.param(MODE).round() as u8;
         let main = self.layers.first().and_then(|l| l.audio.clone());
-        self.starts = main.as_ref().map_or_else(Vec::new, |a| {
-            let ch = a.channel(0);
-            let mut starts = match self.param(SLICER).round() as u8 {
-                0 => slice::transients(ch, a.sample_rate() as f32, self.param(SENS)),
-                1 => slice::grid(ch.len(), self.param(GRID).round() as usize),
-                _ => slice::markers(ch.len(), &self.markers),
-            };
-            slice::snap_to_zero(ch, &mut starts, a.sample_rate() as usize / 500);
-            starts
-        });
+        if std::mem::take(&mut self.reslice) {
+            self.starts = main.as_ref().map_or_else(Vec::new, |a| {
+                let ch = a.channel(0);
+                let mut starts = match self.param(SLICER).round() as u8 {
+                    0 => slice::transients(ch, a.sample_rate() as f32, self.param(SENS)),
+                    1 => slice::grid(ch.len(), self.param(GRID).round() as usize),
+                    _ => slice::markers(ch.len(), &self.markers),
+                };
+                slice::snap_to_zero(ch, &mut starts, a.sample_rate() as usize / 500);
+                // Close starts can snap to the same crossing: no empty slices.
+                starts.dedup();
+                starts
+            });
+        }
         let mut zones = Vec::new();
         if mode == 2 {
             // One slice per key from ROOT up: the pads.
@@ -279,12 +298,6 @@ impl Sampler {
             }
         } else {
             let keys = self.layers.iter().map(|l| l.key).max().map_or(1, |m| m + 1);
-            let vels = self
-                .layers
-                .iter()
-                .map(|l| l.velocity)
-                .max()
-                .map_or(1, |m| m + 1);
             for l in &self.layers {
                 let Some(audio) = l.audio.clone() else {
                     continue;
@@ -295,14 +308,14 @@ impl Sampler {
                     sample: audio,
                     start: 0,
                     keys: key_range,
-                    velocities: split(1, vels, l.velocity),
+                    velocities: split(1, self.velocities(l.key), l.velocity),
                     // One key zone plays at ROOT; split zones play true at their middle.
                     root: if keys == 1 {
                         root
                     } else {
                         ((u16::from(key_range.0) + u16::from(key_range.1)) / 2) as u8
                     },
-                    cell: u16::from(l.key) * u16::from(vels) + u16::from(l.velocity),
+                    cell: u16::from(l.key) * 128 + u16::from(l.velocity),
                     one_shot: mode == 0,
                 });
             }
@@ -342,6 +355,7 @@ impl Hosted for Sampler {
         }
         let shapes_zones = [MODE, SLICER, SENS, GRID, ROOT].contains(&id);
         if shapes_zones && self.params.get(id) != before {
+            self.reslice |= [SLICER, SENS, GRID].contains(&id);
             self.rebuild();
         }
         true
@@ -369,6 +383,7 @@ impl Hosted for Sampler {
         let text = std::str::from_utf8(bytes).map_err(|_| HostError::State)?;
         self.layers.clear();
         self.markers.clear();
+        self.reslice = true;
         for (name, value) in text.lines().filter_map(|l| l.split_once('=')) {
             match name {
                 "LAYER" => {
@@ -458,12 +473,23 @@ mod tests {
         assert_eq!(
             zones,
             [
+                // Kick and its alternate share soft hits; the hard kick has the rest.
                 ((0, 63), (1, 63), 0, 31),
                 ((0, 63), (1, 63), 0, 31),
                 ((0, 63), (64, 127), 1, 31),
-                ((64, 127), (64, 127), 3, 95),
+                // A new key zone covers every velocity.
+                ((64, 127), (1, 127), 128, 95),
             ]
         );
+        // Kick, then a snare key zone with a hard layer: hard kicks still play.
+        s.add_layer("kick.wav".into(), LayerKind::Replace);
+        s.add_layer("snare.wav".into(), LayerKind::Key);
+        s.add_layer("snare-hard.wav".into(), LayerKind::Velocity);
+        for p in ["kick.wav", "snare.wav", "snare-hard.wav"] {
+            s.set_audio(Path::new(p), &audio(100));
+        }
+        let velocities: Vec<_> = s.zones().iter().map(|z| z.velocities).collect();
+        assert_eq!(velocities, [(1, 127), (1, 63), (64, 127)]);
         assert_eq!(split(0, 2, 0), (0, 63));
         assert_eq!(split(0, 2, 1), (64, 127));
         assert_eq!(split(1, 2, 0), (1, 63));

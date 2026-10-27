@@ -557,6 +557,8 @@ impl App {
                 };
                 let uid = self.device_uid(track, device);
                 if let Some(s) = uid.and_then(|uid| self.devices.sampler(uid)) {
+                    // Dropping a file again retries a load that failed.
+                    self.sample_requests.remove(&path);
                     s.add_layer(path, kind);
                     self.history.mark_dirty();
                 }

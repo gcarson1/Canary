@@ -303,7 +303,8 @@ fn sampler_panel(
 
     // Dropping a file from the browser loads it; the modifier picks how.
     let pointer = ui.input(|i| i.pointer.hover_pos());
-    let over = pointer.is_some_and(|at| r.contains(at));
+    // Only where the panel is drawn: the rack clips modules that run past it.
+    let over = pointer.is_some_and(|at| r.contains(at) && p.clip_rect().contains(at));
     if ws.file_drag.is_some() && over {
         p.rect_stroke(
             r.shrink(1.0),

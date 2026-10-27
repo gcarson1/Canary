@@ -267,15 +267,19 @@ impl App {
         match self.audio.get(&path) {
             None => {
                 if self.sample_requests.insert(path.clone()) {
-                    self.load(path, None);
+                    self.load(path.clone(), None);
                 }
             }
             Some(audio) if self.reference_lufs.as_ref().is_none_or(|(p, _)| *p != path) => {
                 let right = audio.channel(audio.num_channels().min(2) - 1);
                 let lufs = integrated_loudness(audio.channel(0), right, audio.sample_rate() as f32);
-                self.reference_lufs = Some((path, lufs));
+                self.reference_lufs = Some((path.clone(), lufs));
             }
             Some(_) => {}
+        }
+        // B only once its loudness is known, so it never plays unmatched.
+        if self.reference_lufs.as_ref().is_none_or(|(p, _)| *p != path) {
+            self.monitor.set_reference(false);
         }
     }
 
@@ -414,6 +418,8 @@ impl App {
         let reference = self.history.project().reference.clone();
         if let Some(audio) = reference.as_ref().and_then(|p| self.audio.get(p)) {
             let params = Arc::new(TrackParams::new(Arc::default()));
+            // Equal-power center pan is -3 dB; undo it so B plays as measured.
+            params.set_gain(std::f32::consts::SQRT_2);
             let clip = Clip::new(0, audio.clone());
             plan.insert(REFERENCE_NODE, Box::new(TrackNode::new(vec![clip], params)));
             let step = plan.add(REFERENCE_NODE, vec![], 2).expect("no sources");

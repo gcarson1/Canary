@@ -150,8 +150,11 @@ impl AudioNode for MasterNode {
             self.loudness.reset();
             self.peaks.iter_mut().for_each(TruePeak::reset);
             self.peak = 0.0;
+            self.sums = [0.0; 3];
         }
-        if mix_l.len() == n && mix_r.len() == n {
+        // A NaN or inf from a plugin would stick in the meters' filter state.
+        let finite = mix_l.iter().chain(mix_r).all(|s| s.is_finite());
+        if finite && mix_l.len() == n && mix_r.len() == n {
             self.loudness.process(mix_l, mix_r);
             for (tp, x) in self.peaks.iter_mut().zip([mix_l, mix_r]) {
                 self.peak = self.peak.max(tp.process(x));
@@ -173,7 +176,7 @@ impl AudioNode for MasterNode {
         store(&r[0], self.loudness.momentary());
         store(&r[1], self.loudness.short_term());
         store(&r[2], self.loudness.integrated());
-        store(&r[3], 20.0 * self.peak.max(1e-6).log10());
+        store(&r[3], 20.0 * self.peak.log10());
         store(&r[4], correlation);
 
         outputs.iter_mut().skip(2).for_each(|o| o.fill(0.0));

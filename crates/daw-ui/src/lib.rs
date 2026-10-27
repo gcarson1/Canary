@@ -28,6 +28,24 @@ pub struct EngineView {
     /// Master peak and RMS, linear, left and right.
     pub peak: [f32; 2],
     pub rms: [f32; 2],
+    /// Mix loudness, LUFS: momentary, short-term, integrated. -inf when silent.
+    pub loudness: [f32; 3],
+    /// Highest true peak since the meters were reset, dBTP.
+    pub true_peak: f32,
+    /// Stereo correlation, -1 to +1.
+    pub correlation: f32,
+    pub listen: Listen,
+    /// The reference plays instead of the mix.
+    pub reference_on: bool,
+}
+
+/// What the master outputs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Listen {
+    #[default]
+    Stereo,
+    Mid,
+    Side,
 }
 
 impl Default for EngineView {
@@ -39,6 +57,11 @@ impl Default for EngineView {
             sample_rate: 48_000,
             peak: [0.0; 2],
             rms: [0.0; 2],
+            loudness: [f32::NEG_INFINITY; 3],
+            true_peak: f32::NEG_INFINITY,
+            correlation: 0.0,
+            listen: Listen::Stereo,
+            reference_on: false,
         }
     }
 }
@@ -75,6 +98,11 @@ pub enum Request {
         path: PathBuf,
         drop: SampleDrop,
     },
+    Listen(Listen),
+    /// Switch between the mix and the reference (A/B).
+    ToggleReference,
+    /// Clear integrated loudness and the true-peak hold.
+    ResetMeters,
     /// Add a slice point at `at` (a fraction of the sample), or remove the nearest.
     SliceMarker {
         track: usize,
@@ -223,14 +251,6 @@ fn header(p: &egui::Painter, m: &Metrics, t: &Theme, zone: Rect, text: &str) -> 
     y
 }
 
-fn db(linear: f32) -> String {
-    if linear <= 0.0 {
-        "-INF".into()
-    } else {
-        format!("{:+.1}", 20.0 * linear.log10()).replace('+', " ")
-    }
-}
-
 impl Workspace {
     /// Draws one frame into `ui` and applies the edits it makes. Returns what the
     /// app must do. Call [`theme::install_fonts`] once on the context first.
@@ -287,7 +307,7 @@ impl Workspace {
             self.device_drag = None;
         }
         self.manifest(ui, &p, &m, z.manifest, inputs.history, inputs.engine);
-        self.dock(ui, &p, &m, z.dock, inputs.engine);
+        self.dock(ui, &p, &m, z.dock, &inputs, &mut out);
         if let Some(path) = &self.file_drag {
             // The file follows the pointer; the rack takes the drop.
             if let Some(at) = ui.input(|i| i.pointer.hover_pos()) {
@@ -860,8 +880,10 @@ impl Workspace {
         p: &egui::Painter,
         m: &Metrics,
         r: Rect,
-        engine: &EngineView,
+        inputs: &Inputs<'_>,
+        out: &mut Vec<Request>,
     ) {
+        let engine = inputs.engine;
         let (t, u) = (self.theme, m.u);
         let y = header(p, m, &t, r, "04 // CONSOLE=80 MASTER_BUS");
         let body = Rect::from_x_y_ranges(
@@ -873,11 +895,92 @@ impl Workspace {
                 self.clip_latch[side] = true;
             }
         }
-        // Giant stacked readouts on the left.
-        let loudest = engine.peak[0].max(engine.peak[1]);
-        let rms = engine.rms[0].max(engine.rms[1]);
+        // Monitor strip along the bottom: what you hear, and the A/B reference.
+        let strip_y = body.max.y - 1.5 * u;
+        let mut x = body.min.x;
+        let seg = |x: f32, label: &str, active: bool, id: &str| {
+            let g = p.layout_no_wrap(label.into(), m.mono(0.625), t.text);
+            let rect = m.snap_rect(Rect::from_min_size(
+                Pos2::new(x, strip_y),
+                Vec2::new(g.size().x + 0.75 * u, 1.5 * u),
+            ));
+            let resp = ui.interact(rect, ui.scope_id().with(id), Sense::click());
+            if active {
+                p.rect_filled(rect, 0.0, t.accent_amber);
+            } else {
+                let line = if resp.hovered() { t.text } else { t.line_2 };
+                p.rect_stroke(rect, 0.0, m.hair(line), StrokeKind::Inside);
+            }
+            let color = if active { t.ink_text } else { t.muted };
+            p.text(
+                rect.center(),
+                Align2::CENTER_CENTER,
+                label,
+                m.mono(0.625),
+                color,
+            );
+            (rect.max.x, resp)
+        };
+        for (listen, label) in [
+            (Listen::Stereo, "ST"),
+            (Listen::Mid, "MID"),
+            (Listen::Side, "SIDE"),
+        ] {
+            let (end, resp) = seg(x, label, engine.listen == listen, label);
+            if resp.clicked() {
+                out.push(Request::Listen(listen));
+            }
+            x = end + 0.25 * u;
+        }
+        let reference = inputs.history.project().reference.as_deref();
+        let (end, resp) = seg(x + 0.5 * u, "A/B REF", engine.reference_on, "ab-ref");
+        if resp.clicked() && reference.is_some() {
+            out.push(Request::ToggleReference);
+        }
+        if resp.secondary_clicked() && reference.is_some() {
+            self.edit(Action::SetReference(None));
+        }
+        let name = reference.map_or_else(|| "DROP REFERENCE FROM 01".into(), file_name);
+        let meters_left = body.max.x - 2.0 * 1.375 * u - 2.0 * u;
+        p.with_clip_rect(Rect::from_x_y_ranges(end..=meters_left, r.y_range()))
+            .text(
+                Pos2::new(end + 0.5 * u, strip_y + 0.75 * u),
+                Align2::LEFT_CENTER,
+                name.to_uppercase(),
+                m.mono(0.5625),
+                t.faint,
+            );
+        // A file dropped on the dock becomes the reference.
+        let hovered = ui
+            .input(|i| i.pointer.hover_pos())
+            .is_some_and(|at| r.contains(at));
+        if let Some(path) = self.file_drag.clone().filter(|_| hovered) {
+            p.rect_stroke(
+                r.shrink(1.0),
+                0.0,
+                egui::Stroke::new(0.125 * u, t.accent_amber),
+                StrokeKind::Inside,
+            );
+            if ui.input(|i| i.pointer.any_released()) {
+                self.edit(Action::SetReference(Some(path)));
+            }
+        }
+
+        // Giant stacked readouts on the left: integrated loudness (click to
+        // reset), true-peak hold, then the short windows and correlation.
+        let lufs = |v: f32| {
+            if v.is_finite() {
+                format!("{v:.1}")
+            } else {
+                "-INF".into()
+            }
+        };
         let mut ty = body.min.y;
-        for (label, value) in [("PEAK_DBFS", loudest), ("RMS_DBFS", rms)] {
+        let size = ((strip_y - body.min.y) / u / 2.0 - 2.0).clamp(1.5, 4.25);
+        for (label, value, id) in [
+            ("LUFS_I // CLICK RESETS", lufs(engine.loudness[2]), "lufs-i"),
+            ("TRUE_PEAK_DBTP", lufs(engine.true_peak), "true-peak"),
+        ] {
             p.text(
                 Pos2::new(body.min.x, ty),
                 Align2::LEFT_TOP,
@@ -888,13 +991,37 @@ impl Workspace {
             let g = p.text(
                 Pos2::new(body.min.x - 0.15 * u, ty + 0.75 * u),
                 Align2::LEFT_TOP,
-                db(value),
+                value,
                 // fs_68 (4.25u) when the dock is tall enough for both readouts.
-                m.mono_bold((body.height() / u / 2.0 - 1.5).clamp(1.5, 4.25)),
-                t.text,
+                m.mono_bold(size),
+                // Red is for clipping only (Styles.md 1.3).
+                if id == "true-peak" && engine.true_peak > 0.0 {
+                    t.bad
+                } else {
+                    t.text
+                },
             );
+            let hit = Rect::from_min_max(Pos2::new(body.min.x, ty), g.max);
+            if ui
+                .interact(hit, ui.scope_id().with(id), Sense::click())
+                .clicked()
+            {
+                out.push(Request::ResetMeters);
+            }
             ty = g.max.y + 0.5 * u;
         }
+        p.text(
+            Pos2::new(body.min.x, ty),
+            Align2::LEFT_TOP,
+            format!(
+                "M {}  S {}  CORR {:+.2}",
+                lufs(engine.loudness[0]),
+                lufs(engine.loudness[1]),
+                engine.correlation
+            ),
+            m.mono(0.625),
+            t.muted,
+        );
 
         // Dual meters on the right with a dB scale.
         let w = 1.375 * u;

@@ -215,6 +215,11 @@ fn playing() -> EngineView {
         playing: true,
         peak: [0.71, 1.02], // right channel clipped
         rms: [0.25, 0.3],
+        loudness: [-12.4, -13.1, -14.0],
+        true_peak: 0.4, // over: the readout turns red
+        correlation: 0.62,
+        listen: daw_ui::Listen::Mid,
+        reference_on: true,
         ..EngineView::default()
     }
 }
@@ -565,4 +570,44 @@ fn sampler_takes_dropped_files_and_slice_clicks() {
             .any(|r| matches!(r, Request::AddFile { .. })),
         "a drag is not a click"
     );
+}
+
+#[test]
+fn dock_switches_listening_and_takes_a_reference_drop() {
+    // Dock: x 1100..1440, y 520..900; body inset 12pt, monitor strip at y 864..888.
+    let mut h = rig();
+    h.run();
+    click(&mut h, egui::Pos2::new(1140.0, 876.0)); // MID, after ST
+    assert!(
+        h.state()
+            .requests
+            .contains(&Request::Listen(daw_ui::Listen::Mid)),
+        "{:?}",
+        h.state().requests
+    );
+
+    let file = egui::Pos2::new(100.0, 104.0);
+    h.hover_at(file);
+    press(&mut h, file, true);
+    h.run();
+    let dock = egui::Pos2::new(1250.0, 700.0);
+    for step in 1..=10 {
+        h.hover_at(file + (dock - file) * step as f32 / 10.0);
+        h.run();
+    }
+    press(&mut h, dock, false);
+    h.run();
+    let reference = h.state().history.project().reference.clone();
+    assert!(
+        reference.is_some_and(|p| p.ends_with("808_Thermal_Sub.wav")),
+        "dropped file is the reference"
+    );
+    h.run();
+    std::fs::create_dir_all("../../target/qa").unwrap();
+    h.render()
+        .unwrap()
+        .save("../../target/qa/dock-reference.png")
+        .unwrap();
+    click(&mut h, egui::Pos2::new(1130.0, 600.0)); // the LUFS_I readout
+    assert!(h.state().requests.contains(&Request::ResetMeters));
 }

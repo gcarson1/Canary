@@ -32,6 +32,18 @@ pub struct Biquad {
 }
 
 impl Biquad {
+    /// A filter from normalized coefficients (`a0` = 1).
+    pub fn from_coefficients(b0: f32, b1: f32, b2: f32, a1: f32, a2: f32) -> Self {
+        Self {
+            b0,
+            b1,
+            b2,
+            a1,
+            a2,
+            ..Self::default()
+        }
+    }
+
     /// Sets the response, keeping the filter's state. `freq` is clamped below
     /// Nyquist and `q` to 0.1..=20, so any input gives a stable filter.
     pub fn set(&mut self, kind: FilterKind, freq: f32, q: f32, sample_rate: f32) {

@@ -2,10 +2,12 @@
 
 pub mod effects;
 mod filter;
+mod meter;
 pub mod slice;
 mod waveform;
 
 pub use filter::{db_to_gain, gain_to_db, Biquad, Envelope, FilterKind};
+pub use meter::{integrated_loudness, Loudness, TruePeak};
 pub use waveform::{MinMax, WaveformPyramid, LEVELS};
 
 /// One-pole smoother that glides a parameter toward its target to avoid zipper noise and clicks.

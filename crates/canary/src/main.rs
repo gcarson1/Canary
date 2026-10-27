@@ -14,16 +14,19 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{env, fs, thread};
 
 use daw_core::{Clip, Command, NodeId, SampleData, Telemetry, TrackParams};
+use daw_dsp::integrated_loudness;
 use daw_dsp::WaveformPyramid;
 use daw_engine::{EngineHandle, Recorder};
-use daw_graph::{ExecutionPlan, GainNode, Source, TrackNode};
+use daw_graph::{ExecutionPlan, MasterNode, Monitor, MonitorMode, Source, TrackNode};
 use daw_host::LayerKind;
 use daw_project::{Action, ClipRef, History, Track};
-use daw_ui::{theme, EngineView, Inputs, Request, SampleDrop, Status, Workspace};
+use daw_ui::{theme, EngineView, Inputs, Listen, Request, SampleDrop, Status, Workspace};
 use devices::Devices;
 
 /// Frames per plan buffer; larger device callbacks render in chunks.
 const MAX_BLOCK: usize = 4096;
+/// The reference track's node, just below the device ids; tracks stay under it.
+const REFERENCE_NODE: NodeId = NodeId(devices::FIRST_DEVICE_NODE - 1);
 const AUDIO_EXTENSIONS: [&str; 7] = ["wav", "flac", "mp3", "m4a", "aac", "aif", "aiff"];
 
 /// A finished background load.
@@ -65,6 +68,13 @@ struct App {
     /// Open only while a take records, so the microphone is not held between takes.
     recorder: Option<(Recorder, cpal::Stream)>,
     title: String,
+    /// The master node until the first plan takes it; it then stays in the
+    /// engine for good, so meters keep their history across edits.
+    master: Option<Box<MasterNode>>,
+    monitor: Arc<Monitor>,
+    /// The reference file the live plan plays, and its integrated loudness.
+    built_reference: Option<PathBuf>,
+    reference_lufs: Option<(PathBuf, f32)>,
 }
 
 fn home() -> PathBuf {
@@ -124,6 +134,7 @@ impl App {
             });
         }
         let (loads_tx, loads_rx) = mpsc::channel();
+        let (master, monitor) = MasterNode::new(config.sample_rate as f32);
         let mut app = Self {
             ws,
             history,
@@ -152,6 +163,10 @@ impl App {
             devices: Devices::scan(),
             recorder: None,
             title: String::new(),
+            master: Some(Box::new(master)),
+            monitor,
+            built_reference: None,
+            reference_lufs: None,
         };
         let sources: Vec<PathBuf> = app
             .history
@@ -243,6 +258,27 @@ impl App {
         tracks.get(track)?.devices.get(device).map(|d| d.uid)
     }
 
+    /// Loads the reference once and measures its loudness when it arrives.
+    fn prepare_reference(&mut self) {
+        let Some(path) = self.history.project().reference.clone() else {
+            self.monitor.set_reference(false);
+            return;
+        };
+        match self.audio.get(&path) {
+            None => {
+                if self.sample_requests.insert(path.clone()) {
+                    self.load(path, None);
+                }
+            }
+            Some(audio) if self.reference_lufs.as_ref().is_none_or(|(p, _)| *p != path) => {
+                let right = audio.channel(audio.num_channels().min(2) - 1);
+                let lufs = integrated_loudness(audio.channel(0), right, audio.sample_rate() as f32);
+                self.reference_lufs = Some((path, lufs));
+            }
+            Some(_) => {}
+        }
+    }
+
     /// Gives samplers the audio they wait for, loading each file once.
     fn feed_samplers(&mut self) {
         for path in self.devices.feed_samplers(&self.audio) {
@@ -297,6 +333,7 @@ impl App {
         let uids = |t: &Track| t.devices.iter().map(|d| d.uid).collect::<Vec<_>>();
         let same_shape = self.built.is_some()
             && !self.devices.changed()
+            && self.built_reference == self.history.project().reference
             && tracks.len() == self.built_clips.len()
             && tracks
                 .iter()
@@ -332,7 +369,7 @@ impl App {
             .project()
             .tracks
             .len()
-            .min(devices::FIRST_DEVICE_NODE as usize - 1);
+            .min(REFERENCE_NODE.0 as usize - 1);
         self.params.truncate(count);
         while self.params.len() < count {
             self.params
@@ -367,11 +404,25 @@ impl App {
             steps.push(self.devices.effects_after(&mut plan, track, track_step));
         }
         let master = NodeId(0);
-        plan.insert(master, Box::new(GainNode { gain: 1.0 }));
+        if let Some(node) = self.master.take() {
+            plan.insert(master, node);
+        }
         let sum = |channel| steps.iter().map(|&step| Source { step, channel }).collect();
-        plan.add(master, vec![sum(0), sum(1)], 2)
+        let mut inputs: Vec<Vec<Source>> = vec![sum(0), sum(1)];
+        self.live = (1..=count as u32).map(NodeId).collect();
+        // The reference plays in sync, into the master's spare inputs, never the mix.
+        let reference = self.history.project().reference.clone();
+        if let Some(audio) = reference.as_ref().and_then(|p| self.audio.get(p)) {
+            let params = Arc::new(TrackParams::new(Arc::default()));
+            let clip = Clip::new(0, audio.clone());
+            plan.insert(REFERENCE_NODE, Box::new(TrackNode::new(vec![clip], params)));
+            let step = plan.add(REFERENCE_NODE, vec![], 2).expect("no sources");
+            inputs.extend((0..2).map(|channel| vec![Source { step, channel }]));
+            self.live.push(REFERENCE_NODE);
+        }
+        self.built_reference = reference;
+        plan.add(master, inputs, 2)
             .expect("sources are earlier steps");
-        self.live = (0..=count as u32).map(NodeId).collect();
         self.built_clips = tracks.iter().map(|t| t.clips.clone()).collect();
         self.built_devices = tracks
             .iter()
@@ -409,6 +460,25 @@ impl App {
         }
         if got_levels {
             self.view.peak = peak;
+        }
+        let r = self.monitor.readings();
+        self.view.loudness = [r.momentary, r.short_term, r.integrated];
+        self.view.true_peak = r.true_peak;
+        self.view.correlation = r.correlation;
+        self.view.reference_on = self.monitor.reference();
+        self.view.listen = match self.monitor.mode() {
+            MonitorMode::Stereo => Listen::Stereo,
+            MonitorMode::Mid => Listen::Mid,
+            MonitorMode::Side => Listen::Side,
+        };
+        // Level-match the reference to the mix: integrated once there is one.
+        let mix = [r.integrated, r.short_term]
+            .into_iter()
+            .find(|v| v.is_finite());
+        let reference = self.reference_lufs.as_ref().map(|(_, l)| *l);
+        if let (Some(mix), Some(reference)) = (mix, reference.filter(|l| l.is_finite())) {
+            let db = (mix - reference).clamp(-24.0, 24.0);
+            self.monitor.set_reference_gain(10f32.powf(db / 20.0));
         }
         self.view.recording = self
             .recorder
@@ -466,6 +536,13 @@ impl App {
                     self.history.mark_dirty(); // so quitting saves the plugin's state
                 }
             }
+            Request::Listen(listen) => self.monitor.set_mode(match listen {
+                Listen::Stereo => MonitorMode::Stereo,
+                Listen::Mid => MonitorMode::Mid,
+                Listen::Side => MonitorMode::Side,
+            }),
+            Request::ToggleReference => self.monitor.set_reference(!self.monitor.reference()),
+            Request::ResetMeters => self.monitor.reset_meters(),
             Request::LoadSample {
                 track,
                 device,
@@ -586,6 +663,7 @@ impl eframe::App for App {
         }
 
         self.feed_samplers();
+        self.prepare_reference();
         self.devices.idle(self.queued.is_some());
         let views = self
             .ws

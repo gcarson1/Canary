@@ -18,6 +18,9 @@ pub struct Project {
     /// Rate that every sample position in the project counts in.
     pub sample_rate: u32,
     pub tracks: Vec<Track>,
+    /// A finished track to A/B the mix against, level-matched; never mixed in.
+    #[serde(default)]
+    pub reference: Option<PathBuf>,
 }
 
 impl Default for Project {
@@ -26,6 +29,7 @@ impl Default for Project {
             bpm: 120.0,
             sample_rate: 48_000,
             tracks: Vec::new(),
+            reference: None,
         }
     }
 }
@@ -152,6 +156,7 @@ pub struct ClipRef {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
     SetTempo(f64),
+    SetReference(Option<PathBuf>),
     InsertTrack {
         index: usize,
         track: Track,
@@ -255,6 +260,7 @@ impl Action {
                 }
                 SetTempo(std::mem::replace(&mut p.bpm, bpm))
             }
+            SetReference(path) => SetReference(std::mem::replace(&mut p.reference, path)),
             InsertTrack { index, track } => {
                 if index > p.tracks.len() {
                     return Err(ActionError::OutOfRange);
@@ -588,6 +594,7 @@ mod tests {
         };
         for action in [
             Action::SetTempo(140.0),
+            Action::SetReference(Some("/refs/master.wav".into())),
             Action::InsertTrack {
                 index: 0,
                 track: Track::new("Drums"),

@@ -39,6 +39,8 @@ pub struct EngineHandle {
     /// Nodes the audio thread will hold once every queued plan is applied.
     live: LiveNodes,
     playhead: Arc<AtomicU64>,
+    /// `ExecutionPlan::latency` of the last plan sent.
+    plan_latency: u32,
 }
 
 #[derive(Debug)]
@@ -64,12 +66,20 @@ impl EngineHandle {
     /// will have, then queues it to be swapped in at the start of a block.
     pub fn send_plan(&mut self, mut plan: Box<ExecutionPlan>) -> Result<(), SendPlanError> {
         plan.compensate();
+        let latency = plan.latency();
         let next = self.live.check(&plan).map_err(SendPlanError::Invalid)?;
         self.plans
             .push(plan)
             .map_err(|rtrb::PushError::Full(plan)| SendPlanError::QueueFull(plan))?;
         self.live = next;
+        self.plan_latency = latency;
         Ok(())
+    }
+
+    /// How far the output lags the transport under the last plan sent (PDC), in
+    /// samples.
+    pub fn plan_latency(&self) -> u32 {
+        self.plan_latency
     }
 
     pub fn live_nodes(&self) -> &LiveNodes {
@@ -121,6 +131,7 @@ pub fn engine(capacity: usize, sample_rate: f32) -> (EngineHandle, AudioEngine) 
             garbage: garbage_rx,
             live: LiveNodes::default(),
             playhead: playhead.clone(),
+            plan_latency: 0,
         },
         AudioEngine {
             commands: command_rx,

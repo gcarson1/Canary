@@ -475,7 +475,6 @@ pub struct Vst3Plugin {
     instance: Arc<Instance>,
     params: Vec<ParamInfo>,
     changes: Producer<(u32, f64)>,
-    latency: u32,
     /// Has an audio input port; without one it is an instrument.
     audio_input: bool,
 }
@@ -636,6 +635,7 @@ impl Vst3Plugin {
                             min: 0.0,
                             max: 1.0,
                             default: info.defaultNormalizedValue,
+                            log: false,
                         }
                     })
                 })
@@ -687,7 +687,6 @@ impl Vst3Plugin {
                     audio_input: inputs.is_some(),
                     params,
                     changes,
-                    latency,
                 },
                 node,
             ))
@@ -703,8 +702,10 @@ impl Vst3Plugin {
         &self.params
     }
 
+    /// Asked fresh each time: it can change with the plugin's settings or state.
     pub fn latency_samples(&self) -> u32 {
-        self.latency
+        // SAFETY: the component is active until the instance drops.
+        unsafe { self.instance.processor.getLatencySamples() }
     }
 
     /// The controller's normalized value for a parameter.

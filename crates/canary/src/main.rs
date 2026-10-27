@@ -268,7 +268,7 @@ impl App {
             return;
         }
         let revision = self.history.revision();
-        if self.built == Some(revision) {
+        if self.built == Some(revision) && !self.devices.changed() {
             return;
         }
         let rate = self.view.sample_rate as f32;
@@ -485,7 +485,12 @@ impl App {
             };
             self.recorder = None; // release the microphone between takes
             self.files = audio_files(&self.samples_dir);
-            self.load(take.path, Some((self.ws.selected_track, take.start_sample)));
+            // The mix plays `plan_latency` behind the transport (PDC), and the
+            // performer played to what they heard.
+            let start = take
+                .start_sample
+                .saturating_sub(u64::from(self.engine.plan_latency()));
+            self.load(take.path, Some((self.ws.selected_track, start)));
         } else {
             let stamp = SystemTime::now()
                 .duration_since(UNIX_EPOCH)

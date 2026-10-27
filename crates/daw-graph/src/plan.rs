@@ -840,6 +840,69 @@ mod tests {
         assert_eq!(&*second.output()[0], &[2.0, 2.0, 2.0, 0.0]);
     }
 
+    /// Old plan delays sources {1, 3, 4} into node 9; the new one {2, 3, 4}, with
+    /// node 4's delay a different length. Only node 3's edge carries its audio.
+    #[test]
+    fn adopt_delays_matches_only_same_edge_and_length() {
+        let mut arena = NodeArena::default();
+        let master = NodeId(9);
+        let build = |plan: &mut ExecutionPlan, first: u32, d_latency: u32| {
+            let steps: Vec<StepId> = [first, 3, 4, 5]
+                .iter()
+                .map(|&id| plan.add(NodeId(id), vec![], 1).unwrap())
+                .collect();
+            plan.set_latency(steps[2], d_latency);
+            plan.set_latency(steps[3], 4);
+            plan.add(master, vec![steps.iter().map(|&s| src(s)).collect()], 1)
+                .unwrap();
+        };
+        let mut old = ExecutionPlan::new(2);
+        for (id, v) in [(1, 1.0), (3, 2.0), (4, 3.0), (5, 0.0)] {
+            old.insert(NodeId(id), script(&[v]));
+        }
+        old.insert(master, gain());
+        build(&mut old, 1, 0);
+        old.compensate();
+        arena.apply(&mut old);
+        old.process(&mut arena, &ctx(2), &[]);
+
+        let mut new = ExecutionPlan::new(2);
+        new.insert(NodeId(2), script(&[]));
+        build(&mut new, 2, 1);
+        new.compensate();
+        new.adopt_delays(&mut old);
+
+        let delays = &new.steps[4].delays;
+        let line = |source: usize| {
+            let d = delays.iter().find(|d| d.source == source).unwrap();
+            (d.line.to_vec(), d.pos)
+        };
+        assert_eq!(line(0), (vec![0.0; 4], 0), "new edge starts silent");
+        assert_eq!(
+            line(1),
+            (vec![2.0, 2.0, 0.0, 0.0], 2),
+            "same edge carries over"
+        );
+        assert_eq!(line(2), (vec![0.0; 3], 0), "new length starts silent");
+    }
+
+    #[test]
+    fn chained_latencies_add_up() {
+        let mut plan = ExecutionPlan::new(4);
+        let source = plan.add(NodeId(0), vec![], 1).unwrap();
+        let p1 = plan.add(NodeId(1), vec![vec![src(source)]], 1).unwrap();
+        let p2 = plan.add(NodeId(2), vec![vec![src(p1)]], 1).unwrap();
+        plan.set_latency(p1, 2);
+        plan.set_latency(p2, 3);
+        plan.add(NodeId(3), vec![vec![src(source), src(p2)]], 1)
+            .unwrap();
+        plan.compensate();
+        assert_eq!(plan.latency(), 5);
+        let delays = &plan.steps[3].delays;
+        assert_eq!(delays.len(), 1);
+        assert_eq!((delays[0].source, delays[0].line.len()), (0, 5));
+    }
+
     #[test]
     fn huge_reported_latency_is_clamped() {
         struct Liar;

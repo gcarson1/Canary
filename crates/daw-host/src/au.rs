@@ -258,8 +258,18 @@ struct BufferList {
 pub struct AuPlugin {
     unit: Arc<Instance>,
     params: Vec<ParamInfo>,
-    latency: u32,
+    sample_rate: f32,
     kind: AuKind,
+}
+
+/// The unit's latency now, in samples: it can change with its settings or state.
+fn latency(unit: &Instance, sample_rate: f32) -> u32 {
+    let seconds: f64 = unit
+        .get(kAudioUnitProperty_Latency, kAudioUnitScope_Global, 0)
+        .unwrap_or(0.0);
+    (seconds * f64::from(sample_rate))
+        .round()
+        .clamp(0.0, f64::from(u32::MAX)) as u32
 }
 
 impl AuPlugin {
@@ -335,14 +345,11 @@ impl AuPlugin {
         // SAFETY: the unit is configured and not yet initialized.
         check(unsafe { AudioUnitInitialize(unit.0) })?;
 
-        let latency_s: f64 = unit
-            .get(kAudioUnitProperty_Latency, kAudioUnitScope_Global, 0)
-            .unwrap_or(0.0);
-        let latency = (latency_s * f64::from(sample_rate)).round().max(0.0) as u32;
+        let latency = latency(&unit, sample_rate);
         let plugin = AuPlugin {
             params: params(&unit),
             unit: unit.clone(),
-            latency,
+            sample_rate,
             kind,
         };
         let channel = || vec![0.0f32; max_block].into_boxed_slice();
@@ -367,7 +374,7 @@ impl AuPlugin {
     }
 
     pub fn latency_samples(&self) -> u32 {
-        self.latency
+        latency(&self.unit, self.sample_rate)
     }
 
     pub fn param_value(&self, id: u32) -> Option<f64> {

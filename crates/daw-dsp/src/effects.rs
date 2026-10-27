@@ -3,6 +3,11 @@
 //! `EffectNode`, so every effect gets them the same way.
 
 use crate::filter::{db_to_gain, gain_to_db, Biquad, Envelope, FilterKind};
+use crate::Smoother;
+
+/// Glide time for levels set by a knob (threshold, makeup, drive), so a turn
+/// never steps the output.
+const GLIDE_SECONDS: f32 = 0.02;
 
 /// One parameter: what the user turns. Values are in the units the name says.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -43,6 +48,7 @@ pub trait Effect: Send {
     fn set_param(&mut self, index: usize, value: f32);
     fn set_sample_rate(&mut self, sample_rate: f32);
     fn process(&mut self, left: &mut [f32], right: &mut [f32]);
+    /// Clears signal state and jumps every gliding knob to its value.
     fn reset(&mut self);
 }
 
@@ -67,17 +73,18 @@ pub fn effect(id: &str, sample_rate: f32) -> Option<Box<dyn Effect>> {
     for (i, p) in fx.params().iter().enumerate() {
         fx.set_param(i, p.default);
     }
+    fx.reset();
     Some(fx)
 }
 
 /// Feed-forward compressor with a 6 dB soft knee and stereo-linked peak detection.
 #[derive(Debug, Default)]
 pub struct Compressor {
-    threshold: f32,
+    threshold: Smoother,
     ratio: f32,
     attack: f32,
     release: f32,
-    makeup: f32,
+    makeup: Smoother,
     sample_rate: f32,
     env: Envelope,
 }
@@ -118,23 +125,26 @@ impl Effect for Compressor {
     }
     fn set_param(&mut self, index: usize, value: f32) {
         match index {
-            0 => self.threshold = value,
+            0 => self.threshold.set_target(value),
             1 => self.ratio = value.max(1.0),
             2 => self.attack = value,
             3 => self.release = value,
-            4 => self.makeup = value,
+            4 => self.makeup.set_target(value),
             _ => {}
         }
         self.update_times();
     }
     fn set_sample_rate(&mut self, sample_rate: f32) {
         self.sample_rate = sample_rate;
+        self.threshold.set_time(GLIDE_SECONDS, sample_rate);
+        self.makeup.set_time(GLIDE_SECONDS, sample_rate);
         self.update_times();
     }
     fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
         for (l, r) in left.iter_mut().zip(right.iter_mut()) {
             let level = self.env.process(l.abs().max(r.abs()));
-            let db = reduction(gain_to_db(level) - self.threshold, self.ratio) + self.makeup;
+            let over = gain_to_db(level) - self.threshold.tick();
+            let db = reduction(over, self.ratio) + self.makeup.tick();
             let g = db_to_gain(db);
             *l *= g;
             *r *= g;
@@ -142,15 +152,20 @@ impl Effect for Compressor {
     }
     fn reset(&mut self) {
         self.env.reset();
+        self.threshold.settle();
+        self.makeup.settle();
     }
 }
 
 /// Soft tanh saturation with first-order antiderivative anti-aliasing (ADAA),
 /// a bias for even harmonics, and a 10 Hz DC blocker.
+// shortcut: first-order ADAA is a half-sample average, so it also rolls off the
+// top octave (-2 dB at 10 kHz at 48 kHz) and comb-filters against dry at MIX
+// below 100%. Move to 2x oversampling (and report its latency) if that is heard.
 #[derive(Debug, Default)]
 pub struct Saturator {
-    drive: f32,
-    bias: f32,
+    /// Per channel: drive (linear) and bias, gliding to the knob.
+    glide: [(Smoother, Smoother); 2],
     /// Per channel: last driven input, DC blocker input and output.
     state: [(f64, f32, f32); 2],
     dc_coef: f32,
@@ -166,12 +181,12 @@ impl Saturator {
     const PARAMS: [ParamSpec; 2] = [spec("DRIVE", 0.0, 36.0, 12.0), spec("BIAS", 0.0, 0.5, 0.0)];
 
     fn channel(&mut self, ch: usize, samples: &mut [f32]) {
-        let drive = f64::from(db_to_gain(self.drive));
-        let bias = f64::from(self.bias);
-        let rest = bias.tanh();
+        let (drive, bias) = &mut self.glide[ch];
         let (mut x1, mut dc_in, mut dc_out) = self.state[ch];
         for s in samples {
-            let x = f64::from(*s) * drive + bias;
+            let bias = f64::from(bias.tick());
+            let rest = bias.tanh();
+            let x = f64::from(*s) * f64::from(drive.tick()) + bias;
             let d = x - x1;
             let y = if d.abs() < 1e-5 {
                 (0.5 * (x + x1)).tanh()
@@ -193,14 +208,20 @@ impl Effect for Saturator {
         &Self::PARAMS
     }
     fn set_param(&mut self, index: usize, value: f32) {
-        match index {
-            0 => self.drive = value,
-            1 => self.bias = value,
-            _ => {}
+        for (drive, bias) in &mut self.glide {
+            match index {
+                0 => drive.set_target(db_to_gain(value)),
+                1 => bias.set_target(value),
+                _ => {}
+            }
         }
     }
     fn set_sample_rate(&mut self, sample_rate: f32) {
         self.dc_coef = (-2.0 * std::f32::consts::PI * 10.0 / sample_rate).exp();
+        for (drive, bias) in &mut self.glide {
+            drive.set_time(GLIDE_SECONDS, sample_rate);
+            bias.set_time(GLIDE_SECONDS, sample_rate);
+        }
     }
     fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
         self.channel(0, left);
@@ -208,6 +229,10 @@ impl Effect for Saturator {
     }
     fn reset(&mut self) {
         self.state = Default::default();
+        for (drive, bias) in &mut self.glide {
+            drive.settle();
+            bias.settle();
+        }
     }
 }
 
@@ -231,8 +256,8 @@ struct DynamicBand {
     mode: BandMode,
     freq: f32,
     q: f32,
-    threshold: f32,
-    range: f32,
+    threshold: Smoother,
+    range: Smoother,
     sample_rate: f32,
     filters: [Biquad; 2],
     env: Envelope,
@@ -253,6 +278,8 @@ impl DynamicBand {
     fn set_sample_rate(&mut self, sample_rate: f32, attack: f32, release: f32) {
         self.sample_rate = sample_rate;
         self.env.set_times(attack, release, sample_rate);
+        self.threshold.set_time(GLIDE_SECONDS, sample_rate);
+        self.range.set_time(GLIDE_SECONDS, sample_rate);
         self.update();
     }
 
@@ -263,8 +290,8 @@ impl DynamicBand {
         for (l, r) in left.iter_mut().zip(right.iter_mut()) {
             let (bl, br) = (band(fl, *l), band(fr, *r));
             let level = self.env.process(bl.abs().max(br.abs()));
-            let over = (gain_to_db(level) - self.threshold).max(0.0);
-            let cut = 1.0 - db_to_gain(-(over * 0.75).min(self.range));
+            let over = (gain_to_db(level) - self.threshold.tick()).max(0.0);
+            let cut = 1.0 - db_to_gain(-(over * 0.75).min(self.range.tick()));
             *l -= cut * bl;
             *r -= cut * br;
         }
@@ -273,6 +300,8 @@ impl DynamicBand {
     fn reset(&mut self) {
         self.filters.iter_mut().for_each(Biquad::reset);
         self.env.reset();
+        self.threshold.settle();
+        self.range.settle();
     }
 }
 
@@ -302,8 +331,8 @@ impl Effect for DynamicEq {
         match index {
             0 => b.freq = value,
             1 => b.q = value,
-            2 => b.threshold = value,
-            3 => b.range = value,
+            2 => b.threshold.set_target(value),
+            3 => b.range.set_target(value),
             4 => {
                 b.mode = if value >= 0.5 {
                     BandMode::LowCut
@@ -359,8 +388,8 @@ impl Effect for DeEsser {
         let b = &mut self.band;
         match index {
             0 => b.freq = value,
-            1 => b.threshold = value,
-            2 => b.range = value,
+            1 => b.threshold.set_target(value),
+            2 => b.range.set_target(value),
             _ => {}
         }
         b.update();

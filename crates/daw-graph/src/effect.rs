@@ -20,12 +20,13 @@ const COMMON: [ParamSpec; 3] = [
         default: 100.0,
         log: false,
     },
-    // On (1): the wet signal is held at the dry signal's loudness.
+    // On (1): the wet signal is held at the dry signal's loudness, for honest A/B.
+    // Off by default: over its 1 s window it would undo a compressor's leveling.
     ParamSpec {
         name: "MATCH",
         min: 0.0,
         max: 1.0,
-        default: 1.0,
+        default: 0.0,
         log: false,
     },
     // On (1): output only what the effect changes (wet minus dry).
@@ -90,6 +91,10 @@ pub struct EffectNode {
     seen: Box<[f32]>,
     dry: [Box<[f32]>; 2],
     mix: f32,
+    /// 1 normally, 0 in delta; ramps like `mix`.
+    keep: f32,
+    /// False until the level match has its first estimate, which it jumps to.
+    matched: bool,
     dry_ms: f32,
     wet_ms: f32,
     average: f32,
@@ -114,6 +119,8 @@ impl EffectNode {
             params: params.clone(),
             dry: std::array::from_fn(|_| vec![0.0; max_block].into_boxed_slice()),
             mix: 1.0,
+            keep: 1.0,
+            matched: false,
             dry_ms: 0.0,
             wet_ms: 0.0,
             average: coef(MATCH_WINDOW),
@@ -136,12 +143,17 @@ impl AudioNode for EffectNode {
     ) {
         let n = context.num_samples;
         let own = self.seen.len();
+        let first = self.seen.first().is_some_and(|s| s.is_nan());
         for (i, seen) in self.seen.iter_mut().enumerate() {
             let v = self.params.get(i).unwrap_or(*seen);
             if v != *seen {
                 self.effect.set_param(i, v);
                 *seen = v;
             }
+        }
+        if first {
+            // Start at the loaded values instead of gliding from the defaults.
+            self.effect.reset();
         }
         let common = |i: usize| self.params.get(own + i).unwrap_or(COMMON[i].default);
         let mix = common(0) / 100.0;
@@ -161,8 +173,11 @@ impl AudioNode for EffectNode {
         {
             match inputs.get(ch).or(inputs.first()) {
                 Some(input) => {
-                    out.copy_from_slice(input);
-                    dry[..n].copy_from_slice(input);
+                    // A NaN from upstream would stick in filter state for good.
+                    for ((o, d), &x) in out.iter_mut().zip(&mut dry[..n]).zip(*input) {
+                        *o = if x.is_finite() { x } else { 0.0 };
+                        *d = *o;
+                    }
                 }
                 None => {
                     out.fill(0.0);
@@ -172,7 +187,8 @@ impl AudioNode for EffectNode {
         }
         self.effect.process(left, right);
 
-        let start = self.mix;
+        let (start, keep_from) = (self.mix, self.keep);
+        let keep_to = if delta { 0.0 } else { 1.0 };
         let [dry_l, dry_r] = &self.dry;
         for i in 0..n {
             let (wl, wr) = (left[i], right[i]);
@@ -182,20 +198,28 @@ impl AudioNode for EffectNode {
             let target = if !matching {
                 1.0
             } else if self.dry_ms > MATCH_FLOOR && self.wet_ms > MATCH_FLOOR {
-                (self.dry_ms / self.wet_ms)
+                let target = (self.dry_ms / self.wet_ms)
                     .sqrt()
-                    .clamp(1.0 / MATCH_LIMIT, MATCH_LIMIT)
+                    .clamp(1.0 / MATCH_LIMIT, MATCH_LIMIT);
+                // No glide up from unity on the first estimate: that is a blast.
+                if !self.matched {
+                    self.gain = target;
+                    self.matched = true;
+                }
+                target
             } else {
                 self.gain
             };
             self.gain += (target - self.gain) * self.glide;
-            // Mix ramps across the block so a turned knob never clicks.
-            let m = start + (mix - start) * (i + 1) as f32 / n as f32;
-            let keep = if delta { 0.0 } else { 1.0 };
+            // Mix and delta ramp across the block so a turned knob never clicks.
+            let ramp = (i + 1) as f32 / n as f32;
+            let m = start + (mix - start) * ramp;
+            let keep = keep_from + (keep_to - keep_from) * ramp;
             left[i] = keep * dl + m * (wl * self.gain - dl);
             right[i] = keep * dr + m * (wr * self.gain - dr);
         }
         self.mix = mix;
+        self.keep = keep_to;
     }
 
     fn reset(&mut self) {
@@ -203,6 +227,7 @@ impl AudioNode for EffectNode {
         self.dry_ms = 0.0;
         self.wet_ms = 0.0;
         self.gain = 1.0;
+        self.matched = false;
     }
 }
 
@@ -258,15 +283,22 @@ mod tests {
     fn level_match_holds_the_dry_loudness() {
         let (mut node, params) = saturator();
         params.set(0, 30.0); // heavy drive: far louder than dry
-        let (out, input) = run(&mut node, 4.0);
-        let diff = gain_to_db(out) - gain_to_db(input);
-        assert!(diff.abs() < 0.5, "matched within 0.5 dB, off by {diff}");
-
         let match_id = params
             .specs()
             .iter()
             .position(|p| p.name == "MATCH")
             .unwrap();
+        assert_eq!(params.get(match_id), Some(0.0), "off by default");
+        params.set(match_id, 1.0);
+        let (out, input) = run(&mut node, 0.05);
+        let diff = gain_to_db(out) - gain_to_db(input);
+        // The first estimate comes from the quiet start of the sine, so it can
+        // undershoot; it must never overshoot into a blast.
+        assert!(diff < 1.0, "no blast before the match settles: {diff} dB");
+        let (out, input) = run(&mut node, 4.0);
+        let diff = gain_to_db(out) - gain_to_db(input);
+        assert!(diff.abs() < 0.5, "matched within 0.5 dB, off by {diff}");
+
         params.set(match_id, 0.0);
         let (out, input) = run(&mut node, 1.0);
         assert!(
@@ -288,6 +320,22 @@ mod tests {
         params.set(id("MIX"), 100.0);
         let (out, _) = run(&mut node, 0.5);
         assert!(out > 0.01, "delta of a wet mix is what the effect changed");
+    }
+
+    #[test]
+    fn a_nan_input_does_not_poison_later_blocks() {
+        let (mut node, _) = saturator();
+        let bad = [f32::NAN, f32::INFINITY, 0.5, 0.5];
+        let (mut l, mut r) = ([0.0; 4], [0.0; 4]);
+        node.process(
+            &[&bad],
+            &mut [&mut l, &mut r],
+            &[],
+            &mut Vec::new(),
+            &ctx(4),
+        );
+        let (out, _) = run(&mut node, 0.1);
+        assert!(out.is_finite() && out > 0.0, "got {out}");
     }
 
     #[test]

@@ -105,6 +105,52 @@ mod tests {
     }
 
     #[test]
+    fn every_builtin_processes_without_allocating() {
+        use daw_core::{MidiEvent, ProcessContext};
+        let ctx = ProcessContext {
+            sample_rate: 48_000.0,
+            num_samples: 48,
+            playhead: 0,
+            playing: true,
+        };
+        let input = [0.5f32; 64];
+        let note = [MidiEvent {
+            sample_offset: 3,
+            data: [0x90, 60, 100],
+        }];
+        for info in builtins() {
+            let (mut handle, mut node) = instantiate(&info.id, 48_000.0, 64).unwrap();
+            for p in handle.params().to_vec() {
+                handle.set_param(p.id, (p.min + p.max) / 2.0);
+            }
+            if let Some(s) = handle.sampler() {
+                // Something to play, so voices run too.
+                let audio = daw_core::SampleData::new(48_000, vec![vec![0.3; 4_800]]).unwrap();
+                s.add_layer("x.wav".into(), crate::LayerKind::Replace);
+                s.set_audio(std::path::Path::new("x.wav"), &Arc::new(audio));
+            }
+            let (mut l, mut r) = ([0.0f32; 48], [0.0f32; 48]);
+            let mut midi_out = Vec::with_capacity(16);
+            for _ in 0..8 {
+                assert_no_alloc::assert_no_alloc(|| {
+                    node.process(
+                        &[&input[..48], &input[..48]],
+                        &mut [&mut l, &mut r],
+                        &note,
+                        &mut midi_out,
+                        &ctx,
+                    );
+                });
+                handle.idle(); // the sampler's zone lists go back and forth
+            }
+            assert!(l.iter().chain(&r).all(|x| x.is_finite()), "{}", info.id);
+            if info.id == crate::sampler::ID {
+                assert!(l.iter().any(|&x| x != 0.0), "the sampler played");
+            }
+        }
+    }
+
+    #[test]
     fn load_state_skips_junk_and_rejects_non_text() {
         let (mut fx, _) = instantiate("canary.compressor", 48_000.0, 64).unwrap();
         fx.load_state(b"THRESH=-30\nNOPE=1\nRATIO=abc\nno equals")

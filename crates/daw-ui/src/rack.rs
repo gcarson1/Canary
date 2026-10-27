@@ -21,7 +21,7 @@ const DIALS: usize = 8;
 pub struct PluginChoice {
     pub name: String,
     pub vendor: String,
-    /// Short format tag: `AU`, `CLAP` or `VST3`.
+    /// Short format tag: `AU`, `CLAP`, `VST3`, or `CANARY` for built-ins.
     pub format: &'static str,
 }
 
@@ -128,7 +128,12 @@ pub(crate) fn show(
     // Drag a module by its title to move it: the slot under the pointer.
     let slot = |x: f32| starts.iter().rposition(|&s| s <= x).unwrap_or(0);
     let pointer = ui.input(|i| i.pointer.interact_pos());
-    let target = ws.device_drag.zip(pointer).map(|(_, at)| slot(at.x));
+    // Only over the rack: a drop anywhere else cancels the move.
+    let target = ws
+        .device_drag
+        .zip(pointer)
+        .filter(|(_, at)| body.contains(*at))
+        .map(|(_, at)| slot(at.x));
     let mut x = body.min.x;
     for (di, device) in inputs.devices.iter().enumerate() {
         let module = Rect::from_x_y_ranges(x..=m.snap(x + width(device)), body.y_range());
@@ -190,7 +195,7 @@ pub(crate) fn show(
         }
         if grab.drag_stopped() && ws.device_drag == Some(di) {
             ws.device_drag = None;
-            if let Some(to) = pointer.map(|at| slot(at.x)).filter(|&to| to != di) {
+            if let Some(to) = target.filter(|&to| to != di) {
                 ws.edit(Action::MoveDevice {
                     track,
                     from: di,

@@ -16,6 +16,12 @@ pub struct Smoother {
     coef: f32,
 }
 
+impl Default for Smoother {
+    fn default() -> Self {
+        Self::new(0.0)
+    }
+}
+
 impl Smoother {
     /// Starts settled at `value`. Call `set_time` before use; until then it jumps instantly.
     pub fn new(value: f32) -> Self {
@@ -38,6 +44,11 @@ impl Smoother {
 
     pub fn set_target(&mut self, target: f32) {
         self.target = target;
+    }
+
+    /// Jumps to the target.
+    pub fn settle(&mut self) {
+        self.current = self.target;
     }
 
     pub fn current(&self) -> f32 {

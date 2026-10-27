@@ -282,6 +282,10 @@ impl Workspace {
         self.tool_strip(ui, &p, &m, z.tools);
         timeline::show(self, ui, &p, &m, z.timeline, &inputs, &mut out);
         rack::show(self, ui, &p, &m, z.rack, &inputs, &mut out);
+        // A module removed mid-drag never sees its drag stop.
+        if !ui.input(|i| i.pointer.any_down()) {
+            self.device_drag = None;
+        }
         self.manifest(ui, &p, &m, z.manifest, inputs.history, inputs.engine);
         self.dock(ui, &p, &m, z.dock, inputs.engine);
         if let Some(path) = &self.file_drag {

@@ -108,6 +108,9 @@ pub struct MasterNode {
     /// 0 = mix, 1 = reference; glides so A/B never clicks.
     fade: f32,
     fade_step: f32,
+    /// The reference gain as heard, gliding to the matched value over ~20 ms.
+    gain: f32,
+    glide: f32,
 }
 
 impl MasterNode {
@@ -123,6 +126,8 @@ impl MasterNode {
             average: 1.0 - (-1.0 / (0.3 * sample_rate)).exp(),
             fade: 0.0,
             fade_step: 1.0 / (0.01 * sample_rate),
+            gain: 1.0,
+            glide: 1.0 - (-1.0 / (0.02 * sample_rate)).exp(),
         };
         (node, monitor)
     }
@@ -194,7 +199,7 @@ impl AudioNode for MasterNode {
         } else {
             0.0
         };
-        let gain = load(&m.reference_gain);
+        let gain_target = load(&m.reference_gain);
         let mode = m.mode();
         let at = |x: &[f32], i: usize| x.get(i).copied().unwrap_or(0.0);
         for i in 0..n {
@@ -203,6 +208,8 @@ impl AudioNode for MasterNode {
             } else {
                 (self.fade - self.fade_step).max(target)
             };
+            self.gain += (gain_target - self.gain) * self.glide;
+            let gain = self.gain;
             let mix = |a: f32, b: f32| a * (1.0 - self.fade) + b * gain * self.fade;
             let l = mix(at(mix_l, i), at(ref_l, i));
             let r = mix(at(mix_r, i), at(ref_r, i));
@@ -258,18 +265,19 @@ mod tests {
     #[test]
     fn reference_fades_in_at_its_gain_and_only_when_present() {
         let (mut node, monitor) = MasterNode::new(48_000.0);
-        let (mix, reference) = ([0.2f32; 960], [0.8f32; 960]);
+        let n = 4_800; // 100 ms: the 20 ms gain glide has settled by the end
+        let (mix, reference) = (vec![0.2f32; n], vec![0.8f32; n]);
         monitor.set_reference(true);
         monitor.set_reference_gain(0.25);
         // No reference inputs: the mix plays.
-        assert_eq!(run(&mut node, &[&mix, &mix], 960).0[959], 0.2);
-        let (l, _) = run(&mut node, &[&mix, &mix, &reference, &reference], 960);
+        assert_eq!(run(&mut node, &[&mix, &mix], n).0[n - 1], 0.2);
+        let (l, _) = run(&mut node, &[&mix, &mix, &reference, &reference], n);
         assert!(l[0] > 0.19 && l[0] < 0.21, "fades, no jump: {}", l[0]);
-        assert!((l[959] - 0.2).abs() < 1e-6, "0.8 x 0.25 matches the mix");
+        assert!((l[n - 1] - 0.2).abs() < 1e-3, "0.8 x 0.25 matches the mix");
         monitor.set_reference_gain(f32::NAN);
         monitor.set_reference(false);
-        let (l, _) = run(&mut node, &[&mix, &mix, &reference, &reference], 960);
-        assert!((l[959] - 0.2).abs() < 1e-6);
+        let (l, _) = run(&mut node, &[&mix, &mix, &reference, &reference], n);
+        assert!((l[n - 1] - 0.2).abs() < 1e-6);
     }
 
     #[test]

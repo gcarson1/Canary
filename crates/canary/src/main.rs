@@ -16,8 +16,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{env, fs, thread};
 
 use daw_core::{Clip, Command, NodeId, SampleData, Telemetry, TrackParams};
-use daw_dsp::integrated_loudness;
 use daw_dsp::WaveformPyramid;
+use daw_dsp::{integrated_loudness, TruePeak};
 use daw_engine::{EngineHandle, Recorder};
 use daw_graph::{ExecutionPlan, MasterNode, Monitor, MonitorMode, Source, TrackNode};
 use daw_host::LayerKind;
@@ -76,7 +76,8 @@ struct App {
     monitor: Arc<Monitor>,
     /// The reference file the live plan plays, and its integrated loudness.
     built_reference: Option<PathBuf>,
-    reference_lufs: Option<(PathBuf, f32)>,
+    /// With its true peak in dBTP.
+    reference_lufs: Option<(PathBuf, f32, f32)>,
 }
 
 fn home() -> PathBuf {
@@ -272,15 +273,28 @@ impl App {
                     self.load(path.clone(), None);
                 }
             }
-            Some(audio) if self.reference_lufs.as_ref().is_none_or(|(p, _)| *p != path) => {
+            Some(audio)
+                if self
+                    .reference_lufs
+                    .as_ref()
+                    .is_none_or(|(p, ..)| *p != path) =>
+            {
                 let right = audio.channel(audio.num_channels().min(2) - 1);
                 let lufs = integrated_loudness(audio.channel(0), right, audio.sample_rate() as f32);
-                self.reference_lufs = Some((path.clone(), lufs));
+                let peak = [audio.channel(0), right]
+                    .iter()
+                    .map(|ch| TruePeak::default().process(ch))
+                    .fold(0.0f32, f32::max);
+                self.reference_lufs = Some((path.clone(), lufs, 20.0 * peak.log10()));
             }
             Some(_) => {}
         }
         // B only once its loudness is known, so it never plays unmatched.
-        if self.reference_lufs.as_ref().is_none_or(|(p, _)| *p != path) {
+        if self
+            .reference_lufs
+            .as_ref()
+            .is_none_or(|(p, ..)| *p != path)
+        {
             self.monitor.set_reference(false);
         }
     }
@@ -483,9 +497,10 @@ impl App {
         let mix = [r.integrated, r.short_term]
             .into_iter()
             .find(|v| v.is_finite());
-        let reference = self.reference_lufs.as_ref().map(|(_, l)| *l);
-        if let (Some(mix), Some(reference)) = (mix, reference.filter(|l| l.is_finite())) {
-            let db = (mix - reference).clamp(-24.0, 24.0);
+        let reference = self.reference_lufs.as_ref().map(|(_, l, p)| (*l, *p));
+        if let (Some(mix), Some((reference, peak))) = (mix, reference.filter(|r| r.0.is_finite())) {
+            // Never boost the reference past 0 dBTP: nothing after the master limits.
+            let db = (mix - reference).clamp(-24.0, (-peak).clamp(0.0, 24.0));
             self.monitor.set_reference_gain(10f32.powf(db / 20.0));
         }
         self.view.recording = self

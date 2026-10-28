@@ -149,7 +149,14 @@ impl Loudness {
         let center = |bin: usize| BIN_FLOOR + (bin as f32 + 0.5) * BIN_LU;
         let mean = |from: usize| {
             let (mut sum, mut n) = (0.0, 0u64);
-            for (bin, &count) in self.hist.iter().enumerate().skip(from) {
+            // Most bins are empty; skip them before the costly energy().
+            let used = self
+                .hist
+                .iter()
+                .enumerate()
+                .skip(from)
+                .filter(|(_, &c)| c > 0);
+            for (bin, &count) in used {
                 sum += energy(center(bin)) * f64::from(count);
                 n += u64::from(count);
             }

@@ -252,7 +252,7 @@ mod tests {
     use super::*;
     use assert_no_alloc::{assert_no_alloc, AllocDisabler};
     use daw_core::{Clip, NodeId, SampleData, TimeSignature, TrackParams};
-    use daw_graph::{AudioNode, GainNode, Source, SynthNode, TrackNode};
+    use daw_graph::{AudioNode, GainNode, MasterNode, Source, SynthNode, TrackNode};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -352,7 +352,11 @@ mod tests {
             track,
             Box::new(TrackNode::new(vec![clip], Arc::new(params))),
         );
-        plan.insert(master, Box::new(GainNode { gain: 1.0 }));
+        // The app's master, with a meter reset pending so the no-alloc tests cover
+        // metering and its reset path too.
+        let (node, monitor) = MasterNode::new(48_000.0);
+        monitor.reset_meters();
+        plan.insert(master, Box::new(node));
         let track_step = plan.add(track, vec![], 2).unwrap();
         let inputs = (0..2)
             .map(|channel| {

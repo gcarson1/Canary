@@ -286,6 +286,61 @@ pub struct AuPlugin {
     kind: AuKind,
     /// The editor's `NSView` while it is shown.
     editor: Option<Retained<AnyObject>>,
+    /// The ARA extension, when created bound to a document.
+    ara: Option<NonNull<c_void>>,
+}
+
+const ARA_MAGIC: u32 = u32::from_be_bytes(*b"Ara!");
+const ARA_FACTORY_PROPERTY: u32 = u32::from_be_bytes(*b"AraF");
+const ARA_BINDING_PROPERTY: u32 = u32::from_be_bytes(*b"AraE");
+
+/// `ARAAudioUnitFactory`.
+#[repr(C)]
+struct AuAraFactory {
+    magic: u32,
+    factory: *const c_void,
+}
+
+/// `ARAAudioUnitPlugInExtensionBinding`.
+#[repr(C)]
+struct AuAraBinding {
+    magic: u32,
+    controller: *mut c_void,
+    extension: *const c_void,
+    known_roles: i32,
+    assigned_roles: i32,
+}
+
+/// Reads a property whose struct the caller pre-fills (ARA's magic number).
+fn get_in_out<T>(unit: &Instance, id: u32, mut value: T) -> Option<T> {
+    let mut size = size_of::<T>() as u32;
+    // SAFETY: `value` is readable and writable for `size` bytes.
+    let status = unsafe {
+        AudioUnitGetProperty(
+            unit.0,
+            id,
+            kAudioUnitScope_Global,
+            0,
+            NonNull::from(&mut value).cast(),
+            NonNull::from(&mut size),
+        )
+    };
+    (status == 0 && size as usize == size_of::<T>()).then_some(value)
+}
+
+/// Binds an uninitialized unit to an ARA document controller.
+fn bind_ara(unit: &Instance, controller: *mut c_void) -> Result<NonNull<c_void>, HostError> {
+    let binding = AuAraBinding {
+        magic: ARA_MAGIC,
+        controller,
+        extension: ptr::null(),
+        known_roles: crate::ara::KNOWN_ROLES,
+        assigned_roles: crate::ara::ROLES,
+    };
+    get_in_out(unit, ARA_BINDING_PROPERTY, binding)
+        .filter(|b| b.magic == ARA_MAGIC)
+        .and_then(|b| NonNull::new(b.extension.cast_mut()))
+        .ok_or(HostError::NoAra)
 }
 
 impl Drop for AuPlugin {
@@ -358,6 +413,17 @@ impl AuPlugin {
         sample_rate: f32,
         max_block: usize,
     ) -> Result<(AuPlugin, AuNode), HostError> {
+        Self::new_ara(id, sample_rate, max_block, None)
+    }
+
+    /// As `new`, bound to ARA document controller `ara` first if given, since ARA
+    /// requires binding before the unit is initialized.
+    pub fn new_ara(
+        id: &str,
+        sample_rate: f32,
+        max_block: usize,
+        ara: Option<*mut c_void>,
+    ) -> Result<(AuPlugin, AuNode), HostError> {
         let unknown = || HostError::UnknownPlugin(id.to_owned());
         let desc = description(id).ok_or_else(unknown)?;
         let kind = KINDS
@@ -420,6 +486,10 @@ impl AuPlugin {
             0,
             &max,
         )?;
+        let ara = match ara {
+            Some(controller) => Some(bind_ara(&unit, controller)?),
+            None => None,
+        };
         // SAFETY: the unit is configured and not yet initialized.
         check(unsafe { AudioUnitInitialize(unit.0) })?;
 
@@ -430,6 +500,7 @@ impl AuPlugin {
             sample_rate,
             kind,
             editor: None,
+            ara,
         };
         let channel = || vec![0.0f32; max_block].into_boxed_slice();
         let node = AuNode {
@@ -514,6 +585,22 @@ impl AuPlugin {
             }
             msg_send![&*factory, uiViewForAudioUnit: self.unit.0, withSize: size]
         }
+    }
+
+    /// The unit's ARA 2 factory, if it is an ARA plug-in.
+    pub fn ara_factory(&self) -> Option<crate::ara::AraFactory> {
+        let query = AuAraFactory {
+            magic: ARA_MAGIC,
+            factory: ptr::null(),
+        };
+        let found = get_in_out(&self.unit, ARA_FACTORY_PROPERTY, query)?;
+        // SAFETY: the unit's factory pointer, or null.
+        (found.magic == ARA_MAGIC)
+            .then(|| unsafe { crate::ara::AraFactory::from_raw(found.factory) })?
+    }
+
+    pub fn ara_extension(&self) -> Option<NonNull<c_void>> {
+        self.ara
     }
 
     pub fn kind(&self) -> AuKind {

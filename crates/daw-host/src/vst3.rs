@@ -9,7 +9,7 @@
 use std::cell::UnsafeCell;
 use std::ffi::c_void;
 use std::path::Path;
-use std::ptr;
+use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -479,6 +479,80 @@ pub struct Vst3Plugin {
     audio_input: bool,
     /// The editor while it is shown.
     view: Option<ComPtr<IPlugView>>,
+    /// The ARA extension, when created bound to a document.
+    ara: Option<NonNull<c_void>>,
+}
+
+/// A VST3 interface id from ARAVST3.h's four words (non-COM byte order, macOS).
+const fn ara_iid(w: [u32; 4]) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    let mut i = 0;
+    while i < 4 {
+        let b = w[i].to_be_bytes();
+        out[i * 4] = b[0];
+        out[i * 4 + 1] = b[1];
+        out[i * 4 + 2] = b[2];
+        out[i * 4 + 3] = b[3];
+        i += 1;
+    }
+    out
+}
+
+const ARA_ENTRY_POINT: [u8; 16] = ara_iid([0x12814E54, 0xA1CE4076, 0x82B96813, 0x16950BD6]);
+const ARA_ENTRY_POINT_2: [u8; 16] = ara_iid([0xCD9A5913, 0xC9EB46D7, 0x96CA53AD, 0xD1DB89F5]);
+
+/// FUnknown's three methods, then the interface's own, as the vtable lays them out.
+#[repr(C)]
+struct AraEntryVtbl {
+    query_interface:
+        unsafe extern "system" fn(*mut c_void, *const [u8; 16], *mut *mut c_void) -> i32,
+    add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
+    release: unsafe extern "system" fn(*mut c_void) -> u32,
+    /// `getFactory` (IPlugInEntryPoint) or `bindToDocumentControllerWithRoles`
+    /// (IPlugInEntryPoint2).
+    first: *const c_void,
+}
+
+/// Asks `object` (an FUnknown) for interface `iid`; the result is AddRef'd.
+unsafe fn query(object: *mut c_void, iid: &[u8; 16]) -> Option<NonNull<*const AraEntryVtbl>> {
+    let vtbl = unsafe { *object.cast::<*const AraEntryVtbl>() };
+    let mut out = ptr::null_mut();
+    // SAFETY: every VST3 object starts with an FUnknown vtable.
+    let status = unsafe { ((*vtbl).query_interface)(object, iid, &mut out) };
+    (status == kResultOk).then(|| NonNull::new(out.cast()))?
+}
+
+/// The component's ARA factory via `ARA::IPlugInEntryPoint`.
+unsafe fn ara_factory_of(component: *mut c_void) -> Option<crate::ara::AraFactory> {
+    let entry = unsafe { query(component, &ARA_ENTRY_POINT) }?;
+    // SAFETY: an IPlugInEntryPoint; `first` is `getFactory(this)`.
+    unsafe {
+        let vtbl = &**entry.as_ptr();
+        let get: unsafe extern "system" fn(*mut c_void) -> *const c_void =
+            std::mem::transmute(vtbl.first);
+        let factory = get(entry.as_ptr().cast());
+        (vtbl.release)(entry.as_ptr().cast());
+        crate::ara::AraFactory::from_raw(factory)
+    }
+}
+
+/// Binds the component via `ARA::IPlugInEntryPoint2` before processing starts.
+unsafe fn ara_bind(component: *mut c_void, controller: *mut c_void) -> Option<NonNull<c_void>> {
+    let entry = unsafe { query(component, &ARA_ENTRY_POINT_2) }?;
+    // SAFETY: an IPlugInEntryPoint2; `first` is bindToDocumentControllerWithRoles.
+    unsafe {
+        let vtbl = &**entry.as_ptr();
+        let bind: unsafe extern "system" fn(*mut c_void, *mut c_void, i32, i32) -> *const c_void =
+            std::mem::transmute(vtbl.first);
+        let ext = bind(
+            entry.as_ptr().cast(),
+            controller,
+            crate::ara::KNOWN_ROLES,
+            crate::ara::ROLES,
+        );
+        (vtbl.release)(entry.as_ptr().cast());
+        NonNull::new(ext.cast_mut())
+    }
 }
 
 impl Drop for Vst3Plugin {
@@ -544,6 +618,18 @@ impl Vst3Plugin {
         id: &str,
         sample_rate: f32,
         max_block: usize,
+    ) -> Result<(Vst3Plugin, Vst3Node), HostError> {
+        Self::new_ara(bundle, id, sample_rate, max_block, None)
+    }
+
+    /// As `new`, bound to ARA document controller `ara` first if given, since ARA
+    /// requires binding before processing is set up.
+    pub fn new_ara(
+        bundle: &Arc<Vst3Bundle>,
+        id: &str,
+        sample_rate: f32,
+        max_block: usize,
+        ara: Option<*mut c_void>,
     ) -> Result<(Vst3Plugin, Vst3Node), HostError> {
         let unknown = || HostError::UnknownPlugin(id.to_owned());
         let class = bundle
@@ -626,6 +712,13 @@ impl Vst3Plugin {
                 maxSamplesPerBlock: max_block.min(i32::MAX as usize) as int32,
                 sampleRate: f64::from(sample_rate),
             };
+            let ara = match ara {
+                Some(controller) => Some(
+                    ara_bind(instance.component.as_ptr().cast(), controller)
+                        .ok_or(HostError::NoAra)?,
+                ),
+                None => None,
+            };
             ok(instance.processor.setupProcessing(&mut setup))?;
             ok(instance.component.setActive(1))?;
             instance.active = true;
@@ -696,10 +789,21 @@ impl Vst3Plugin {
                     params,
                     changes,
                     view: None,
+                    ara,
                 },
                 node,
             ))
         }
+    }
+
+    /// The plug-in's ARA 2 factory, if it is an ARA plug-in.
+    pub fn ara_factory(&self) -> Option<crate::ara::AraFactory> {
+        // SAFETY: a live component.
+        unsafe { ara_factory_of(self.instance.component.as_ptr().cast()) }
+    }
+
+    pub fn ara_extension(&self) -> Option<NonNull<c_void>> {
+        self.ara
     }
 
     /// Attaches the controller's editor view to `parent`; returns its size.

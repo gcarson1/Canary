@@ -1,6 +1,7 @@
 //! Third-party plugin hosting. Plugins run in-process for now behind `AudioNode`, so
 //! moving them out of process later (ARCHITECTURE.md section 2) changes nothing above.
 
+pub mod ara;
 #[cfg(target_os = "macos")]
 mod au;
 mod builtin;

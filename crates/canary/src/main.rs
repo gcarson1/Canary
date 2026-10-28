@@ -404,9 +404,12 @@ impl App {
         let tracks = &self.history.project().tracks[..count];
         let mut steps = Vec::with_capacity(count);
         for (i, track) in tracks.iter().enumerate() {
+            // An ARA plug-in on the track renders its clips itself.
+            let ara = self.devices.ara_track(track);
             let clips = track
                 .clips
                 .iter()
+                .filter(|_| !ara)
                 .filter_map(|c| {
                     let audio = self.audio.get(&c.source)?.clone();
                     Clip::with_window(c.start, audio, c.offset, c.length, c.fade_in, c.fade_out)
@@ -451,6 +454,7 @@ impl App {
             .map(|t| t.devices.iter().map(|d| d.uid).collect())
             .collect();
         self.built = Some(self.history.revision());
+        self.devices.sync_ara(self.history.project(), &self.audio);
         self.send(Box::new(plan));
     }
 

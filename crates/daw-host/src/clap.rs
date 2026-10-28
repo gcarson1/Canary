@@ -1,6 +1,7 @@
 use std::ffi::{c_void, CStr, CString};
 use std::fmt;
 use std::path::Path;
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use clack_extensions::audio_ports::{AudioPortInfoBuffer, PluginAudioPorts};
@@ -40,6 +41,8 @@ pub enum HostError {
     Status(i32),
     /// The plugin has no editor this host can embed (an `NSView`).
     NoEditor,
+    /// The plugin has no usable ARA 2 factory, or its document controller failed.
+    NoAra,
 }
 
 impl fmt::Display for HostError {
@@ -62,6 +65,7 @@ impl fmt::Display for HostError {
             Self::State => write!(f, "plugin could not save or load its state"),
             Self::Status(s) => write!(f, "Audio Unit call failed (OSStatus {s})"),
             Self::NoEditor => write!(f, "the plugin has no editor to show"),
+            Self::NoAra => write!(f, "the plugin does not support ARA 2"),
         }
     }
 }
@@ -208,6 +212,26 @@ pub struct ClapPlugin {
     audio_input: bool,
     /// The editor is created and embedded.
     editor: bool,
+    /// The ARA extension, when created bound to a document.
+    ara: Option<NonNull<c_void>>,
+}
+
+/// `clap_ara_plugin_extension` (ARACLAP.h).
+#[repr(C)]
+struct ClapAraExtension {
+    get_factory: unsafe extern "C" fn(plugin: *const c_void) -> *const c_void,
+    bind_to_document_controller:
+        unsafe extern "C" fn(*const c_void, *mut c_void, i32, i32) -> *const c_void,
+}
+
+/// The plugin's ARA extension, if it has one.
+fn ara_extension(instance: &PluginInstance<CanaryHost>) -> Option<&ClapAraExtension> {
+    let raw = instance.raw_instance();
+    let get = raw.get_extension?;
+    // SAFETY: the CLAP plugin's own lookup with ARACLAP.h's id.
+    let ext = unsafe { get(raw, c"org.ara-audio.ara.pluginextension/2".as_ptr()) };
+    // SAFETY: a non-null result has the ARACLAP layout and lives with the plugin.
+    unsafe { ext.cast::<ClapAraExtension>().as_ref() }
 }
 
 const EMBEDDED_COCOA: GuiConfiguration = GuiConfiguration {
@@ -224,6 +248,18 @@ impl ClapPlugin {
         id: &str,
         sample_rate: f32,
         max_block: usize,
+    ) -> Result<(ClapPlugin, PluginNode), HostError> {
+        Self::new_ara(entry, id, sample_rate, max_block, None)
+    }
+
+    /// As `new`, bound to ARA document controller `ara` first if given, since ARA
+    /// requires binding before the plugin is activated.
+    pub fn new_ara(
+        entry: &PluginEntry,
+        id: &str,
+        sample_rate: f32,
+        max_block: usize,
+        ara: Option<*mut c_void>,
     ) -> Result<(ClapPlugin, PluginNode), HostError> {
         let factory = entry.get_plugin_factory().ok_or(HostError::NoFactory)?;
         let unknown = || HostError::UnknownPlugin(id.to_owned());
@@ -279,6 +315,22 @@ impl ClapPlugin {
             sample_rate: f64::from(sample_rate),
             min_frames_count: 1,
             max_frames_count: max_frames,
+        };
+        let ara = match ara {
+            Some(controller) => {
+                let ext = ara_extension(&instance).ok_or(HostError::NoAra)?;
+                // SAFETY: the plugin's own extension, before activation as ARA asks.
+                let bound = unsafe {
+                    (ext.bind_to_document_controller)(
+                        instance.raw_instance() as *const _ as *const c_void,
+                        controller,
+                        crate::ara::KNOWN_ROLES,
+                        crate::ara::ROLES,
+                    )
+                };
+                Some(NonNull::new(bound.cast_mut()).ok_or(HostError::NoAra)?)
+            }
+            None => None,
         };
         let processor = instance.activate(|_, _| (), config)?;
 
@@ -336,6 +388,7 @@ impl ClapPlugin {
                 param_changes,
                 latency,
                 editor: false,
+                ara,
             },
             node,
         ))
@@ -437,6 +490,18 @@ impl ClapPlugin {
                 gui.destroy(&handle);
             }
         }
+    }
+
+    /// The plug-in's ARA 2 factory, if it is an ARA plug-in.
+    pub fn ara_factory(&self) -> Option<crate::ara::AraFactory> {
+        let ext = ara_extension(&self.instance)?;
+        let plugin = self.instance.raw_instance() as *const _ as *const c_void;
+        // SAFETY: the plugin's own extension and pointer.
+        unsafe { crate::ara::AraFactory::from_raw((ext.get_factory)(plugin)) }
+    }
+
+    pub fn ara_extension(&self) -> Option<NonNull<c_void>> {
+        self.ara
     }
 
     /// A size the editor asked for since the last call, in points.

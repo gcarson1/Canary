@@ -66,7 +66,7 @@ The UI follows Styles.md whichever framework is chosen.
 
 ### Phase 5: Production Toolkit (later)
 - [x] PDC compiler: delay lines so tracks with plugin latency stay in sync. `ExecutionPlan::compensate` (run by `send_plan`) delays faster edges; delays keep their audio across plan swaps
-- [ ] ARA2 on timeline clips (needs the ARA SDK; no Rust bindings yet)
+- [x] ARA2 on timeline clips. ARA_API 2.3 vendored with checked-in bindgen bindings; `daw_host::ara::Document` plus AU/VST3/CLAP factory discovery and binding; an ARA plug-in on a track renders its clips as playback regions. Compile-tested and host callbacks unit-tested only: no ARA plug-in (Melodyne etc.) installed to run against. Still to do: save ARA document archives with the project, stable clip ids, content access (tempo map) for the plug-in
 - [x] Every built-in effect has dry/wet and automatic level matching; insert racks can be reordered by drag and drop. `daw_graph::EffectNode` adds MIX/MATCH/DELTA to every `daw_dsp::effects::Effect`; drag a module's title to move it
 - [x] Built-in dynamics and tone: dynamic EQ (incl. threshold-triggered low cut), de-esser, compressor, saturator. In the device picker as `CANARY`; saturator uses ADAA against aliasing
 - [x] Sampler: one-shot/classic/slice modes (transient, grid, manual), slice to pads, key and velocity zones, round robin. Built-in `Sampler` instrument: drop files from 01 (Shift round robin, Option velocity zone, Cmd key zone), click the waveform to add slice points, right-click to remove. Pads do not preview yet (no MIDI path from the UI)

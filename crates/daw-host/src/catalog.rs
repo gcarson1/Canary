@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
+use std::ptr::NonNull;
 use std::sync::Arc;
 
 use clack_host::prelude::PluginEntry;
@@ -53,6 +54,14 @@ pub trait Hosted {
     unsafe fn open_editor(&mut self, _parent: *mut c_void) -> Result<(f64, f64), HostError> {
         Err(HostError::NoEditor)
     }
+    /// The plug-in's ARA 2 factory, if it is an ARA plug-in.
+    fn ara_factory(&self) -> Option<crate::ara::AraFactory> {
+        None
+    }
+    /// The ARA extension, when made by `Catalog::instantiate_ara`.
+    fn ara_extension(&self) -> Option<NonNull<c_void>> {
+        None
+    }
     /// Takes the editor down; a no-op when none is open.
     fn close_editor(&mut self) {}
     /// A new size the open editor asked for, in points.
@@ -97,6 +106,12 @@ impl Hosted for ClapPlugin {
     fn close_editor(&mut self) {
         ClapPlugin::close_editor(self)
     }
+    fn ara_factory(&self) -> Option<crate::ara::AraFactory> {
+        ClapPlugin::ara_factory(self)
+    }
+    fn ara_extension(&self) -> Option<NonNull<c_void>> {
+        ClapPlugin::ara_extension(self)
+    }
     fn editor_resized(&mut self) -> Option<(f64, f64)> {
         ClapPlugin::editor_resized(self)
     }
@@ -131,6 +146,12 @@ impl Hosted for Vst3Plugin {
     fn close_editor(&mut self) {
         Vst3Plugin::close_editor(self)
     }
+    fn ara_factory(&self) -> Option<crate::ara::AraFactory> {
+        Vst3Plugin::ara_factory(self)
+    }
+    fn ara_extension(&self) -> Option<NonNull<c_void>> {
+        Vst3Plugin::ara_extension(self)
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -159,6 +180,12 @@ impl Hosted for crate::AuPlugin {
     }
     fn close_editor(&mut self) {
         crate::AuPlugin::close_editor(self)
+    }
+    fn ara_factory(&self) -> Option<crate::ara::AraFactory> {
+        crate::AuPlugin::ara_factory(self)
+    }
+    fn ara_extension(&self) -> Option<NonNull<c_void>> {
+        crate::AuPlugin::ara_extension(self)
     }
     fn has_audio_input(&self) -> bool {
         self.kind() != crate::AuKind::Instrument
@@ -291,11 +318,87 @@ impl Catalog {
             Format::Builtin => crate::builtin::instantiate(id, sample_rate, max_block),
         }
     }
+
+    /// As `instantiate`, bound to ARA document controller `controller` (see
+    /// `ara::Document::controller_ref`) before the plug-in is set up, as ARA requires.
+    /// The ARA side is then `Hosted::ara_extension`.
+    pub fn instantiate_ara(
+        &mut self,
+        format: Format,
+        bundle: Option<&Path>,
+        id: &str,
+        sample_rate: f32,
+        max_block: usize,
+        controller: *mut c_void,
+    ) -> Result<Instance, HostError> {
+        let missing = || HostError::UnknownPlugin(id.to_owned());
+        match format {
+            Format::Clap => {
+                let path = bundle.ok_or_else(missing)?;
+                if !self.clap.contains_key(path) {
+                    // SAFETY: the user chose this plugin.
+                    let entry = unsafe { crate::load_bundle(path) }?;
+                    self.clap.insert(path.to_path_buf(), entry);
+                }
+                let (p, n) = ClapPlugin::new_ara(
+                    &self.clap[path],
+                    id,
+                    sample_rate,
+                    max_block,
+                    Some(controller),
+                )?;
+                Ok((Box::new(p), Box::new(n)))
+            }
+            Format::Vst3 => {
+                let path = bundle.ok_or_else(missing)?;
+                if !self.vst3.contains_key(path) {
+                    #[cfg(target_os = "macos")]
+                    // SAFETY: the user chose this plugin.
+                    self.vst3
+                        .insert(path.to_path_buf(), unsafe { Vst3Bundle::load(path) }?);
+                }
+                let bundle = self.vst3.get(path).ok_or_else(missing)?;
+                let (p, n) =
+                    Vst3Plugin::new_ara(bundle, id, sample_rate, max_block, Some(controller))?;
+                Ok((Box::new(p), Box::new(n)))
+            }
+            #[cfg(target_os = "macos")]
+            Format::AudioUnit => {
+                let (p, n) =
+                    crate::AuPlugin::new_ara(id, sample_rate, max_block, Some(controller))?;
+                Ok((Box::new(p), Box::new(n)))
+            }
+            #[cfg(not(target_os = "macos"))]
+            Format::AudioUnit => Err(missing()),
+            Format::Builtin => Err(HostError::NoAra),
+        }
+    }
 }
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn apple_units_report_no_ara_factory_and_ara_instancing_refuses() {
+        // Apple's units are not ARA plug-ins: the query must answer, not crash.
+        let mut c = Catalog::scan();
+        let (hosted, _node) = c
+            .instantiate(Format::AudioUnit, None, "aufx:dely:appl", 48_000.0, 256)
+            .unwrap();
+        assert!(hosted.ara_factory().is_none());
+        assert!(hosted.ara_extension().is_none());
+        let bound = c.instantiate_ara(
+            Format::AudioUnit,
+            None,
+            "aufx:dely:appl",
+            48_000.0,
+            256,
+            std::ptr::null_mut(),
+        );
+        assert!(matches!(bound, Err(HostError::NoAra)));
+    }
 
     #[test]
     fn scan_finds_apple_units_and_instantiates_through_one_interface() {

@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use daw_core::{NodeId, SampleData};
 use daw_graph::{AudioNode, ExecutionPlan, Source, StepId, MAX_NODES};
+use daw_host::ara::{self, AraClip};
 use daw_host::{Catalog, Format, Hosted, Sampler};
 use daw_project::{Device, PluginFormat, Project, Track};
 use daw_ui::{DeviceView, ParamView, PluginChoice, SamplerView};
@@ -26,9 +27,14 @@ struct Live {
     instrument: bool,
     /// The latency the last plan compensated for; a change needs a new plan.
     latency: u32,
+    /// An ARA plug-in: index into `Devices::ara`, and the track it renders once bound.
+    ara: Option<(usize, Option<usize>)>,
 }
 
 pub struct Devices {
+    /// One ARA document per plug-in factory. First field, so documents go before
+    /// the catalog unloads the plug-in libraries.
+    ara: Vec<ara::Document>,
     catalog: Catalog,
     pub choices: Vec<PluginChoice>,
     live: HashMap<u64, Live>,
@@ -82,6 +88,7 @@ impl Devices {
             })
             .collect();
         Self {
+            ara: Vec::new(),
             catalog,
             choices,
             live: HashMap::new(),
@@ -135,7 +142,32 @@ impl Devices {
             sample_rate,
             max_block,
         );
-        let (mut hosted, node) = match made {
+        let made = made.and_then(|(hosted, node)| match hosted.ara_factory() {
+            None => Ok(((hosted, node), None)),
+            // ARA binds before setup, so make it again bound to the factory's document.
+            Some(factory) => {
+                drop((hosted, node));
+                let doc = match self.ara.iter().position(|doc| doc.factory() == factory) {
+                    Some(i) => i,
+                    None => {
+                        let doc = ara::Document::new(factory, "Canary", f64::from(sample_rate))?;
+                        self.ara.push(doc);
+                        self.ara.len() - 1
+                    }
+                };
+                let controller = self.ara[doc].controller_ref();
+                let made = self.catalog.instantiate_ara(
+                    to_host(d.format),
+                    d.bundle.as_deref(),
+                    &d.id,
+                    sample_rate,
+                    max_block,
+                    controller,
+                )?;
+                Ok((made, Some((doc, None))))
+            }
+        });
+        let ((mut hosted, node), ara) = match made {
             Ok(made) => made,
             Err(e) => {
                 self.free.push(raw);
@@ -159,6 +191,7 @@ impl Devices {
                 node: Some(node),
                 instrument,
                 latency: 0,
+                ara,
             },
         );
         Ok(())
@@ -176,6 +209,7 @@ impl Devices {
             .collect();
         for uid in gone {
             self.close_editor(uid);
+            self.unbind_ara(uid);
             let mut live = self.live.remove(&uid).expect("listed above");
             if let Ok(state) = live.hosted.save_state() {
                 self.removed_state.insert(uid, state);
@@ -259,6 +293,70 @@ impl Devices {
     /// False if the device is not live or is not an instrument.
     pub fn is_instrument(&self, uid: u64) -> bool {
         self.live.get(&uid).is_some_and(|l| l.instrument)
+    }
+
+    fn unbind_ara(&mut self, uid: u64) {
+        let Some(l) = self.live.get_mut(&uid) else {
+            return;
+        };
+        if let (Some((doc, Some(_))), Some(ext)) = (l.ara, l.hosted.ara_extension()) {
+            self.ara[doc].unbind(ext);
+            l.ara = Some((doc, None));
+        }
+    }
+
+    /// True if an ARA plug-in on `track` renders its clips, so the track node must
+    /// not play them too.
+    pub fn ara_track(&self, track: &Track) -> bool {
+        track
+            .devices
+            .iter()
+            .any(|d| self.live.get(&d.uid).is_some_and(|l| l.ara.is_some()))
+    }
+
+    /// Binds each ARA plug-in to its track and brings every document's playback
+    /// regions in line with those tracks' clips.
+    // shortcut: clip ids are (track, index), so moving a clip between tracks or
+    // reordering clips recreates its region and the plug-in's edits to it; give
+    // clips stable ids in the project when ARA editing is used for real.
+    // shortcut: ARA document archives are not saved with the project yet.
+    pub fn sync_ara(&mut self, project: &Project, audio: &HashMap<PathBuf, Arc<SampleData>>) {
+        if self.ara.is_empty() {
+            return;
+        }
+        let mut clips: Vec<Vec<AraClip>> = (0..self.ara.len()).map(|_| Vec::new()).collect();
+        for (ti, track) in project.tracks.iter().enumerate() {
+            for d in &track.devices {
+                let Some(l) = self.live.get_mut(&d.uid) else {
+                    continue;
+                };
+                let (Some((doc, bound)), Some(ext)) = (l.ara, l.hosted.ara_extension()) else {
+                    continue;
+                };
+                if bound != Some(ti) {
+                    if bound.is_some() {
+                        self.ara[doc].unbind(ext);
+                    }
+                    // SAFETY: the extension this instance was created bound with.
+                    unsafe { self.ara[doc].bind(ti, ext) };
+                    l.ara = Some((doc, Some(ti)));
+                }
+                clips[doc].extend(track.clips.iter().enumerate().filter_map(|(ci, c)| {
+                    Some(AraClip {
+                        id: (ti as u64) << 32 | ci as u64,
+                        track: ti,
+                        name: c.source.file_stem()?.to_string_lossy().into_owned(),
+                        audio: audio.get(&c.source)?.clone(),
+                        start: c.start,
+                        offset: c.offset,
+                        length: c.length,
+                    })
+                }));
+            }
+        }
+        for (doc, clips) in self.ara.iter_mut().zip(&clips) {
+            doc.sync(clips);
+        }
     }
 
     /// Shows device `uid`'s own editor, or brings its window forward.

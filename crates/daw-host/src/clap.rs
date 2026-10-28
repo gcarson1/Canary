@@ -396,8 +396,6 @@ impl ClapPlugin {
         ext.load(&handle, &mut bytes).map_err(|_| HostError::State)
     }
 
-    /// Runs main-thread work the plugin asked for. Call it regularly, like
-    /// `EngineHandle::collect_garbage`.
     /// Creates the plugin's editor embedded in `parent`; returns its size.
     ///
     /// # Safety
@@ -407,6 +405,9 @@ impl ClapPlugin {
         if parent.is_null() {
             return Err(HostError::NoEditor);
         }
+        // A request left over from a previous editor must not resize this one.
+        self.instance
+            .access_shared_handler(|r| r.resize.store(0, Ordering::Relaxed));
         let handle = self.instance.plugin_handle();
         let gui = handle
             .get_extension::<PluginGui>()
@@ -446,6 +447,8 @@ impl ClapPlugin {
         (packed != 0).then(|| (f64::from((packed >> 32) as u32), f64::from(packed as u32)))
     }
 
+    /// Runs main-thread work the plugin asked for. Call it regularly, like
+    /// `EngineHandle::collect_garbage`.
     pub fn idle(&mut self) {
         let asked = self
             .instance

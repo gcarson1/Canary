@@ -6,7 +6,7 @@ use std::ffi::c_void;
 use daw_host::Hosted;
 use objc2::rc::Retained;
 use objc2::{MainThreadMarker, MainThreadOnly};
-use objc2_app_kit::{NSBackingStoreType, NSWindow, NSWindowStyleMask};
+use objc2_app_kit::{NSApplication, NSBackingStoreType, NSWindow, NSWindowStyleMask};
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 
 pub struct EditorWindow {
@@ -50,7 +50,10 @@ impl EditorWindow {
 
     /// False once the user closed the window.
     pub fn is_open(&self) -> bool {
-        self.window.isVisible()
+        // Minimized or app-hidden windows are not visible but still open.
+        let hidden = MainThreadMarker::new()
+            .is_some_and(|mtm| NSApplication::sharedApplication(mtm).isHidden());
+        hidden || self.window.isVisible() || self.window.isMiniaturized()
     }
 
     pub fn front(&self) {

@@ -261,7 +261,6 @@ impl Devices {
         self.live.get(&uid).is_some_and(|l| l.instrument)
     }
 
-    /// Drops a device made by `create` that never went into the project.
     /// Shows device `uid`'s own editor, or brings its window forward.
     pub fn open_editor(&mut self, uid: u64, title: &str) -> Result<(), String> {
         #[cfg(target_os = "macos")]
@@ -316,6 +315,7 @@ impl Devices {
         }
     }
 
+    /// Drops a device made by `create` that never went into the project.
     pub fn discard(&mut self, uid: u64) {
         if let Some(l) = self.live.remove(&uid) {
             // Its node never reached a plan, so both halves can go now.

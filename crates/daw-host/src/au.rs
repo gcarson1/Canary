@@ -13,9 +13,9 @@ use std::sync::Arc;
 use daw_core::{MidiEvent, ProcessContext};
 use daw_graph::{AudioNode, MAX_CHANNELS};
 use objc2::encode::{Encode, Encoding};
-use objc2::msg_send;
 use objc2::rc::{Allocated, Retained};
 use objc2::runtime::{AnyClass, AnyObject};
+use objc2::{msg_send, sel};
 use objc2_audio_toolbox::{
     kAudioUnitProperty_ClassInfo, kAudioUnitProperty_CocoaUI, kAudioUnitProperty_Latency,
     kAudioUnitProperty_MaximumFramesPerSlice, kAudioUnitProperty_ParameterInfo,
@@ -24,11 +24,10 @@ use objc2_audio_toolbox::{
     kAudioUnitScope_Output, kAudioUnitType_Effect, kAudioUnitType_MusicDevice,
     kAudioUnitType_MusicEffect, AURenderCallbackStruct, AudioComponent, AudioComponentCopyName,
     AudioComponentDescription, AudioComponentFindNext, AudioComponentGetDescription,
-    AudioComponentInstanceDispose, AudioComponentInstanceNew, AudioUnit, AudioUnitCocoaViewInfo,
-    AudioUnitGetParameter, AudioUnitGetProperty, AudioUnitGetPropertyInfo, AudioUnitInitialize,
-    AudioUnitParameterInfo, AudioUnitParameterOptions, AudioUnitRender, AudioUnitRenderActionFlags,
-    AudioUnitReset, AudioUnitSetParameter, AudioUnitSetProperty, AudioUnitUninitialize,
-    MusicDeviceMIDIEvent,
+    AudioComponentInstanceDispose, AudioComponentInstanceNew, AudioUnit, AudioUnitGetParameter,
+    AudioUnitGetProperty, AudioUnitGetPropertyInfo, AudioUnitInitialize, AudioUnitParameterInfo,
+    AudioUnitParameterOptions, AudioUnitRender, AudioUnitRenderActionFlags, AudioUnitReset,
+    AudioUnitSetParameter, AudioUnitSetProperty, AudioUnitUninitialize, MusicDeviceMIDIEvent,
 };
 use objc2_core_audio_types::{
     kAudioFormatFlagIsFloat, kAudioFormatFlagIsNonInterleaved, kAudioFormatFlagIsPacked,
@@ -475,17 +474,25 @@ impl AuPlugin {
 
     /// The view from the unit's own Cocoa UI bundle, if it names one.
     unsafe fn cocoa_view(&self) -> Option<Retained<AnyObject>> {
-        let info: AudioUnitCocoaViewInfo =
+        // Raw pointers, not `AudioUnitCocoaViewInfo`: a buggy unit may leave one null.
+        #[repr(C)]
+        struct ViewInfo {
+            url: *mut CFURL,
+            class: *mut CFString,
+        }
+        let info: ViewInfo =
             self.unit
                 .get_raw(kAudioUnitProperty_CocoaUI, kAudioUnitScope_Global, 0)?;
+        let (url, class) = (NonNull::new(info.url), NonNull::new(info.class));
         // The unit hands over a reference to each; take them so they are released.
-        // SAFETY: valid CF objects from the property.
+        // SAFETY: CF objects from the property, owned by us now.
         let (url, class) = unsafe {
             (
-                CFRetained::from_raw(info.mCocoaAUViewBundleLocation),
-                CFRetained::from_raw(info.mCocoaAUViewClass[0]),
+                url.map(|p| CFRetained::from_raw(p)),
+                class.map(|p| CFRetained::from_raw(p)),
             )
         };
+        let (url, class) = (url?, class?);
         let bundle_class = AnyClass::get(c"NSBundle")?;
         // SAFETY: CFURL and CFString are toll-free bridged to NSURL and NSString.
         unsafe {
@@ -498,7 +505,14 @@ impl AuPlugin {
                 width: 400.0,
                 height: 300.0,
             };
-            msg_send![&*factory?, uiViewForAudioUnit: self.unit.0, withSize: size]
+            let factory = factory?;
+            // A stale bundle's class may lack the method; calling it would throw.
+            let ok: bool =
+                msg_send![&*factory, respondsToSelector: sel!(uiViewForAudioUnit:withSize:)];
+            if !ok {
+                return None;
+            }
+            msg_send![&*factory, uiViewForAudioUnit: self.unit.0, withSize: size]
         }
     }
 

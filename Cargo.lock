@@ -582,6 +582,9 @@ dependencies = [
  "daw-ui",
  "eframe",
  "egui",
+ "objc2 0.6.5",
+ "objc2-app-kit 0.3.2",
+ "objc2-foundation 0.3.2",
 ]
 
 [[package]]
@@ -936,6 +939,7 @@ dependencies = [
  "daw-engine",
  "daw-graph",
  "libloading 0.8.9",
+ "objc2 0.6.5",
  "objc2-audio-toolbox",
  "objc2-core-audio-types",
  "objc2-core-foundation",

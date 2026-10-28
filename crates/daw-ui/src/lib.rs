@@ -98,6 +98,11 @@ pub enum Request {
         path: PathBuf,
         drop: SampleDrop,
     },
+    /// Show the plugin's own editor window.
+    OpenEditor {
+        track: usize,
+        device: usize,
+    },
     Listen(Listen),
     /// Switch between the mix and the reference (A/B).
     ToggleReference,

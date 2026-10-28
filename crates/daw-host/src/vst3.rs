@@ -477,6 +477,14 @@ pub struct Vst3Plugin {
     changes: Producer<(u32, f64)>,
     /// Has an audio input port; without one it is an instrument.
     audio_input: bool,
+    /// The editor while it is shown.
+    view: Option<ComPtr<IPlugView>>,
+}
+
+impl Drop for Vst3Plugin {
+    fn drop(&mut self) {
+        self.close_editor(); // before the controller goes
+    }
 }
 
 /// Runs its closure on drop unless disarmed: cleanup for early returns.
@@ -687,9 +695,50 @@ impl Vst3Plugin {
                     audio_input: inputs.is_some(),
                     params,
                     changes,
+                    view: None,
                 },
                 node,
             ))
+        }
+    }
+
+    /// Attaches the controller's editor view to `parent`; returns its size.
+    ///
+    /// # Safety
+    /// `parent` must be a valid `NSView` that outlives the editor. Main thread only.
+    pub unsafe fn open_editor(&mut self, parent: *mut c_void) -> Result<(f64, f64), HostError> {
+        self.close_editor();
+        if parent.is_null() {
+            return Err(HostError::NoEditor);
+        }
+        // SAFETY: the controller is live; the view is used as the VST3 API says.
+        unsafe {
+            let raw = self.instance.controller.createView(ViewType::kEditor);
+            let view = ComPtr::from_raw(raw).ok_or(HostError::NoEditor)?;
+            if view.isPlatformTypeSupported(kPlatformTypeNSView) != kResultOk
+                || view.attached(parent, kPlatformTypeNSView) != kResultOk
+            {
+                return Err(HostError::NoEditor);
+            }
+            let mut rect = ViewRect {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            };
+            view.getSize(&mut rect);
+            self.view = Some(view);
+            Ok((
+                f64::from(rect.right - rect.left),
+                f64::from(rect.bottom - rect.top),
+            ))
+        }
+    }
+
+    pub fn close_editor(&mut self) {
+        if let Some(view) = self.view.take() {
+            // SAFETY: attached in `open_editor`; dropping releases our reference.
+            unsafe { view.removed() };
         }
     }
 

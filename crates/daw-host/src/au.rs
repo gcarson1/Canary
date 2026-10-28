@@ -12,18 +12,23 @@ use std::sync::Arc;
 
 use daw_core::{MidiEvent, ProcessContext};
 use daw_graph::{AudioNode, MAX_CHANNELS};
+use objc2::encode::{Encode, Encoding};
+use objc2::msg_send;
+use objc2::rc::{Allocated, Retained};
+use objc2::runtime::{AnyClass, AnyObject};
 use objc2_audio_toolbox::{
-    kAudioUnitProperty_ClassInfo, kAudioUnitProperty_Latency,
+    kAudioUnitProperty_ClassInfo, kAudioUnitProperty_CocoaUI, kAudioUnitProperty_Latency,
     kAudioUnitProperty_MaximumFramesPerSlice, kAudioUnitProperty_ParameterInfo,
     kAudioUnitProperty_ParameterList, kAudioUnitProperty_SetRenderCallback,
     kAudioUnitProperty_StreamFormat, kAudioUnitScope_Global, kAudioUnitScope_Input,
     kAudioUnitScope_Output, kAudioUnitType_Effect, kAudioUnitType_MusicDevice,
     kAudioUnitType_MusicEffect, AURenderCallbackStruct, AudioComponent, AudioComponentCopyName,
     AudioComponentDescription, AudioComponentFindNext, AudioComponentGetDescription,
-    AudioComponentInstanceDispose, AudioComponentInstanceNew, AudioUnit, AudioUnitGetParameter,
-    AudioUnitGetProperty, AudioUnitGetPropertyInfo, AudioUnitInitialize, AudioUnitParameterInfo,
-    AudioUnitParameterOptions, AudioUnitRender, AudioUnitRenderActionFlags, AudioUnitReset,
-    AudioUnitSetParameter, AudioUnitSetProperty, AudioUnitUninitialize, MusicDeviceMIDIEvent,
+    AudioComponentInstanceDispose, AudioComponentInstanceNew, AudioUnit, AudioUnitCocoaViewInfo,
+    AudioUnitGetParameter, AudioUnitGetProperty, AudioUnitGetPropertyInfo, AudioUnitInitialize,
+    AudioUnitParameterInfo, AudioUnitParameterOptions, AudioUnitRender, AudioUnitRenderActionFlags,
+    AudioUnitReset, AudioUnitSetParameter, AudioUnitSetProperty, AudioUnitUninitialize,
+    MusicDeviceMIDIEvent,
 };
 use objc2_core_audio_types::{
     kAudioFormatFlagIsFloat, kAudioFormatFlagIsNonInterleaved, kAudioFormatFlagIsPacked,
@@ -32,7 +37,7 @@ use objc2_core_audio_types::{
 };
 use objc2_core_foundation::{
     CFData, CFPropertyListCreateData, CFPropertyListCreateWithData, CFPropertyListFormat,
-    CFRetained, CFString, CFType,
+    CFRetained, CFString, CFType, CFURL,
 };
 
 use crate::{HostError, ParamInfo, PluginInfo};
@@ -193,6 +198,26 @@ impl Instance {
         })?;
         Ok(value)
     }
+
+    /// A property of a type with no sensible default; None unless the unit fills
+    /// exactly one `T`.
+    fn get_raw<T>(&self, id: u32, scope: u32, element: u32) -> Option<T> {
+        let mut value = std::mem::MaybeUninit::<T>::uninit();
+        let mut size = size_of::<T>() as u32;
+        // SAFETY: `value` is writable for `size` bytes.
+        let status = unsafe {
+            AudioUnitGetProperty(
+                self.0,
+                id,
+                scope,
+                element,
+                NonNull::from(&mut value).cast(),
+                NonNull::from(&mut size),
+            )
+        };
+        // SAFETY: the unit wrote a whole `T`.
+        (status == 0 && size as usize == size_of::<T>()).then(|| unsafe { value.assume_init() })
+    }
 }
 
 /// Where the render callback reads the node's input from, set before each render.
@@ -260,6 +285,60 @@ pub struct AuPlugin {
     params: Vec<ParamInfo>,
     sample_rate: f32,
     kind: AuKind,
+    /// The editor's `NSView` while it is shown.
+    editor: Option<Retained<AnyObject>>,
+}
+
+impl Drop for AuPlugin {
+    fn drop(&mut self) {
+        self.close_editor(); // before the unit goes
+    }
+}
+
+// AUGenericView, the editor for units without their own Cocoa view.
+#[link(name = "CoreAudioKit", kind = "framework")]
+extern "C" {}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct CGPoint {
+    x: f64,
+    y: f64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct CGSize {
+    width: f64,
+    height: f64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct CGRect {
+    origin: CGPoint,
+    size: CGSize,
+}
+
+// SAFETY: these match CoreGraphics' layouts and names.
+unsafe impl Encode for CGPoint {
+    const ENCODING: Encoding = Encoding::Struct("CGPoint", &[f64::ENCODING, f64::ENCODING]);
+}
+unsafe impl Encode for CGSize {
+    const ENCODING: Encoding = Encoding::Struct("CGSize", &[f64::ENCODING, f64::ENCODING]);
+}
+unsafe impl Encode for CGRect {
+    const ENCODING: Encoding = Encoding::Struct("CGRect", &[CGPoint::ENCODING, CGSize::ENCODING]);
+}
+
+/// CoreAudioKit's generic parameter view for `unit`.
+unsafe fn generic_view(unit: AudioUnit) -> Option<Retained<AnyObject>> {
+    let class = AnyClass::get(c"AUGenericView")?;
+    // SAFETY: AUGenericView takes the unit it shows.
+    unsafe {
+        let view: Allocated<AnyObject> = msg_send![class, alloc];
+        msg_send![view, initWithAudioUnit: unit]
+    }
 }
 
 /// The unit's latency now, in samples: it can change with its settings or state.
@@ -351,6 +430,7 @@ impl AuPlugin {
             unit: unit.clone(),
             sample_rate,
             kind,
+            editor: None,
         };
         let channel = || vec![0.0f32; max_block].into_boxed_slice();
         let node = AuNode {
@@ -363,6 +443,63 @@ impl AuPlugin {
             kind,
         };
         Ok((plugin, node))
+    }
+
+    /// The unit's own Cocoa view if it has one, else Apple's generic view of its
+    /// parameters, added to `parent`. Returns its size in points.
+    ///
+    /// # Safety
+    /// `parent` must be a valid `NSView` that outlives the editor. Main thread only.
+    pub unsafe fn open_editor(&mut self, parent: *mut c_void) -> Result<(f64, f64), HostError> {
+        self.close_editor();
+        let parent = NonNull::new(parent.cast::<AnyObject>()).ok_or(HostError::NoEditor)?;
+        // SAFETY: the unit is live; the view classes are called as documented.
+        let view = unsafe { self.cocoa_view() }
+            .or_else(|| unsafe { generic_view(self.unit.0) })
+            .ok_or(HostError::NoEditor)?;
+        // SAFETY: both are NSViews on the main thread.
+        let frame: CGRect = unsafe {
+            let _: () = msg_send![parent.as_ref(), addSubview: &*view];
+            msg_send![&*view, frame]
+        };
+        self.editor = Some(view);
+        Ok((frame.size.width, frame.size.height))
+    }
+
+    pub fn close_editor(&mut self) {
+        if let Some(view) = self.editor.take() {
+            // SAFETY: an NSView we added; dropping `view` releases our reference.
+            let _: () = unsafe { msg_send![&*view, removeFromSuperview] };
+        }
+    }
+
+    /// The view from the unit's own Cocoa UI bundle, if it names one.
+    unsafe fn cocoa_view(&self) -> Option<Retained<AnyObject>> {
+        let info: AudioUnitCocoaViewInfo =
+            self.unit
+                .get_raw(kAudioUnitProperty_CocoaUI, kAudioUnitScope_Global, 0)?;
+        // The unit hands over a reference to each; take them so they are released.
+        // SAFETY: valid CF objects from the property.
+        let (url, class) = unsafe {
+            (
+                CFRetained::from_raw(info.mCocoaAUViewBundleLocation),
+                CFRetained::from_raw(info.mCocoaAUViewClass[0]),
+            )
+        };
+        let bundle_class = AnyClass::get(c"NSBundle")?;
+        // SAFETY: CFURL and CFString are toll-free bridged to NSURL and NSString.
+        unsafe {
+            let url: *const AnyObject = (&*url as *const CFURL).cast();
+            let name: *const AnyObject = (&*class as *const CFString).cast();
+            let bundle: Option<Retained<AnyObject>> = msg_send![bundle_class, bundleWithURL: url];
+            let factory_class: *const AnyClass = msg_send![&*bundle?, classNamed: name];
+            let factory: Option<Retained<AnyObject>> = msg_send![factory_class.as_ref()?, new];
+            let size = CGSize {
+                width: 400.0,
+                height: 300.0,
+            };
+            msg_send![&*factory?, uiViewForAudioUnit: self.unit.0, withSize: size]
+        }
     }
 
     pub fn kind(&self) -> AuKind {

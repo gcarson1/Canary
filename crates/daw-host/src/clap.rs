@@ -1,9 +1,12 @@
-use std::ffi::{CStr, CString};
+use std::ffi::{c_void, CStr, CString};
 use std::fmt;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use clack_extensions::audio_ports::{AudioPortInfoBuffer, PluginAudioPorts};
+use clack_extensions::gui::{
+    GuiApiType, GuiConfiguration, GuiSize, HostGui, HostGuiImpl, PluginGui, Window,
+};
 use clack_extensions::latency::PluginLatency;
 use clack_extensions::params::{ParamInfoBuffer, PluginParams};
 use clack_extensions::state::PluginState;
@@ -35,6 +38,8 @@ pub enum HostError {
     State,
     /// An Audio Unit call failed with this OSStatus.
     Status(i32),
+    /// The plugin has no editor this host can embed (an `NSView`).
+    NoEditor,
 }
 
 impl fmt::Display for HostError {
@@ -56,6 +61,7 @@ impl fmt::Display for HostError {
             ),
             Self::State => write!(f, "plugin could not save or load its state"),
             Self::Status(s) => write!(f, "Audio Unit call failed (OSStatus {s})"),
+            Self::NoEditor => write!(f, "the plugin has no editor to show"),
         }
     }
 }
@@ -147,6 +153,27 @@ struct CanaryHost;
 #[derive(Default)]
 struct Requests {
     callback: AtomicBool,
+    /// A size the editor asked for, `width << 32 | height`; 0 when none.
+    resize: AtomicU64,
+}
+
+/// Editor requests may come from any thread; the size waits for the main thread.
+impl HostGuiImpl for Requests {
+    fn resize_hints_changed(&self) {}
+    fn request_resize(&self, size: GuiSize) -> Result<(), clack_host::prelude::HostError> {
+        let packed = u64::from(size.width) << 32 | u64::from(size.height);
+        self.resize.store(packed.max(1), Ordering::Release);
+        Ok(())
+    }
+    fn request_show(&self) -> Result<(), clack_host::prelude::HostError> {
+        Ok(())
+    }
+    fn request_hide(&self) -> Result<(), clack_host::prelude::HostError> {
+        Ok(())
+    }
+    // shortcut: embedded editors only; a lost connection shows as a blank window
+    // until the user closes it.
+    fn closed(&self, _was_destroyed: bool) {}
 }
 
 impl SharedHandler<'_> for Requests {
@@ -161,6 +188,10 @@ impl HostHandlers for CanaryHost {
     type Shared<'a> = Requests;
     type MainThread<'a> = ();
     type AudioProcessor<'a> = ();
+
+    fn declare_extensions(builder: &mut HostExtensions<Self>, _shared: &Self::Shared<'_>) {
+        builder.register::<HostGui>();
+    }
 }
 
 /// Main-thread side of one hosted CLAP plugin: parameters, state and callbacks.
@@ -175,7 +206,14 @@ pub struct ClapPlugin {
     latency: u32,
     /// Has an audio input port; without one it is an instrument.
     audio_input: bool,
+    /// The editor is created and embedded.
+    editor: bool,
 }
+
+const EMBEDDED_COCOA: GuiConfiguration = GuiConfiguration {
+    api_type: GuiApiType::COCOA,
+    is_floating: false,
+};
 
 impl ClapPlugin {
     /// Instantiates plugin `id` from `entry` and activates it for blocks of up to
@@ -297,6 +335,7 @@ impl ClapPlugin {
                 params,
                 param_changes,
                 latency,
+                editor: false,
             },
             node,
         ))
@@ -359,6 +398,54 @@ impl ClapPlugin {
 
     /// Runs main-thread work the plugin asked for. Call it regularly, like
     /// `EngineHandle::collect_garbage`.
+    /// Creates the plugin's editor embedded in `parent`; returns its size.
+    ///
+    /// # Safety
+    /// `parent` must be a valid `NSView` that outlives the editor. Main thread only.
+    pub unsafe fn open_editor(&mut self, parent: *mut c_void) -> Result<(f64, f64), HostError> {
+        self.close_editor();
+        if parent.is_null() {
+            return Err(HostError::NoEditor);
+        }
+        let handle = self.instance.plugin_handle();
+        let gui = handle
+            .get_extension::<PluginGui>()
+            .filter(|g| g.is_api_supported(&handle, EMBEDDED_COCOA))
+            .ok_or(HostError::NoEditor)?;
+        gui.create(&handle, EMBEDDED_COCOA)
+            .map_err(|_| HostError::NoEditor)?;
+        // SAFETY: upheld by the caller.
+        let shown = unsafe { gui.set_parent(&handle, Window::from_cocoa_nsview(parent)) }
+            .and_then(|()| gui.show(&handle));
+        if shown.is_err() {
+            gui.destroy(&handle);
+            return Err(HostError::NoEditor);
+        }
+        let size = gui.get_size(&handle).unwrap_or(GuiSize {
+            width: 400,
+            height: 300,
+        });
+        self.editor = true;
+        Ok((f64::from(size.width), f64::from(size.height)))
+    }
+
+    pub fn close_editor(&mut self) {
+        if std::mem::take(&mut self.editor) {
+            let handle = self.instance.plugin_handle();
+            if let Some(gui) = handle.get_extension::<PluginGui>() {
+                gui.destroy(&handle);
+            }
+        }
+    }
+
+    /// A size the editor asked for since the last call, in points.
+    pub fn editor_resized(&mut self) -> Option<(f64, f64)> {
+        let packed = self
+            .instance
+            .access_shared_handler(|r| r.resize.swap(0, Ordering::Acquire));
+        (packed != 0).then(|| (f64::from((packed >> 32) as u32), f64::from(packed as u32)))
+    }
+
     pub fn idle(&mut self) {
         let asked = self
             .instance
@@ -366,6 +453,12 @@ impl ClapPlugin {
         if asked {
             self.instance.call_on_main_thread_callback();
         }
+    }
+}
+
+impl Drop for ClapPlugin {
+    fn drop(&mut self) {
+        self.close_editor(); // CLAP: destroy the GUI before the plugin
     }
 }
 

@@ -5,6 +5,8 @@
 //! `canary [project.daw] [--samples DIR]`. Defaults to `~/Music/Canary`.
 
 mod devices;
+#[cfg(target_os = "macos")]
+mod editor;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -540,6 +542,15 @@ impl App {
                 if let Some(uid) = self.device_uid(track, device) {
                     self.devices.set_param(uid, param, value);
                     self.history.mark_dirty(); // so quitting saves the plugin's state
+                }
+            }
+            Request::OpenEditor { track, device } => {
+                let tracks = &self.history.project().tracks;
+                let found = tracks.get(track).and_then(|t| t.devices.get(device));
+                if let Some((uid, name)) = found.map(|d| (d.uid, d.name.clone())) {
+                    if let Err(e) = self.devices.open_editor(uid, &name) {
+                        self.error(e);
+                    }
                 }
             }
             Request::Listen(listen) => self.monitor.set_mode(match listen {

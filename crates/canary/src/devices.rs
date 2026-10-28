@@ -41,6 +41,9 @@ pub struct Devices {
     /// Devices whose plugin failed to load; not retried on every edit.
     failed: HashSet<u64>,
     free: Vec<u32>,
+    /// Open plugin editor windows by device uid.
+    #[cfg(target_os = "macos")]
+    editors: HashMap<u64, crate::editor::EditorWindow>,
 }
 
 fn to_host(f: PluginFormat) -> Format {
@@ -87,6 +90,8 @@ impl Devices {
             removed_state: HashMap::new(),
             failed: HashSet::new(),
             free: (FIRST_DEVICE_NODE..MAX_NODES as u32).rev().collect(),
+            #[cfg(target_os = "macos")]
+            editors: HashMap::new(),
         }
     }
 
@@ -170,6 +175,7 @@ impl Devices {
             .copied()
             .collect();
         for uid in gone {
+            self.close_editor(uid);
             let mut live = self.live.remove(&uid).expect("listed above");
             if let Ok(state) = live.hosted.save_state() {
                 self.removed_state.insert(uid, state);
@@ -256,6 +262,60 @@ impl Devices {
     }
 
     /// Drops a device made by `create` that never went into the project.
+    /// Shows device `uid`'s own editor, or brings its window forward.
+    pub fn open_editor(&mut self, uid: u64, title: &str) -> Result<(), String> {
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(w) = self.editors.get(&uid) {
+                w.front();
+                return Ok(());
+            }
+            let l = self.live.get_mut(&uid).ok_or("device is not loaded")?;
+            let window = crate::editor::EditorWindow::open(&mut *l.hosted, title)?;
+            self.editors.insert(uid, window);
+            Ok(())
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (uid, title);
+            Err("plugin editors need macOS".into())
+        }
+    }
+
+    fn close_editor(&mut self, uid: u64) {
+        #[cfg(target_os = "macos")]
+        if let (Some(w), Some(l)) = (self.editors.remove(&uid), self.live.get_mut(&uid)) {
+            w.close(&mut *l.hosted);
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = uid;
+    }
+
+    /// Closes editors whose window the user closed and follows resize requests.
+    fn tend_editors(&mut self) {
+        #[cfg(target_os = "macos")]
+        {
+            let closed: Vec<u64> = self
+                .editors
+                .iter()
+                .filter(|(_, w)| !w.is_open())
+                .map(|(uid, _)| *uid)
+                .collect();
+            for uid in closed {
+                self.close_editor(uid);
+            }
+            for (uid, w) in &self.editors {
+                if let Some(size) = self
+                    .live
+                    .get_mut(uid)
+                    .and_then(|l| l.hosted.editor_resized())
+                {
+                    w.resize(size);
+                }
+            }
+        }
+    }
+
     pub fn discard(&mut self, uid: u64) {
         if let Some(l) = self.live.remove(&uid) {
             // Its node never reached a plan, so both halves can go now.
@@ -313,6 +373,7 @@ impl Devices {
                         })
                         .collect()
                 }),
+                editor: d.format != PluginFormat::Builtin,
                 sampler: self
                     .live
                     .get_mut(&d.uid)
@@ -340,6 +401,7 @@ impl Devices {
         for l in self.live.values_mut() {
             l.hosted.idle();
         }
+        self.tend_editors();
         if waiting {
             return;
         }

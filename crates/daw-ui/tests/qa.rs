@@ -136,6 +136,7 @@ fn devices() -> Vec<DeviceView> {
                 param(3, "Lowpass", 100.0),
             ],
             sampler: None,
+            editor: true,
         },
         DeviceView {
             // A full built-in module: eight dials, a log-scaled frequency first.
@@ -162,6 +163,7 @@ fn devices() -> Vec<DeviceView> {
             })
             .collect(),
             sampler: None,
+            editor: false,
         },
     ]
 }
@@ -192,6 +194,7 @@ fn sampler() -> DeviceView {
                 log: false,
             })
             .collect(),
+        editor: false,
         sampler: Some(SamplerView {
             path: Some(PathBuf::from("/samples/808_Thermal_Sub.wav")),
             slices: vec![0.0, 0.25, 0.5, 0.75],

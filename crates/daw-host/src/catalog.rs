@@ -2,6 +2,7 @@
 //! them behind the same `Hosted` handle and `AudioNode`.
 
 use std::collections::HashMap;
+use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -44,6 +45,20 @@ pub trait Hosted {
     fn has_audio_input(&self) -> bool;
     /// Main-thread work the plugin asked for; call regularly.
     fn idle(&mut self) {}
+    /// Puts the plugin's own editor inside `parent` and returns its size in points.
+    ///
+    /// # Safety
+    /// `parent` must be a valid `NSView` that stays alive until `close_editor`.
+    /// Main thread only.
+    unsafe fn open_editor(&mut self, _parent: *mut c_void) -> Result<(f64, f64), HostError> {
+        Err(HostError::NoEditor)
+    }
+    /// Takes the editor down; a no-op when none is open.
+    fn close_editor(&mut self) {}
+    /// A new size the open editor asked for, in points.
+    fn editor_resized(&mut self) -> Option<(f64, f64)> {
+        None
+    }
     /// The built-in sampler's own controls; None for everything else.
     fn sampler(&mut self) -> Option<&mut crate::Sampler> {
         None
@@ -75,6 +90,16 @@ impl Hosted for ClapPlugin {
     fn idle(&mut self) {
         ClapPlugin::idle(self)
     }
+    unsafe fn open_editor(&mut self, parent: *mut c_void) -> Result<(f64, f64), HostError> {
+        // SAFETY: upheld by the caller.
+        unsafe { ClapPlugin::open_editor(self, parent) }
+    }
+    fn close_editor(&mut self) {
+        ClapPlugin::close_editor(self)
+    }
+    fn editor_resized(&mut self) -> Option<(f64, f64)> {
+        ClapPlugin::editor_resized(self)
+    }
 }
 
 impl Hosted for Vst3Plugin {
@@ -99,6 +124,13 @@ impl Hosted for Vst3Plugin {
     fn has_audio_input(&self) -> bool {
         Vst3Plugin::has_audio_input(self)
     }
+    unsafe fn open_editor(&mut self, parent: *mut c_void) -> Result<(f64, f64), HostError> {
+        // SAFETY: upheld by the caller.
+        unsafe { Vst3Plugin::open_editor(self, parent) }
+    }
+    fn close_editor(&mut self) {
+        Vst3Plugin::close_editor(self)
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -120,6 +152,13 @@ impl Hosted for crate::AuPlugin {
     }
     fn latency_samples(&self) -> u32 {
         crate::AuPlugin::latency_samples(self)
+    }
+    unsafe fn open_editor(&mut self, parent: *mut c_void) -> Result<(f64, f64), HostError> {
+        // SAFETY: upheld by the caller.
+        unsafe { crate::AuPlugin::open_editor(self, parent) }
+    }
+    fn close_editor(&mut self) {
+        crate::AuPlugin::close_editor(self)
     }
     fn has_audio_input(&self) -> bool {
         self.kind() != crate::AuKind::Instrument

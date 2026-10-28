@@ -32,6 +32,8 @@ pub struct DeviceView {
     pub params: Vec<ParamView>,
     /// Set for the built-in sampler.
     pub sampler: Option<SamplerView>,
+    /// A third-party plugin, which may have its own editor.
+    pub editor: bool,
 }
 
 /// What the rack shows of a sampler.
@@ -181,8 +183,30 @@ pub(crate) fn show(
         if resp.clicked() && !was_open {
             ws.edit(Action::RemoveDevice { track, index: di });
         }
+        let mut title_end = remove.min.x;
+        if device.editor {
+            let edit = p.text(
+                Pos2::new(remove.min.x - 0.75 * u, top),
+                Align2::RIGHT_CENTER,
+                "EDIT",
+                m.mono(0.625),
+                t.faint,
+            );
+            let resp = ui.interact(
+                edit.expand(0.25 * u),
+                ui.scope_id().with(("edit-device", di)),
+                Sense::click(),
+            );
+            if resp.hovered() {
+                p.hline(edit.x_range(), m.snap(edit.max.y), m.hair(t.muted));
+            }
+            if resp.clicked() && !was_open {
+                out.push(Request::OpenEditor { track, device: di });
+            }
+            title_end = edit.min.x;
+        }
         let title = Rect::from_x_y_ranges(
-            module.min.x..=remove.min.x - 0.5 * u,
+            module.min.x..=title_end - 0.5 * u,
             module.min.y..=top + 0.75 * u,
         );
         let grab = ui.interact(

@@ -319,9 +319,10 @@ impl Catalog {
         }
     }
 
-    /// As `instantiate`, bound to ARA document controller `controller` (see
-    /// `ara::Document::controller_ref`) before the plug-in is set up, as ARA requires.
-    /// The ARA side is then `Hosted::ara_extension`.
+    /// As `instantiate`, bound to ARA document controller `bind.0` (see
+    /// `ara::Document::controller_ref`) before the plug-in is set up, as ARA
+    /// requires. `bind.1` gets the ARA extension before the plug-in is activated:
+    /// the only time its playback regions may be set (`ara::Document::bind`).
     pub fn instantiate_ara(
         &mut self,
         format: Format,
@@ -329,8 +330,9 @@ impl Catalog {
         id: &str,
         sample_rate: f32,
         max_block: usize,
-        controller: *mut c_void,
+        bind: crate::ara::AraBind<'_>,
     ) -> Result<Instance, HostError> {
+        let (controller, on_bind) = bind;
         let missing = || HostError::UnknownPlugin(id.to_owned());
         match format {
             Format::Clap => {
@@ -345,7 +347,7 @@ impl Catalog {
                     id,
                     sample_rate,
                     max_block,
-                    Some(controller),
+                    Some((controller, &mut *on_bind)),
                 )?;
                 Ok((Box::new(p), Box::new(n)))
             }
@@ -358,14 +360,23 @@ impl Catalog {
                         .insert(path.to_path_buf(), unsafe { Vst3Bundle::load(path) }?);
                 }
                 let bundle = self.vst3.get(path).ok_or_else(missing)?;
-                let (p, n) =
-                    Vst3Plugin::new_ara(bundle, id, sample_rate, max_block, Some(controller))?;
+                let (p, n) = Vst3Plugin::new_ara(
+                    bundle,
+                    id,
+                    sample_rate,
+                    max_block,
+                    Some((controller, &mut *on_bind)),
+                )?;
                 Ok((Box::new(p), Box::new(n)))
             }
             #[cfg(target_os = "macos")]
             Format::AudioUnit => {
-                let (p, n) =
-                    crate::AuPlugin::new_ara(id, sample_rate, max_block, Some(controller))?;
+                let (p, n) = crate::AuPlugin::new_ara(
+                    id,
+                    sample_rate,
+                    max_block,
+                    Some((controller, &mut *on_bind)),
+                )?;
                 Ok((Box::new(p), Box::new(n)))
             }
             #[cfg(not(target_os = "macos"))]
@@ -395,7 +406,7 @@ mod tests {
             "aufx:dely:appl",
             48_000.0,
             256,
-            std::ptr::null_mut(),
+            (std::ptr::null_mut(), &mut |_| panic!("not an ARA unit")),
         );
         assert!(matches!(bound, Err(HostError::NoAra)));
     }

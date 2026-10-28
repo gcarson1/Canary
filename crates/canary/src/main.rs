@@ -528,7 +528,7 @@ impl App {
             Request::AddDevice { track, choice } => {
                 let uid = self.history.new_device_uid();
                 let rate = self.view.sample_rate as f32;
-                match self.devices.create(choice, uid, rate, MAX_BLOCK) {
+                match self.devices.create(choice, uid, track, rate, MAX_BLOCK) {
                     Ok(device) => {
                         let tracks = &self.history.project().tracks;
                         // One instrument per track: a second would never be scheduled.

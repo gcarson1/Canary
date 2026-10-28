@@ -622,14 +622,15 @@ impl Vst3Plugin {
         Self::new_ara(bundle, id, sample_rate, max_block, None)
     }
 
-    /// As `new`, bound to ARA document controller `ara` first if given, since ARA
-    /// requires binding before processing is set up.
+    /// As `new`, bound to ARA document controller `ara.0` first if given, since
+    /// ARA requires binding before processing is set up; `ara.1` gets the
+    /// extension while the plug-in is still inactive.
     pub fn new_ara(
         bundle: &Arc<Vst3Bundle>,
         id: &str,
         sample_rate: f32,
         max_block: usize,
-        ara: Option<*mut c_void>,
+        ara: Option<crate::ara::AraBind<'_>>,
     ) -> Result<(Vst3Plugin, Vst3Node), HostError> {
         let unknown = || HostError::UnknownPlugin(id.to_owned());
         let class = bundle
@@ -713,10 +714,12 @@ impl Vst3Plugin {
                 sampleRate: f64::from(sample_rate),
             };
             let ara = match ara {
-                Some(controller) => Some(
-                    ara_bind(instance.component.as_ptr().cast(), controller)
-                        .ok_or(HostError::NoAra)?,
-                ),
+                Some((controller, on_bind)) => {
+                    let ext = ara_bind(instance.component.as_ptr().cast(), controller)
+                        .ok_or(HostError::NoAra)?;
+                    on_bind(ext); // regions go to the renderer before activation
+                    Some(ext)
+                }
                 None => None,
             };
             ok(instance.processor.setupProcessing(&mut setup))?;

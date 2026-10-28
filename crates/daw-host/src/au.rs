@@ -416,13 +416,14 @@ impl AuPlugin {
         Self::new_ara(id, sample_rate, max_block, None)
     }
 
-    /// As `new`, bound to ARA document controller `ara` first if given, since ARA
-    /// requires binding before the unit is initialized.
+    /// As `new`, bound to ARA document controller `ara.0` first if given, since
+    /// ARA requires binding before the unit is initialized; `ara.1` gets the
+    /// extension while the unit is still uninitialized.
     pub fn new_ara(
         id: &str,
         sample_rate: f32,
         max_block: usize,
-        ara: Option<*mut c_void>,
+        ara: Option<crate::ara::AraBind<'_>>,
     ) -> Result<(AuPlugin, AuNode), HostError> {
         let unknown = || HostError::UnknownPlugin(id.to_owned());
         let desc = description(id).ok_or_else(unknown)?;
@@ -487,7 +488,11 @@ impl AuPlugin {
             &max,
         )?;
         let ara = match ara {
-            Some(controller) => Some(bind_ara(&unit, controller)?),
+            Some((controller, on_bind)) => {
+                let ext = bind_ara(&unit, controller)?;
+                on_bind(ext); // regions go to the renderer before initialization
+                Some(ext)
+            }
             None => None,
         };
         // SAFETY: the unit is configured and not yet initialized.

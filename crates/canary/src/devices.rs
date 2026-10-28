@@ -2,7 +2,9 @@
 //! across plan rebuilds so plugin state survives edits.
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::c_void;
 use std::path::{Path, PathBuf};
+use std::ptr::NonNull;
 use std::sync::Arc;
 
 use daw_core::{NodeId, SampleData};
@@ -27,8 +29,16 @@ struct Live {
     instrument: bool,
     /// The latency the last plan compensated for; a change needs a new plan.
     latency: u32,
-    /// An ARA plug-in: index into `Devices::ara`, and the track it renders once bound.
-    ara: Option<(usize, Option<usize>)>,
+    /// An ARA plug-in: index into `Devices::ara`, and the track whose regions it
+    /// was given before activation.
+    ara: Option<(usize, usize)>,
+}
+
+struct Retired {
+    hosted: Box<dyn Hosted>,
+    frames: u32,
+    /// Its ARA document and extension, released once the handle is gone.
+    ara: Option<(usize, NonNull<c_void>)>,
 }
 
 pub struct Devices {
@@ -39,7 +49,7 @@ pub struct Devices {
     pub choices: Vec<PluginChoice>,
     live: HashMap<u64, Live>,
     /// Handles whose nodes a plan is removing: (handle, frames left).
-    retired: Vec<(Box<dyn Hosted>, u32)>,
+    retired: Vec<Retired>,
     /// Ids removed from the engine but not yet sent in a plan.
     removing: Vec<NodeId>,
     /// Last state of removed devices, so an undo brings back what was there.
@@ -102,11 +112,13 @@ impl Devices {
         }
     }
 
-    /// Makes the plugin for picker entry `choice`, ready to insert as device `uid`.
+    /// Makes the plugin for picker entry `choice`, ready to insert as device `uid`
+    /// on `track` (where an ARA plug-in renders).
     pub fn create(
         &mut self,
         choice: usize,
         uid: u64,
+        track: usize,
         sample_rate: f32,
         max_block: usize,
     ) -> Result<Device, String> {
@@ -124,13 +136,14 @@ impl Devices {
             name: a.info.name.clone(),
             state: Vec::new(),
         };
-        self.instantiate(&device, sample_rate, max_block)?;
+        self.instantiate(&device, track, sample_rate, max_block)?;
         Ok(device)
     }
 
     fn instantiate(
         &mut self,
         d: &Device,
+        track: usize,
         sample_rate: f32,
         max_block: usize,
     ) -> Result<(), String> {
@@ -155,16 +168,18 @@ impl Devices {
                         self.ara.len() - 1
                     }
                 };
-                let controller = self.ara[doc].controller_ref();
+                let document = &mut self.ara[doc];
+                let controller = document.controller_ref();
                 let made = self.catalog.instantiate_ara(
                     to_host(d.format),
                     d.bundle.as_deref(),
                     &d.id,
                     sample_rate,
                     max_block,
-                    controller,
+                    // SAFETY: the extension of this new instance, before activation.
+                    (controller, &mut |ext| unsafe { document.bind(track, ext) }),
                 )?;
-                Ok((made, Some((doc, None))))
+                Ok((made, Some((doc, track))))
             }
         });
         let ((mut hosted, node), ara) = match made {
@@ -200,32 +215,27 @@ impl Devices {
     /// Matches the live plugins to the project: makes missing ones (a loaded
     /// project, an undone removal) and retires ones no longer there. Returns errors.
     pub fn sync(&mut self, project: &Project, sample_rate: f32, max_block: usize) -> Vec<String> {
-        let wanted: Vec<&Device> = project.tracks.iter().flat_map(|t| &t.devices).collect();
+        let wanted: Vec<(usize, &Device)> = project
+            .tracks
+            .iter()
+            .enumerate()
+            .flat_map(|(ti, t)| t.devices.iter().map(move |d| (ti, d)))
+            .collect();
         let gone: Vec<u64> = self
             .live
             .keys()
-            .filter(|uid| !wanted.iter().any(|d| d.uid == **uid))
+            .filter(|uid| !wanted.iter().any(|(_, d)| d.uid == **uid))
             .copied()
             .collect();
         for uid in gone {
-            self.close_editor(uid);
-            self.unbind_ara(uid);
-            let mut live = self.live.remove(&uid).expect("listed above");
-            if let Ok(state) = live.hosted.save_state() {
-                self.removed_state.insert(uid, state);
-            }
-            if live.node.is_none() {
-                self.removing.push(live.id);
-            }
-            self.free.push(live.id.0);
-            self.retired.push((live.hosted, RETIRE_FRAMES));
+            self.retire(uid);
         }
         self.failed
-            .retain(|uid| wanted.iter().any(|d| d.uid == *uid));
+            .retain(|uid| wanted.iter().any(|(_, d)| d.uid == *uid));
         let mut errors = Vec::new();
-        for d in wanted {
+        for (track, d) in wanted {
             if !self.live.contains_key(&d.uid) && !self.failed.contains(&d.uid) {
-                if let Err(e) = self.instantiate(d, sample_rate, max_block) {
+                if let Err(e) = self.instantiate(d, track, sample_rate, max_block) {
                     self.failed.insert(d.uid);
                     errors.push(e);
                 }
@@ -295,14 +305,29 @@ impl Devices {
         self.live.get(&uid).is_some_and(|l| l.instrument)
     }
 
-    fn unbind_ara(&mut self, uid: u64) {
-        let Some(l) = self.live.get_mut(&uid) else {
+    /// Takes device `uid` out of the engine, keeping its state for an undo or a
+    /// remake; its handle goes once its node has left the engine.
+    fn retire(&mut self, uid: u64) {
+        self.close_editor(uid);
+        let Some(mut live) = self.live.remove(&uid) else {
             return;
         };
-        if let (Some((doc, Some(_))), Some(ext)) = (l.ara, l.hosted.ara_extension()) {
-            self.ara[doc].unbind(ext);
-            l.ara = Some((doc, None));
+        if let Ok(state) = live.hosted.save_state() {
+            self.removed_state.insert(uid, state);
         }
+        if live.node.is_none() {
+            self.removing.push(live.id);
+        }
+        self.free.push(live.id.0);
+        let ara = live
+            .ara
+            .zip(live.hosted.ara_extension())
+            .map(|((doc, _), ext)| (doc, ext));
+        self.retired.push(Retired {
+            hosted: live.hosted,
+            frames: RETIRE_FRAMES,
+            ara,
+        });
     }
 
     /// True if an ARA plug-in on `track` renders its clips, so the track node must
@@ -314,33 +339,32 @@ impl Devices {
             .any(|d| self.live.get(&d.uid).is_some_and(|l| l.ara.is_some()))
     }
 
-    /// Binds each ARA plug-in to its track and brings every document's playback
-    /// regions in line with those tracks' clips.
-    // shortcut: clip ids are (track, index), so moving a clip between tracks or
-    // reordering clips recreates its region and the plug-in's edits to it; give
-    // clips stable ids in the project when ARA editing is used for real.
+    /// Brings every ARA document's playback regions in line with the clips of the
+    /// tracks its plug-ins sit on. A renderer's regions can only be set before it
+    /// is activated, so ARA plug-ins whose track gained or lost regions, or which
+    /// moved to another track, are retired here and made again on the next sync.
+    // shortcut: clip ids are (track, index), so reordering clips recreates regions
+    // and the plug-in's edits to them; give clips stable ids for real ARA editing.
     // shortcut: ARA document archives are not saved with the project yet.
     pub fn sync_ara(&mut self, project: &Project, audio: &HashMap<PathBuf, Arc<SampleData>>) {
         if self.ara.is_empty() {
             return;
         }
         let mut clips: Vec<Vec<AraClip>> = (0..self.ara.len()).map(|_| Vec::new()).collect();
+        let mut remake = Vec::new();
         for (ti, track) in project.tracks.iter().enumerate() {
-            for d in &track.devices {
-                let Some(l) = self.live.get_mut(&d.uid) else {
-                    continue;
-                };
-                let (Some((doc, bound)), Some(ext)) = (l.ara, l.hosted.ara_extension()) else {
-                    continue;
-                };
-                if bound != Some(ti) {
-                    if bound.is_some() {
-                        self.ara[doc].unbind(ext);
+            let docs: Vec<usize> = track
+                .devices
+                .iter()
+                .filter_map(|d| {
+                    let (doc, bound) = self.live.get(&d.uid)?.ara?;
+                    if bound != ti {
+                        remake.push(d.uid);
                     }
-                    // SAFETY: the extension this instance was created bound with.
-                    unsafe { self.ara[doc].bind(ti, ext) };
-                    l.ara = Some((doc, Some(ti)));
-                }
+                    Some(doc)
+                })
+                .collect();
+            for doc in docs {
                 clips[doc].extend(track.clips.iter().enumerate().filter_map(|(ci, c)| {
                     Some(AraClip {
                         id: (ti as u64) << 32 | ci as u64,
@@ -354,8 +378,22 @@ impl Devices {
                 }));
             }
         }
-        for (doc, clips) in self.ara.iter_mut().zip(&clips) {
-            doc.sync(clips);
+        for (doc, (document, clips)) in self.ara.iter_mut().zip(&clips).enumerate() {
+            let mut clips = clips.clone();
+            clips.sort_by_key(|c| c.id);
+            clips.dedup_by_key(|c| c.id); // two ARA devices on one track
+            for track in document.sync(&clips) {
+                remake.extend(project.tracks.get(track).into_iter().flat_map(|t| {
+                    t.devices.iter().map(|d| d.uid).filter(|uid| {
+                        self.live
+                            .get(uid)
+                            .is_some_and(|l| l.ara.is_some_and(|a| a.0 == doc))
+                    })
+                }));
+            }
+        }
+        for uid in remake {
+            self.retire(uid);
         }
     }
 
@@ -503,10 +541,20 @@ impl Devices {
         if waiting {
             return;
         }
-        for (_, frames) in &mut self.retired {
-            *frames = frames.saturating_sub(1);
+        for r in &mut self.retired {
+            r.frames = r.frames.saturating_sub(1);
         }
-        self.retired.retain(|(_, frames)| *frames > 0);
+        let (done, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.retired)
+            .into_iter()
+            .partition(|r| r.frames == 0);
+        self.retired = waiting;
+        for r in done {
+            drop(r.hosted);
+            if let Some((doc, ext)) = r.ara {
+                // Only now may its regions go, if no other instance renders them.
+                self.ara[doc].release(ext);
+            }
+        }
     }
 }
 

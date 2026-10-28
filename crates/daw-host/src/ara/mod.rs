@@ -36,6 +36,10 @@ pub(crate) const ROLES: sys::ARAPlugInInstanceRoleFlags =
 pub(crate) const KNOWN_ROLES: sys::ARAPlugInInstanceRoleFlags =
     (sys::kARAPlaybackRendererRole | sys::kARAEditorRendererRole | sys::kARAEditorViewRole) as i32;
 
+/// What binding a new instance needs: the document controller ref, and the
+/// callback that gets the instance's ARA extension before activation.
+pub type AraBind<'a> = (*mut c_void, &'a mut dyn FnMut(NonNull<c_void>));
+
 /// A plug-in's ARA factory. Valid while the plug-in's library stays loaded,
 /// which the catalog guarantees for the life of the app.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -64,6 +68,9 @@ impl AraFactory {
         usable.then_some(Self(f))
     }
 
+    // shortcut: copies the whole 2.3 struct; a plug-in built on an older SDK has a
+    // smaller one (static data, so this reads its neighbours, not unmapped
+    // memory). Read fields one by one if that ever matters.
     fn get(&self) -> sys::ARAFactory {
         // SAFETY: checked in `from_raw`; a plain read of a `Copy` struct.
         unsafe { self.0.as_ptr().read_unaligned() }
@@ -121,7 +128,6 @@ struct Source {
     _host: Box<SourceHost>,
     source: sys::ARAAudioSourceRef,
     modification: sys::ARAAudioModificationRef,
-    _ids: [CString; 2],
 }
 
 struct Region {
@@ -131,7 +137,10 @@ struct Region {
     source: usize,
 }
 
-/// A plug-in instance's ARA side, bound to a document.
+/// A plug-in instance's ARA side, bound to a document, and the regions it was
+/// given before activation. ARA only lets a renderer's regions change while it
+/// is inactive, so they stay fixed for the instance's life; a track whose clips
+/// gain or lose regions gets a new instance instead (see `Document::sync`).
 struct Binding {
     track: usize,
     instance: NonNull<sys::ARAPlugInExtensionInstance>,
@@ -143,6 +152,8 @@ struct Archive {
     bytes: Vec<u8>,
     id: CString,
 }
+
+static NO_ASSERT: sys::ARAAssertFunction = None;
 
 pub struct Document {
     factory: AraFactory,
@@ -156,8 +167,10 @@ pub struct Document {
     sources: HashMap<usize, Source>,
     regions: HashMap<u64, Region>,
     bindings: Vec<Binding>,
+    /// Regions whose clip is gone, with their source key, kept until no
+    /// instance renders them.
+    orphans: Vec<(sys::ARAPlaybackRegionRef, usize)>,
     sample_rate: f64,
-    _names: Vec<CString>,
 }
 
 impl Document {
@@ -168,7 +181,8 @@ impl Document {
         let config = sys::ARAInterfaceConfiguration {
             structSize: size_of::<sys::ARAInterfaceConfiguration>(),
             desiredApiGeneration: factory.generation(),
-            assertFunctionAddress: ptr::null_mut(),
+            // Must point somewhere, even at no function.
+            assertFunctionAddress: ptr::addr_of!(NO_ASSERT).cast_mut(),
         };
         let init = f.initializeARAWithConfiguration.ok_or(HostError::NoAra)?;
         let create = f
@@ -232,8 +246,8 @@ impl Document {
             sources: HashMap::new(),
             regions: HashMap::new(),
             bindings: Vec::new(),
+            orphans: Vec::new(),
             sample_rate,
-            _names: vec![doc_name],
         };
         doc.edit(|d| {
             let name = c("Canary");
@@ -246,7 +260,6 @@ impl Document {
             // SAFETY: inside begin/endEditing.
             d.context =
                 unsafe { (d.dc().createMusicalContext.unwrap())(d.r(), ptr::null_mut(), &props) };
-            d._names.push(name);
         });
         Ok(doc)
     }
@@ -277,87 +290,134 @@ impl Document {
         unsafe { (dc.endEditing.unwrap())(self.r()) };
     }
 
-    /// Adds the plug-in instance a format bound to this document (see
-    /// `Hosted::ara_extension`) as the renderer of `track`'s clips.
+    /// Makes the instance a format just bound to this document (the `on_bind`
+    /// callback of `Catalog::instantiate_ara`) the renderer of `track`'s regions.
+    /// Call it only there: before the instance is activated, as ARA requires.
     ///
     /// # Safety
     /// `instance` must be the `ARAPlugInExtensionInstance` the plug-in returned
-    /// when bound to this document, and must stay valid until `unbind`.
+    /// when bound to this document, and must stay valid until `release`.
     pub unsafe fn bind(&mut self, track: usize, instance: NonNull<c_void>) {
-        self.bindings.push(Binding {
+        let regions: Vec<_> = self
+            .regions
+            .values()
+            .filter(|r| r.track == track)
+            .map(|r| r.region)
+            .collect();
+        let binding = Binding {
             track,
             instance: instance.cast(),
-            regions: Vec::new(),
-        });
-        self.render_regions();
+            regions,
+        };
+        // SAFETY: a live, not yet active extension instance (see above).
+        unsafe { add_to_renderer(&binding) };
+        self.bindings.push(binding);
     }
 
-    /// Removes `instance`'s regions before the plug-in instance goes.
-    pub fn unbind(&mut self, instance: NonNull<c_void>) {
-        if let Some(i) = self
+    /// Forgets an instance after it was destroyed, then destroys regions only it
+    /// still rendered. The plug-in handles instance-before-document teardown.
+    pub fn release(&mut self, instance: NonNull<c_void>) {
+        self.bindings.retain(|b| b.instance.cast() != instance);
+        let held: Vec<_> = self
             .bindings
             .iter()
-            .position(|b| b.instance.cast() == instance)
-        {
-            let mut b = self.bindings.remove(i);
-            set_renderer_regions(&mut b, &[]);
+            .flat_map(|b| b.regions.iter().copied())
+            .collect();
+        let free: Vec<_> = self
+            .orphans
+            .iter()
+            .map(|o| o.0)
+            .filter(|r| !held.contains(r))
+            .collect();
+        if free.is_empty() {
+            return;
         }
+        self.orphans.retain(|o| !free.contains(&o.0));
+        self.edit(|d| {
+            for region in free {
+                // SAFETY: inside editing; no renderer holds it.
+                unsafe { (d.dc().destroyPlaybackRegion.unwrap())(d.r(), region) };
+            }
+            d.drop_unused_sources();
+        });
     }
 
-    /// Makes the document match `clips`: one region sequence per track, one audio
-    /// source per audio file, one playback region per clip.
-    pub fn sync(&mut self, clips: &[AraClip]) {
+    /// Makes the document match `clips` (one region sequence per track, one audio
+    /// source per file, one playback region per clip) and returns the tracks whose
+    /// bound instances now render the wrong set of regions: their instances must
+    /// be replaced, since an active renderer's regions cannot change. Moved or
+    /// trimmed clips just update their region, which ARA allows while rendering.
+    pub fn sync(&mut self, clips: &[AraClip]) -> Vec<usize> {
         let gone: Vec<u64> = self
             .regions
             .keys()
             .filter(|id| !clips.iter().any(|c| c.id == **id))
             .copied()
             .collect();
-        // Renderers drop regions before the document destroys them.
-        let remaining: Vec<_> = self
-            .regions
-            .iter()
-            .filter(|(id, _)| !gone.contains(id))
-            .map(|(_, r)| (r.track, r.region))
-            .collect();
-        for b in &mut self.bindings {
-            let keep: Vec<_> = remaining
-                .iter()
-                .filter(|(t, _)| *t == b.track)
-                .map(|r| r.1)
-                .collect();
-            set_renderer_regions(b, &keep);
-        }
         self.edit(|d| {
-            let dc = d.dc();
             for id in gone {
                 if let Some(r) = d.regions.remove(&id) {
-                    // SAFETY: no renderer holds it any more.
-                    unsafe { (dc.destroyPlaybackRegion.unwrap())(d.r(), r.region) };
+                    d.retire(r.region, r.source);
                 }
             }
             for clip in clips {
                 d.place(clip);
             }
-            let used: Vec<usize> = d.regions.values().map(|r| r.source).collect();
-            let unused: Vec<usize> = d
-                .sources
-                .keys()
-                .filter(|k| !used.contains(k))
-                .copied()
-                .collect();
-            for key in unused {
-                if let Some(s) = d.sources.remove(&key) {
-                    // SAFETY: no region plays it; modification goes first.
-                    unsafe {
-                        (dc.destroyAudioModification.unwrap())(d.r(), s.modification);
-                        (dc.enableAudioSourceSamplesAccess.unwrap())(d.r(), s.source, 0);
-                        (dc.destroyAudioSource.unwrap())(d.r(), s.source);
-                    }
+            d.drop_unused_sources();
+        });
+        let mut stale: Vec<usize> = self
+            .bindings
+            .iter()
+            .filter(|b| {
+                let mut want: Vec<_> = self
+                    .regions
+                    .values()
+                    .filter(|r| r.track == b.track)
+                    .map(|r| r.region as usize)
+                    .collect();
+                let mut have: Vec<_> = b.regions.iter().map(|r| *r as usize).collect();
+                want.sort_unstable();
+                have.sort_unstable();
+                want != have
+            })
+            .map(|b| b.track)
+            .collect();
+        stale.dedup();
+        stale
+    }
+
+    /// Destroys a region now, or once no instance renders it. Inside editing.
+    fn retire(&mut self, region: sys::ARAPlaybackRegionRef, source: usize) {
+        if self.bindings.iter().any(|b| b.regions.contains(&region)) {
+            self.orphans.push((region, source));
+        } else {
+            // SAFETY: inside editing; no renderer holds it.
+            unsafe { (self.dc().destroyPlaybackRegion.unwrap())(self.r(), region) };
+        }
+    }
+
+    /// Destroys sources no region (live or orphaned) still plays. Inside editing.
+    fn drop_unused_sources(&mut self) {
+        let dc = self.dc();
+        let used: Vec<usize> = (self.regions.values().map(|r| r.source))
+            .chain(self.orphans.iter().map(|o| o.1))
+            .collect();
+        let unused: Vec<usize> = self
+            .sources
+            .keys()
+            .filter(|k| !used.contains(k))
+            .copied()
+            .collect();
+        for key in unused {
+            if let Some(s) = self.sources.remove(&key) {
+                // SAFETY: no region plays it; modification goes first.
+                unsafe {
+                    (dc.destroyAudioModification.unwrap())(self.r(), s.modification);
+                    (dc.enableAudioSourceSamplesAccess.unwrap())(self.r(), s.source, 0);
+                    (dc.destroyAudioSource.unwrap())(self.r(), s.source);
                 }
             }
-        });
-        self.render_regions();
+        }
     }
 
     /// Creates or updates the region for `clip`, and its source if new.
@@ -365,6 +425,7 @@ impl Document {
         let dc = self.dc();
         let key = Arc::as_ptr(&clip.audio) as usize;
         if !self.sources.contains_key(&key) {
+            // Only needed for the call: the plug-in copies what it keeps.
             let ids = [
                 c(&format!("canary.source.{key:x}")),
                 c(&format!("canary.mod.{key:x}")),
@@ -408,10 +469,8 @@ impl Document {
                     _host: host,
                     source,
                     modification,
-                    _ids: ids,
                 },
             );
-            self._names.push(name);
         }
         let sequence = self.sequence(clip.track);
         let rate = f64::from(clip.audio.sample_rate());
@@ -438,15 +497,9 @@ impl Document {
                 }
             }
             existing => {
-                if let Some((_, old)) = existing {
+                if let Some((source, old)) = existing {
                     // A clip now playing another file: ARA regions cannot move.
-                    for b in &mut self.bindings {
-                        let keep: Vec<_> =
-                            b.regions.iter().copied().filter(|r| *r != old).collect();
-                        set_renderer_regions(b, &keep);
-                    }
-                    // SAFETY: inside editing; no renderer holds it now.
-                    unsafe { (dc.destroyPlaybackRegion.unwrap())(self.r(), old) };
+                    self.retire(old, source);
                 }
                 // SAFETY: inside editing.
                 let region = unsafe {
@@ -467,7 +520,6 @@ impl Document {
                 );
             }
         }
-        self._names.push(name);
     }
 
     fn sequence(&mut self, track: usize) -> sys::ARARegionSequenceRef {
@@ -486,90 +538,44 @@ impl Document {
         let s =
             unsafe { (self.dc().createRegionSequence.unwrap())(self.r(), ptr::null_mut(), &props) };
         self.sequences.insert(track, s);
-        self._names.push(name);
         s
-    }
-
-    /// Gives each bound renderer exactly its track's regions.
-    fn render_regions(&mut self) {
-        for b in &mut self.bindings {
-            let want: Vec<_> = self
-                .regions
-                .values()
-                .filter(|r| r.track == b.track)
-                .map(|r| r.region)
-                .collect();
-            set_renderer_regions(b, &want);
-        }
-    }
-
-    /// The plug-in's document data, for saving with the project.
-    pub fn store(&self) -> Result<Vec<u8>, HostError> {
-        let mut archive = Archive {
-            bytes: Vec::new(),
-            id: CString::default(),
-        };
-        let writer = (&mut archive as *mut Archive).cast();
-        // SAFETY: `archive` outlives the call.
-        let ok = unsafe { (self.dc().storeDocumentToArchive.unwrap())(self.r(), writer) };
-        if ok == 0 {
-            return Err(HostError::State);
-        }
-        Ok(archive.bytes)
-    }
-
-    /// Restores document data saved by `store`. Call before `sync`.
-    pub fn restore(&mut self, bytes: &[u8]) -> Result<(), HostError> {
-        let f = self.factory.get();
-        let mut archive = Archive {
-            bytes: bytes.to_vec(),
-            id: CString::from(
-                // SAFETY: the factory's archive id is a NUL-terminated string.
-                unsafe { CStr::from_ptr(f.documentArchiveID) },
-            ),
-        };
-        let reader = (&mut archive as *mut Archive).cast();
-        let dc = self.dc();
-        // SAFETY: paired restore calls; `archive` outlives them.
-        let ok = unsafe {
-            (dc.beginRestoringDocumentFromArchive.unwrap())(self.r(), reader) != 0
-                && (dc.endRestoringDocumentFromArchive.unwrap())(self.r(), reader) != 0
-        };
-        ok.then_some(()).ok_or(HostError::State)
     }
 }
 
-/// Swaps a renderer's regions for `want`, removing before adding.
-fn set_renderer_regions(b: &mut Binding, want: &[sys::ARAPlaybackRegionRef]) {
-    // SAFETY: a live extension instance (see `Document::bind`).
-    let ext = unsafe { b.instance.as_ptr().read_unaligned() };
-    let Some(renderer) = NonNull::new(ext.playbackRendererInterface.cast_mut()) else {
-        return;
-    };
-    // SAFETY: the plug-in's interface for this instance.
-    let r = unsafe { renderer.as_ptr().read_unaligned() };
-    for old in b.regions.iter().filter(|o| !want.contains(o)) {
-        // SAFETY: added earlier, still alive.
-        unsafe { (r.removePlaybackRegion.unwrap())(ext.playbackRendererRef, *old) };
+/// Hands a fresh binding its regions.
+///
+/// # Safety
+/// The instance must be live and not yet active.
+unsafe fn add_to_renderer(b: &Binding) {
+    // SAFETY: per the caller; packed plug-in structs read unaligned, field by field.
+    unsafe {
+        let ext = b.instance.as_ptr();
+        let iface = ptr::addr_of!((*ext).playbackRendererInterface).read_unaligned();
+        let renderer = ptr::addr_of!((*ext).playbackRendererRef).read_unaligned();
+        let Some(iface) = NonNull::new(iface.cast_mut()) else {
+            return;
+        };
+        let add = ptr::addr_of!((*iface.as_ptr()).addPlaybackRegion).read_unaligned();
+        if let Some(add) = add {
+            for region in &b.regions {
+                add(renderer, *region);
+            }
+        }
     }
-    for new in want.iter().filter(|n| !b.regions.contains(n)) {
-        // SAFETY: a live region of the same document.
-        unsafe { (r.addPlaybackRegion.unwrap())(ext.playbackRendererRef, *new) };
-    }
-    b.regions = want.to_vec();
 }
 
 impl Drop for Document {
     fn drop(&mut self) {
-        for mut b in std::mem::take(&mut self.bindings) {
-            set_renderer_regions(&mut b, &[]);
-        }
+        // Instances may outlive the document at quit; ARA leaves that order to the
+        // plug-in, so regions go without being taken from their renderers.
+        self.bindings.clear();
         self.edit(|d| {
             let dc = d.dc();
             // SAFETY: tear down in reverse order of creation, inside editing.
             unsafe {
-                for r in d.regions.values() {
-                    (dc.destroyPlaybackRegion.unwrap())(d.r(), r.region);
+                let orphans = d.orphans.iter().map(|o| o.0);
+                for r in d.regions.values().map(|r| r.region).chain(orphans) {
+                    (dc.destroyPlaybackRegion.unwrap())(d.r(), r);
                 }
                 for s in d.sources.values() {
                     (dc.destroyAudioModification.unwrap())(d.r(), s.modification);
@@ -804,6 +810,238 @@ mod tests {
                 c"com.example.doc"
             );
         }
+    }
+
+    // A fake plug-in side that logs every call, to check the document's call order.
+    thread_local!(static LOG: std::cell::RefCell<Vec<String>> = Default::default());
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+
+    fn log(s: String) {
+        LOG.with(|l| l.borrow_mut().push(s));
+    }
+    fn take_log() -> Vec<String> {
+        LOG.with(|l| std::mem::take(&mut *l.borrow_mut()))
+    }
+    fn new_ref<T>(kind: &str) -> *mut T {
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        log(format!("create {kind} {n}"));
+        n as *mut T
+    }
+    fn id<T>(p: *mut T) -> usize {
+        p as usize
+    }
+
+    type R = sys::ARADocumentControllerRef;
+    unsafe extern "C" fn begin(_: R) {
+        log("begin".into());
+    }
+    unsafe extern "C" fn end(_: R) {
+        log("end".into());
+    }
+    unsafe extern "C" fn destroy_dc(_: R) {
+        log("destroy controller".into());
+    }
+    unsafe extern "C" fn new_context(
+        _: R,
+        _: sys::ARAMusicalContextHostRef,
+        _: *const sys::ARAMusicalContextProperties,
+    ) -> sys::ARAMusicalContextRef {
+        new_ref("context")
+    }
+    unsafe extern "C" fn drop_context(_: R, c: sys::ARAMusicalContextRef) {
+        log(format!("destroy context {}", id(c)));
+    }
+    unsafe extern "C" fn new_sequence(
+        _: R,
+        _: sys::ARARegionSequenceHostRef,
+        _: *const sys::ARARegionSequenceProperties,
+    ) -> sys::ARARegionSequenceRef {
+        new_ref("sequence")
+    }
+    unsafe extern "C" fn drop_sequence(_: R, s: sys::ARARegionSequenceRef) {
+        log(format!("destroy sequence {}", id(s)));
+    }
+    unsafe extern "C" fn new_source(
+        _: R,
+        _: sys::ARAAudioSourceHostRef,
+        _: *const sys::ARAAudioSourceProperties,
+    ) -> sys::ARAAudioSourceRef {
+        new_ref("source")
+    }
+    unsafe extern "C" fn access(_: R, s: sys::ARAAudioSourceRef, on: sys::ARABool) {
+        log(format!("access {} {on}", id(s)));
+    }
+    unsafe extern "C" fn drop_source(_: R, s: sys::ARAAudioSourceRef) {
+        log(format!("destroy source {}", id(s)));
+    }
+    unsafe extern "C" fn new_mod(
+        _: R,
+        _: sys::ARAAudioSourceRef,
+        _: sys::ARAAudioModificationHostRef,
+        _: *const sys::ARAAudioModificationProperties,
+    ) -> sys::ARAAudioModificationRef {
+        new_ref("modification")
+    }
+    unsafe extern "C" fn drop_mod(_: R, m: sys::ARAAudioModificationRef) {
+        log(format!("destroy modification {}", id(m)));
+    }
+    unsafe extern "C" fn new_region(
+        _: R,
+        _: sys::ARAAudioModificationRef,
+        _: sys::ARAPlaybackRegionHostRef,
+        _: *const sys::ARAPlaybackRegionProperties,
+    ) -> sys::ARAPlaybackRegionRef {
+        new_ref("region")
+    }
+    unsafe extern "C" fn update_region(
+        _: R,
+        r: sys::ARAPlaybackRegionRef,
+        _: *const sys::ARAPlaybackRegionProperties,
+    ) {
+        log(format!("update region {}", id(r)));
+    }
+    unsafe extern "C" fn drop_region(_: R, r: sys::ARAPlaybackRegionRef) {
+        log(format!("destroy region {}", id(r)));
+    }
+    unsafe extern "C" fn add_region(_: sys::ARAPlaybackRendererRef, r: sys::ARAPlaybackRegionRef) {
+        log(format!("render region {}", id(r)));
+    }
+    unsafe extern "C" fn init(_: *const sys::ARAInterfaceConfiguration) {
+        log("init".into());
+    }
+    unsafe extern "C" fn uninit() {
+        log("uninit".into());
+    }
+
+    struct Fake {
+        dc: sys::ARADocumentControllerInterface,
+        instance: sys::ARADocumentControllerInstance,
+        renderer: sys::ARAPlaybackRendererInterface,
+        ext: sys::ARAPlugInExtensionInstance,
+    }
+
+    thread_local!(static FAKE: std::cell::Cell<*const sys::ARADocumentControllerInstance> =
+        const { std::cell::Cell::new(ptr::null()) });
+
+    unsafe extern "C" fn create_dc(
+        _: *const sys::ARADocumentControllerHostInstance,
+        _: *const sys::ARADocumentProperties,
+    ) -> *const sys::ARADocumentControllerInstance {
+        FAKE.with(|f| f.get())
+    }
+
+    #[test]
+    fn document_keeps_ara_call_order_through_edits_and_teardown() {
+        let mut fake = Box::new(Fake {
+            dc: sys::ARADocumentControllerInterface {
+                structSize: size_of::<sys::ARADocumentControllerInterface>(),
+                destroyDocumentController: Some(destroy_dc),
+                beginEditing: Some(begin),
+                endEditing: Some(end),
+                createMusicalContext: Some(new_context),
+                destroyMusicalContext: Some(drop_context),
+                createRegionSequence: Some(new_sequence),
+                destroyRegionSequence: Some(drop_sequence),
+                createAudioSource: Some(new_source),
+                enableAudioSourceSamplesAccess: Some(access),
+                destroyAudioSource: Some(drop_source),
+                createAudioModification: Some(new_mod),
+                destroyAudioModification: Some(drop_mod),
+                createPlaybackRegion: Some(new_region),
+                updatePlaybackRegionProperties: Some(update_region),
+                destroyPlaybackRegion: Some(drop_region),
+                ..Default::default()
+            },
+            instance: Default::default(),
+            renderer: sys::ARAPlaybackRendererInterface {
+                structSize: size_of::<sys::ARAPlaybackRendererInterface>(),
+                addPlaybackRegion: Some(add_region),
+                removePlaybackRegion: None,
+            },
+            ext: Default::default(),
+        });
+        fake.instance.documentControllerInterface = &fake.dc;
+        fake.renderer.removePlaybackRegion = None; // must never be needed
+        fake.ext.playbackRendererInterface = &fake.renderer;
+        FAKE.with(|f| f.set(&fake.instance));
+        let factory = sys::ARAFactory {
+            structSize: size_of::<sys::ARAFactory>(),
+            lowestSupportedApiGeneration: sys::kARAAPIGeneration_2_0_Final as i32,
+            highestSupportedApiGeneration: sys::kARAAPIGeneration_2_3_Final as i32,
+            initializeARAWithConfiguration: Some(init),
+            uninitializeARA: Some(uninit),
+            createDocumentControllerWithDocument: Some(create_dc),
+            ..Default::default()
+        };
+        // SAFETY: a complete fake factory that outlives the document.
+        let factory = unsafe { AraFactory::from_raw((&factory as *const sys::ARAFactory).cast()) };
+        let mut doc = Document::new(factory.unwrap(), "test", 48_000.0).unwrap();
+        take_log();
+
+        let audio = |n| Arc::new(SampleData::new(48_000, vec![vec![0.5; n]]).unwrap());
+        let (one, two) = (audio(100), audio(200));
+        let clip = |id, audio: &Arc<SampleData>, start| AraClip {
+            id,
+            track: 0,
+            name: "c".into(),
+            audio: audio.clone(),
+            start,
+            offset: 0,
+            length: 50,
+        };
+        assert!(
+            doc.sync(&[clip(1, &one, 0), clip(2, &two, 100)]).is_empty(),
+            "no renderers yet"
+        );
+        let regions: Vec<String> = take_log()
+            .into_iter()
+            .filter_map(|l| l.strip_prefix("create region ").map(String::from))
+            .collect();
+        assert_eq!(regions.len(), 2);
+
+        let ext = NonNull::from(&fake.ext).cast();
+        // SAFETY: the fake extension, not active.
+        unsafe { doc.bind(0, ext) };
+        let mut rendered = take_log();
+        rendered.sort();
+        assert_eq!(
+            rendered,
+            regions
+                .iter()
+                .map(|r| format!("render region {r}"))
+                .collect::<Vec<_>>()
+        );
+
+        // Moving a clip updates it in place; removing one keeps its region while
+        // the renderer has it, and asks for the track's instance to be remade.
+        assert_eq!(doc.sync(&[clip(2, &two, 300)]), [0]);
+        let log = take_log();
+        assert!(log.iter().any(|l| l.starts_with("update region")));
+        assert!(!log.iter().any(|l| l.starts_with("destroy")), "{log:?}");
+
+        doc.release(ext);
+        let log = take_log();
+        let first = &regions[0];
+        let pos = |s: &str| {
+            log.iter()
+                .position(|l| l.starts_with(s))
+                .unwrap_or(usize::MAX)
+        };
+        assert_eq!(log.first().map(String::as_str), Some("begin"));
+        assert!(log.contains(&format!("destroy region {first}")), "{log:?}");
+        assert!(pos("destroy region") < pos("destroy modification"));
+        assert!(pos("destroy modification") < pos("access"));
+        assert!(pos("access") < pos("destroy source"));
+        assert_eq!(log.last().map(String::as_str), Some("end"));
+
+        drop(doc);
+        let log = take_log();
+        let pos = |s: &str| log.iter().position(|l| l.starts_with(s)).unwrap();
+        assert!(pos("destroy region") < pos("destroy source"));
+        assert!(pos("destroy source") < pos("destroy sequence"));
+        assert!(pos("destroy sequence") < pos("destroy context"));
+        assert!(pos("end") < pos("destroy controller"));
+        assert_eq!(log.last().map(String::as_str), Some("uninit"));
     }
 
     #[test]

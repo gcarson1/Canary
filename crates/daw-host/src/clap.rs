@@ -252,14 +252,15 @@ impl ClapPlugin {
         Self::new_ara(entry, id, sample_rate, max_block, None)
     }
 
-    /// As `new`, bound to ARA document controller `ara` first if given, since ARA
-    /// requires binding before the plugin is activated.
+    /// As `new`, bound to ARA document controller `ara.0` first if given, since
+    /// ARA requires binding before the plugin is activated; `ara.1` gets the
+    /// extension while the plugin is still inactive.
     pub fn new_ara(
         entry: &PluginEntry,
         id: &str,
         sample_rate: f32,
         max_block: usize,
-        ara: Option<*mut c_void>,
+        ara: Option<crate::ara::AraBind<'_>>,
     ) -> Result<(ClapPlugin, PluginNode), HostError> {
         let factory = entry.get_plugin_factory().ok_or(HostError::NoFactory)?;
         let unknown = || HostError::UnknownPlugin(id.to_owned());
@@ -317,7 +318,7 @@ impl ClapPlugin {
             max_frames_count: max_frames,
         };
         let ara = match ara {
-            Some(controller) => {
+            Some((controller, on_bind)) => {
                 let ext = ara_extension(&instance).ok_or(HostError::NoAra)?;
                 // SAFETY: the plugin's own extension, before activation as ARA asks.
                 let bound = unsafe {
@@ -328,7 +329,9 @@ impl ClapPlugin {
                         crate::ara::ROLES,
                     )
                 };
-                Some(NonNull::new(bound.cast_mut()).ok_or(HostError::NoAra)?)
+                let bound = NonNull::new(bound.cast_mut()).ok_or(HostError::NoAra)?;
+                on_bind(bound); // regions go to the renderer before activation
+                Some(bound)
             }
             None => None,
         };

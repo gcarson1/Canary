@@ -63,8 +63,9 @@ impl PreviewNode {
             Some(a) => match self.done.push(a) {
                 Ok(()) => true,
                 Err(rtrb::PushError::Full(a)) => {
+                    // Parked at its end: silent, handed back next block.
+                    self.pos = a.frames();
                     self.playing = Some(a);
-                    self.pos = usize::MAX;
                     false
                 }
             },
@@ -126,6 +127,7 @@ mod tests {
             num_samples: 4,
             playhead: 0,
             playing: false,
+            ..Default::default()
         };
         let (mut l, mut r) = ([9.0; 4], [9.0; 4]);
         node.process(&[], &mut [&mut l, &mut r], &[], &mut Vec::new(), &ctx);
@@ -135,5 +137,24 @@ mod tests {
         assert_eq!(Arc::strong_count(&audio), 2, "returned, not dropped");
         preview.collect();
         assert_eq!(Arc::strong_count(&audio), 1);
+    }
+
+    #[test]
+    fn a_full_return_queue_parks_the_sample_silently() {
+        let (mut node, mut preview) = PreviewNode::new();
+        let audio = Arc::new(SampleData::new(48_000, vec![vec![0.5; 2]]).unwrap());
+        let ctx = ProcessContext {
+            num_samples: 4,
+            ..Default::default()
+        };
+        let (mut l, mut r) = ([9.0; 4], [9.0; 4]);
+        // Fill the return queue without collecting, then keep playing.
+        for _ in 0..QUEUE * 3 {
+            let _ = preview.start.push(Some(audio.clone()));
+            node.process(&[], &mut [&mut l, &mut r], &[], &mut Vec::new(), &ctx);
+            node.process(&[], &mut [&mut l, &mut r], &[], &mut Vec::new(), &ctx);
+        }
+        assert!(l.iter().all(|s| s.is_finite()));
+        preview.collect();
     }
 }

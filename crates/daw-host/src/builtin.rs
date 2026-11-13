@@ -130,6 +130,7 @@ mod tests {
             num_samples: 48,
             playhead: 0,
             playing: true,
+            ..Default::default()
         };
         let input = [0.5f32; 64];
         let note = [MidiEvent {

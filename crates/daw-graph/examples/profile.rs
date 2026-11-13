@@ -28,6 +28,7 @@ fn time(name: &str, node: &mut dyn AudioNode, inputs: usize, notes: bool) {
                 num_samples: BLOCK,
                 playhead: (b * BLOCK) as u64,
                 playing: true,
+                ..Default::default()
             };
             // A new note every ~100 ms keeps the sampler's voices busy.
             let note = [MidiEvent {

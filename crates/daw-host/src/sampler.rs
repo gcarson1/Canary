@@ -447,6 +447,7 @@ mod tests {
             num_samples: 8,
             playhead: 0,
             playing: false,
+            ..Default::default()
         };
         let (mut l, mut r) = ([0.0; 8], [0.0; 8]);
         node.process(&[], &mut [&mut l, &mut r], &[], &mut Vec::new(), &ctx);

@@ -565,9 +565,9 @@ pub(crate) fn show(
         }
     }
 
-    let at = pattern.filter(|_| inputs.engine.playing).map_or(0, |p| {
-        project.ticks_at(inputs.engine.playhead) % p.length.max(1)
-    });
+    let at = pattern
+        .filter(|_| inputs.engine.playing)
+        .map(|p| project.ticks_at(inputs.engine.playhead) % p.length.max(1));
     keys_pressed(ws, ui, project, ti, stored, grid_ticks, at, out);
 }
 
@@ -580,8 +580,8 @@ fn keys_pressed(
     ti: usize,
     stored: &[Note],
     grid: u64,
-    // Where pasted notes go: the playhead's tick in the pattern (0 when stopped).
-    paste_at: u64,
+    // Where pasted notes go: the playhead's tick in the pattern while playing.
+    paste_at: Option<u64>,
     out: &mut Vec<Request>,
 ) {
     if ui.ctx().text_edit_focused() || ws.roll.gesture.is_some() {
@@ -623,9 +623,15 @@ fn keys_pressed(
                 })
             }
             Key::V if mods.command && !ws.roll.copied.is_empty() => {
-                // The copy's first note lands on the grid at the paste point.
+                // The copy's first note lands on the grid at the playhead, or,
+                // while stopped, right after the copied notes (never on them).
                 let first = ws.roll.copied.iter().map(|n| n.start).min().unwrap_or(0);
-                let to = paste_at / grid.max(1) * grid.max(1);
+                let last = ws.roll.copied.iter().map(|n| n.end()).max().unwrap_or(0);
+                let g = grid.max(1);
+                let to = match paste_at {
+                    Some(at) => at / g * g,
+                    None => last.div_ceil(g) * g,
+                };
                 let pasted: Vec<Note> = ws
                     .roll
                     .copied

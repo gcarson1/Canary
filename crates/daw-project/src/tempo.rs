@@ -144,6 +144,33 @@ impl Project {
         tick
     }
 
+    /// The tempo and meter as segments for the audio thread
+    /// (`daw_core::musical_at`): one at the start and at every change.
+    pub fn tempo_segments(&self) -> Vec<daw_core::TempoSegment> {
+        let mut ticks: Vec<u64> = std::iter::once(0)
+            .chain(self.tempos.iter().map(|c| c.tick))
+            .chain(self.meters().map(|m| self.bar_tick(u64::from(m.bar))))
+            .collect();
+        ticks.sort_unstable();
+        ticks.dedup();
+        ticks
+            .into_iter()
+            .map(|t| {
+                let at = self.bar_beat(t);
+                let bar = at.bar - 1;
+                daw_core::TempoSegment {
+                    at: self.samples_at(t),
+                    beats: t as f64 / PPQ as f64,
+                    bpm: self.bpm_at(t),
+                    bar: bar.min(i32::MAX as u64) as i32,
+                    bar_start: self.bar_tick(bar) as f64 / PPQ as f64,
+                    numerator: u16::from(at.meter.numerator),
+                    denominator: u16::from(at.meter.denominator),
+                }
+            })
+            .collect()
+    }
+
     /// Every beat before tick `end`, with `true` on each bar's first beat.
     pub fn beats(&self, end: u64) -> Vec<(u64, bool)> {
         let mut out = Vec::new();
@@ -266,6 +293,11 @@ mod tests {
         assert!(valid_meters(&p.meters));
         assert!(!valid_meters(&p.meters[1..]), "must start at bar 0");
         assert!(!valid_tempos(&[TempoChange { tick: 0, bpm: 90.0 }]));
+        let seg = p.tempo_segments();
+        assert_eq!(seg.len(), 2, "the start and the 7/8 bar");
+        let m = daw_core::musical_at(&seg, p.samples_at(8 * PPQ + 3 * eighth), 48_000.0);
+        assert_eq!((m.bar, m.numerator, m.denominator), (2, 7, 8));
+        assert!((m.beats - 9.5).abs() < 1e-9 && (m.bar_start - 8.0).abs() < 1e-9);
         let beats = p.beats(8 * PPQ + PPQ);
         assert_eq!(beats.len(), 8 + 2);
         assert_eq!(beats[8], (8 * PPQ, true));

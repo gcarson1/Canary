@@ -115,6 +115,7 @@ mod tests {
             num_samples: 100,
             playhead,
             playing,
+            ..Default::default()
         }
     }
 

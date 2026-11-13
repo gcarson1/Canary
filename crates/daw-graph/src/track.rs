@@ -208,6 +208,7 @@ mod tests {
                 num_samples: n,
                 playhead,
                 playing,
+                ..Default::default()
             },
         );
         (l, r)
@@ -330,6 +331,7 @@ mod tests {
                 num_samples: 4,
                 playhead: 0,
                 playing: false,
+                ..Default::default()
             },
         );
         let g = FRAC_PI_4.cos();

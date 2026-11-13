@@ -594,6 +594,40 @@ impl PluginNode {
     }
 }
 
+/// The host transport CLAP plugins sync to, from the block's context.
+fn transport(c: &ProcessContext) -> clack_host::events::event_types::TransportEvent {
+    use clack_host::events::event_types::{TransportEvent, TransportFlags};
+    use clack_host::events::{EventFlags, EventHeader};
+    use clack_host::utils::FixedPoint;
+    let m = c.musical;
+    let mut flags = TransportFlags::HAS_TEMPO
+        | TransportFlags::HAS_BEATS_TIMELINE
+        | TransportFlags::HAS_SECONDS_TIMELINE
+        | TransportFlags::HAS_TIME_SIGNATURE;
+    if c.playing {
+        flags |= TransportFlags::IS_PLAYING;
+    }
+    let zero = FixedPoint::from_int(0);
+    TransportEvent {
+        header: EventHeader::new_core(0, EventFlags::empty()),
+        flags,
+        song_pos_beats: FixedPoint::from_float(m.beats),
+        song_pos_seconds: FixedPoint::from_float(
+            c.playhead as f64 / f64::from(c.sample_rate.max(1.0)),
+        ),
+        tempo: m.bpm,
+        tempo_inc: 0.0,
+        loop_start_beats: zero,
+        loop_end_beats: zero,
+        loop_start_seconds: zero,
+        loop_end_seconds: zero,
+        bar_start: FixedPoint::from_float(m.bar_start),
+        bar_number: m.bar,
+        time_signature_numerator: m.numerator,
+        time_signature_denominator: m.denominator,
+    }
+}
+
 impl AudioNode for PluginNode {
     fn automate(&mut self, id: u32, value: f64) {
         self.automated.set(id, value);
@@ -655,7 +689,7 @@ impl AudioNode for PluginNode {
                         // Plugin output events are not used yet; void never allocates.
                         &mut OutputEvents::void(),
                         Some(self.steady_time),
-                        None,
+                        Some(&transport(context)),
                     )
                     .is_ok()
             }
@@ -711,6 +745,7 @@ mod tests {
             num_samples: n,
             playhead: 0,
             playing: true,
+            ..Default::default()
         }
     }
 

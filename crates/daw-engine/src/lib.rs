@@ -266,6 +266,7 @@ impl AudioEngine {
                             num_samples: frames,
                             playhead: self.transport.playhead(),
                             playing: rolling,
+                            ..Default::default()
                         },
                         now,
                     );

@@ -131,7 +131,11 @@ struct App {
     preview: Preview,
     /// A file to audition once it has loaded.
     preview_wanted: Option<PathBuf>,
+    preview_tx: mpsc::Sender<(PathBuf, Arc<SampleData>)>,
+    preview_rx: mpsc::Receiver<(PathBuf, Arc<SampleData>)>,
     last_autosave: Instant,
+    /// The revision last autosaved: nothing new, nothing to write.
+    autosaved: Option<u64>,
     /// The monitor mode and A/B reference to put back after an export.
     export_restore: Option<(MonitorMode, bool)>,
     /// The last export's format conversion, still running.
@@ -195,8 +199,12 @@ impl App {
         let mut history = if project_path.exists() {
             History::load(&project_path).map_err(|e| format!("{}: {e}", project_path.display()))?
         } else if template.exists() {
-            // A new project starts from the saved template (Cmd+Shift+T).
-            History::load(&template).unwrap_or_default()
+            // A new project starts from the saved template (Cmd+Shift+T), if it
+            // was made at the device's rate.
+            History::load(&template)
+                .ok()
+                .filter(|h| h.project().sample_rate == config.sample_rate)
+                .unwrap_or_default()
         } else {
             History::default()
         };
@@ -218,6 +226,7 @@ impl App {
         }
         let (loads_tx, loads_rx) = mpsc::channel();
         let (stretch_tx, stretch_rx) = mpsc::channel();
+        let (preview_tx, preview_rx) = mpsc::channel();
         let (master, monitor) = MasterNode::new(config.sample_rate as f32);
         let (preview_node, preview) = PreviewNode::new();
         let mut app = Self {
@@ -262,6 +271,7 @@ impl App {
             midi_take: None,
             export: None,
             last_autosave: Instant::now(),
+            autosaved: None,
             export_restore: None,
             converting: None,
             stretching: HashSet::new(),
@@ -272,6 +282,8 @@ impl App {
             preview_node: Some(Box::new(preview_node)),
             preview,
             preview_wanted: None,
+            preview_tx,
+            preview_rx,
             monitor,
             built_reference: None,
             reference_lufs: None,
@@ -288,14 +300,11 @@ impl App {
         }
         app.devices.restore_ara(app.history.project().ara.clone());
         // Work from a session that ended without saving.
-        let modified = |p: &Path| fs::metadata(p).and_then(|m| m.modified()).ok();
-        if let Some(auto) = modified(&app.autosave_path()) {
-            if modified(&app.project_path).is_none_or(|saved| auto > saved) {
-                app.ws.status = Some(Status {
-                    text: "AUTOSAVE FOUND · CMD+SHIFT+R RECOVERS IT".into(),
-                    error: false,
-                });
-            }
+        if app.autosave_is_newer() {
+            app.ws.status = Some(Status {
+                text: "AUTOSAVE FOUND · CMD+SHIFT+R RECOVERS IT".into(),
+                error: false,
+            });
         }
         Ok(app)
     }
@@ -754,6 +763,7 @@ impl App {
         self.built_sequences = sequences;
         self.built_loop = looping;
         plan.set_clicks(clicks.clone());
+        plan.set_tempo_map(self.history.project().tempo_segments());
         self.built_clicks = clicks;
         self.built_routing = routing(self.history.project());
         self.built_automation = self
@@ -869,7 +879,11 @@ impl App {
             Request::Play | Request::Seek(_) | Request::Listen(_) | Request::ToggleReference
                 if self.export.is_some() => {}
             Request::Play => command(self, Command::Play),
-            Request::Stop => command(self, Command::Stop),
+            Request::Stop => {
+                // Stop also silences an audition.
+                let _ = self.preview.play(None);
+                command(self, Command::Stop)
+            }
             Request::Seek(at) => {
                 // While a pattern loops, a seek lands inside it.
                 let at = into_loop(self.built_loop, at).unwrap_or(at);
@@ -889,8 +903,17 @@ impl App {
                     Some(p) => match self.audio.get(&p) {
                         Some(audio) => drop(self.preview.play(Some(audio.clone()))),
                         None => {
+                            // Loaded on its own, never kept: browsing must not
+                            // fill memory or rebuild the plan.
                             self.preview_wanted = Some(p.clone());
-                            self.load(p, None);
+                            let (tx, rate) = (self.preview_tx.clone(), self.view.sample_rate);
+                            thread::spawn(move || {
+                                let audio = daw_engine::load_audio(&p)
+                                    .and_then(|a| daw_engine::resample(&a, rate));
+                                if let Ok(audio) = audio {
+                                    let _ = tx.send((p, audio));
+                                }
+                            });
                         }
                     },
                     None => drop(self.preview.play(None)),
@@ -1491,6 +1514,12 @@ impl App {
         errors
     }
 
+    fn autosave_is_newer(&self) -> bool {
+        let modified = |p: &Path| fs::metadata(p).and_then(|m| m.modified()).ok();
+        modified(&self.autosave_path())
+            .is_some_and(|auto| modified(&self.project_path).is_none_or(|saved| auto > saved))
+    }
+
     /// Where unsaved work is written every minute.
     fn autosave_path(&self) -> PathBuf {
         self.project_path.with_extension("autosave.daw")
@@ -1501,10 +1530,12 @@ impl App {
         if !self.history.is_dirty()
             || self.export.is_some()
             || self.last_autosave.elapsed() < AUTOSAVE_EVERY
+            || self.autosaved == Some(self.history.revision())
         {
             return;
         }
         self.last_autosave = Instant::now();
+        self.autosaved = Some(self.history.revision());
         let _ = self.gather_state();
         if let Err(e) = self.history.save_copy(&self.autosave_path()) {
             self.error(format!("autosave failed: {e}"));
@@ -1514,11 +1545,19 @@ impl App {
     /// Replaces the project with its autosave (Cmd+Shift+R), as an edit away from
     /// the saved file.
     fn recover(&mut self) {
+        // Only an autosave newer than the saved project: recovering otherwise
+        // would throw away up to a minute of work with no undo.
+        if !self.autosave_is_newer() {
+            return self.error("no newer autosave to recover".into());
+        }
         let path = self.autosave_path();
         match History::load(&path) {
             Ok(h) if h.project().sample_rate == self.view.sample_rate => {
+                // Plugins are remade from the recovered state, not kept from the old.
+                self.devices.reset();
                 self.history = h;
                 self.history.mark_dirty();
+                self.devices.restore_ara(self.history.project().ara.clone());
                 let sources: Vec<PathBuf> = self
                     .history
                     .project()
@@ -1588,14 +1627,12 @@ impl eframe::App for App {
         self.receive_loads();
         self.receive_stretches();
         self.preview.collect();
-        if let Some(audio) = self
-            .preview_wanted
-            .as_ref()
-            .and_then(|p| self.audio.get(p))
-            .cloned()
-        {
-            self.preview_wanted = None;
-            self.preview.play(Some(audio));
+        while let Ok((path, audio)) = self.preview_rx.try_recv() {
+            // Only the latest file asked for; earlier ones just drop.
+            if self.preview_wanted.as_ref() == Some(&path) {
+                self.preview_wanted = None;
+                self.preview.play(Some(audio));
+            }
         }
         self.read_telemetry();
         self.tend_export();

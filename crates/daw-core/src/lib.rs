@@ -65,6 +65,9 @@ pub fn automation_value(points: &[AutoPoint], at: u64) -> Option<f64> {
 /// Per-block information passed to every `AudioNode::process` call.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ProcessContext {
+    /// Musical position at the block's first frame, for plugins that sync to
+    /// the host (tempo-synced delays and LFOs).
+    pub musical: Musical,
     pub sample_rate: f32,
     /// Frames in this tick. Every buffer passed to `process` is exactly this long;
     /// it can vary per callback, up to the plan's max block size.
@@ -86,6 +89,84 @@ impl Default for TimeSignature {
             numerator: 4,
             denominator: 4,
         }
+    }
+}
+
+impl Default for ProcessContext {
+    fn default() -> Self {
+        Self {
+            musical: Musical::default(),
+            sample_rate: 48_000.0,
+            num_samples: 0,
+            playhead: 0,
+            playing: false,
+        }
+    }
+}
+
+/// Where the transport is in musical time, at one sample.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Musical {
+    pub bpm: f64,
+    /// Quarter notes from the song's start.
+    pub beats: f64,
+    /// Where the current bar starts, in quarter notes.
+    pub bar_start: f64,
+    /// 0-based bar number.
+    pub bar: i32,
+    pub numerator: u16,
+    pub denominator: u16,
+    /// The loop region in quarter notes, while the transport loops.
+    pub looping: Option<(f64, f64)>,
+}
+
+impl Default for Musical {
+    fn default() -> Self {
+        Self {
+            bpm: 120.0,
+            beats: 0.0,
+            bar_start: 0.0,
+            bar: 0,
+            numerator: 4,
+            denominator: 4,
+            looping: None,
+        }
+    }
+}
+
+/// One stretch of constant tempo and meter, for working out `Musical` on the
+/// audio thread: from timeline sample `at`, at quarter note `beats`, bar `bar`
+/// (starting at quarter `bar_start`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TempoSegment {
+    pub at: u64,
+    pub beats: f64,
+    pub bpm: f64,
+    pub bar: i32,
+    pub bar_start: f64,
+    pub numerator: u16,
+    pub denominator: u16,
+}
+
+/// The musical position at `sample`, from segments sorted by `at` (the first at
+/// 0). No allocation.
+pub fn musical_at(segments: &[TempoSegment], sample: u64, sample_rate: f32) -> Musical {
+    let i = segments.partition_point(|s| s.at <= sample);
+    let Some(seg) = i.checked_sub(1).map(|i| segments[i]) else {
+        return Musical::default();
+    };
+    let beats =
+        seg.beats + (sample - seg.at) as f64 * seg.bpm / (60.0 * f64::from(sample_rate.max(1.0)));
+    let bar_len = f64::from(seg.numerator) * 4.0 / f64::from(seg.denominator.max(1));
+    let bars = ((beats - seg.bar_start) / bar_len).floor().max(0.0);
+    Musical {
+        bpm: seg.bpm,
+        beats,
+        bar_start: seg.bar_start + bars * bar_len,
+        bar: seg.bar + bars as i32,
+        numerator: seg.numerator,
+        denominator: seg.denominator,
+        looping: None,
     }
 }
 

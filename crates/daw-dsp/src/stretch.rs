@@ -21,7 +21,8 @@ pub fn time_stretch(channels: &[Vec<f32>], ratio: f64) -> Vec<Vec<f32>> {
 /// `time_stretch` without the user-facing limits (pitch shifting stretches
 /// past them before resampling back).
 fn stretch_by(channels: &[Vec<f32>], ratio: f64) -> Vec<Vec<f32>> {
-    let ratio = ratio.clamp(0.1, 10.0);
+    // Every allowed stretch times every allowed pitch: 0.25/4 .. 4*4.
+    let ratio = ratio.clamp(0.0625, 16.0);
     let len = channels.first().map_or(0, Vec::len);
     let out_len = (len as f64 * ratio).round() as usize;
     if len == 0 || (ratio - 1.0).abs() < 1e-9 {
@@ -166,5 +167,11 @@ mod tests {
         let f = crossings(&out[0][4_096..44_000]);
         assert!((f - 440.0).abs() < 10.0, "{f} Hz");
         assert_eq!(stretch_and_pitch(&input, 1.0, 0.0), input);
+        // The far corner: four times as long and two octaves up.
+        let mono = vec![sine(110.0, 24_000)];
+        let out = stretch_and_pitch(&mono, 4.0, 24.0);
+        assert_eq!(out[0].len(), 96_000);
+        let f = crossings(&out[0][8_192..88_000]);
+        assert!((f - 440.0).abs() < 12.0, "{f} Hz");
     }
 }

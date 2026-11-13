@@ -306,6 +306,7 @@ mod tests {
             num_samples: n,
             playhead: 0,
             playing: true,
+            ..Default::default()
         }
     }
 

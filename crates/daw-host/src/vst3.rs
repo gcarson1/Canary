@@ -1121,6 +1121,23 @@ impl AudioNode for Vst3Node {
         };
         let mut in_bus = bus(self.inputs.len(), &mut self.in_ptrs);
         let mut out_bus = bus(self.outputs.len(), &mut self.out_ptrs);
+        // The host transport, so tempo-synced plugins follow the song.
+        let m = context.musical;
+        use ProcessContext_::StatesAndFlags_ as flags;
+        // SAFETY: a plain C struct; zero is a valid value for every field.
+        let mut transport: vst3::Steinberg::Vst::ProcessContext = unsafe { std::mem::zeroed() };
+        transport.state = flags::kTempoValid
+            | flags::kProjectTimeMusicValid
+            | flags::kBarPositionValid
+            | flags::kTimeSigValid
+            | if context.playing { flags::kPlaying } else { 0 };
+        transport.sampleRate = f64::from(context.sample_rate);
+        transport.projectTimeSamples = context.playhead as i64;
+        transport.projectTimeMusic = m.beats;
+        transport.barPositionMusic = m.bar_start;
+        transport.tempo = m.bpm;
+        transport.timeSigNumerator = i32::from(m.numerator);
+        transport.timeSigDenominator = i32::from(m.denominator);
         let mut data = ProcessData {
             processMode: ProcessModes_::kRealtime as int32,
             symbolicSampleSize: SymbolicSampleSizes_::kSample32 as int32,
@@ -1147,7 +1164,7 @@ impl AudioNode for Vst3Node {
                 .as_com_ref::<IEventList>()
                 .map_or(ptr::null_mut(), |e| e.as_ptr()),
             outputEvents: ptr::null_mut(),
-            processContext: ptr::null_mut(),
+            processContext: &mut transport,
         };
         // SAFETY: every pointer in `data` lives until this call returns.
         let ok = unsafe { processor.process(&mut data) } == kResultOk;

@@ -453,6 +453,17 @@ impl Devices {
     }
 
     /// Saved ARA documents from the project, given back as their plug-ins load.
+    /// Retires every live device and forgets kept state, so the next `sync`
+    /// makes each one fresh from the project (a recovered autosave).
+    pub fn reset(&mut self) {
+        let uids: Vec<u64> = self.live.keys().copied().collect();
+        for uid in uids {
+            self.retire(uid);
+        }
+        self.removed_state.clear();
+        self.failed.clear();
+    }
+
     pub fn restore_ara(&mut self, archives: Vec<AraArchive>) {
         self.pending_ara = archives;
     }

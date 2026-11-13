@@ -2,7 +2,10 @@ use std::any::Any;
 use std::fmt;
 use std::mem;
 
-use daw_core::{automation_value, AutoPoint, MidiEvent, NodeId, ProcessContext, SeqEvent};
+use daw_core::{
+    automation_value, musical_at, AutoPoint, MidiEvent, NodeId, ProcessContext, SeqEvent,
+    TempoSegment,
+};
 
 use crate::sequence::NoteState;
 use crate::AudioNode;
@@ -131,6 +134,8 @@ pub struct ExecutionPlan {
     midi_in: Vec<MidiEvent>,
     /// Metronome beats by timeline sample; `data[0]` is 1 on a downbeat.
     clicks: Box<[SeqEvent]>,
+    /// Tempo and meter, so every node's context carries the musical position.
+    tempo: Box<[TempoSegment]>,
     inserts: Vec<(NodeId, Option<Box<dyn AudioNode>>)>,
     removals: Vec<NodeId>,
     /// Receives removed nodes on the audio thread; capacity reserved in `remove`.
@@ -154,6 +159,7 @@ impl ExecutionPlan {
             midi_out: Vec::with_capacity(MIDI_CAPACITY),
             midi_in: Vec::with_capacity(MIDI_CAPACITY),
             clicks: Box::default(),
+            tempo: Box::default(),
             inserts: Vec::new(),
             removals: Vec::new(),
             retired: Vec::new(),
@@ -270,6 +276,12 @@ impl ExecutionPlan {
             }
             None => false,
         }
+    }
+
+    /// The tempo map nodes see through `ProcessContext::musical` (plugins that
+    /// sync to the host read it).
+    pub fn set_tempo_map(&mut self, segments: Vec<TempoSegment>) {
+        self.tempo = segments.into_boxed_slice();
     }
 
     /// The metronome's beats while this plan plays: timeline samples, with
@@ -416,6 +428,16 @@ impl ExecutionPlan {
     /// `context.num_samples` must not exceed `max_block`. `midi` is this block's live
     /// input, offsets below `num_samples` and in order; it goes to `route_midi` steps.
     pub fn process(&mut self, arena: &mut NodeArena, context: &ProcessContext, midi: &[MidiEvent]) {
+        let with_music;
+        let context = if self.tempo.is_empty() {
+            context
+        } else {
+            with_music = ProcessContext {
+                musical: musical_at(&self.tempo, context.playhead, context.sample_rate),
+                ..*context
+            };
+            &with_music
+        };
         let n = context.num_samples;
         assert!(n <= self.max_block, "block of {n} frames exceeds plan max");
         debug_assert!(midi.iter().all(|e| (e.sample_offset as usize) < n.max(1)));
@@ -683,6 +705,7 @@ mod tests {
             num_samples: n,
             playhead: 0,
             playing: true,
+            ..Default::default()
         }
     }
 

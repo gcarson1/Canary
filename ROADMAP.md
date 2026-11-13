@@ -72,3 +72,51 @@ The UI follows Styles.md whichever framework is chosen.
 - [x] Sampler: one-shot/classic/slice modes (transient, grid, manual), slice to pads, key and velocity zones, round robin. Built-in `Sampler` instrument: drop files from 01 (Shift round robin, Option velocity zone, Cmd key zone), click the waveform to add slice points, right-click to remove. Press a pad to hear it; pads and the first MIDI input play the selected track's instrument
 - [x] Metering and QC: LUFS (integrated/short-term), oversampled true peak, delta monitoring, mid/side, level-matched A/B reference. Master dock: LUFS_I (click resets), TRUE_PEAK_DBTP, M/S/CORR, ST/MID/SIDE, A/B REF (drop a file from 01 on the dock; right-click clears). Delta is each effect's DELTA
 - [x] Plugin GUIs drawn through Metal; SIMD where profiling shows a hot loop. EDIT on a rack module opens the plugin's own editor (AU, VST3, CLAP) in a layer-backed window composited on Metal; every Apple AU opens (`editor_check` example). VST3/CLAP editors are untested on real plugins (none installed); the CLAP editor call order is unit-tested. `daw-graph/examples/profile.rs` found the hot loops: true-peak FIR vectorized as 4 lanes, saturator transcendentals halved
+
+### Phase 6: Patterns, Step Sequencer and Piano Roll
+- [ ] Note model in `daw-project`: notes in ticks (960 PPQ) with key, velocity and length; FL-style patterns (each track holds its own notes per pattern); pattern clips placed on playlist rows; undoable actions for all of it
+- [ ] Sequenced MIDI in the engine: a step's note sequence (timeline samples) merges with live MIDI, sample-accurate, no allocation; held notes are released on stop, seek, loop wrap and sequence changes
+- [ ] Transport loop (`Command::SetLoop`): blocks split exactly at the loop end. PAT mode loops the current pattern; SONG mode plays the playlist
+- [ ] View router in the top bar (SEQUENCER, PLAYLIST, PIANO ROLL) with pattern selector (`PAT 01`) and PAT/SONG switch
+- [ ] Step sequencer: 16-step matrix per track with velocity lane, pattern length in steps
+- [ ] Piano roll: draw, move, resize, delete, select (box and shift), velocity lane, snap, keyboard preview, zoom/scroll
+- [ ] MIDI editing: quantize, transpose, duplicate, legato, velocity scale and humanize
+- [ ] Standard MIDI file import and export (`.mid`, format 0/1)
+- [ ] MIDI recording into the current pattern (quantize optional)
+
+### Phase 7: Time, Automation and Transport
+- [ ] Tempo map and time-signature map (`daw-project`), ticks ↔ samples through it everywhere; the bar:beat clock and grid follow it
+- [ ] Loop region on the playlist, metronome (accented downbeat), count-in, punch in/out
+- [ ] Automation lanes: track gain/pan/mute and any plugin or built-in parameter, breakpoints with curve shapes, applied per block chunk on the audio thread; draw/edit in the playlist and piano roll lanes; record automation from the rack (latch/touch)
+- [ ] Transport info to plugins (tempo, position, playing, loop) for CLAP, VST3 and AU; ARA content access for the tempo map
+- [ ] Plugin delay compensation for sequenced instruments (notes scheduled early by the instrument path's latency)
+
+### Phase 8: Mixer and Routing
+- [ ] MIXER view: channel strips with ladder faders, pan dials, meters, M/S, insert slots, send knobs
+- [ ] Buses: group/folder buses, track output assignment, aux sends (pre/post fader) to return buses
+- [ ] Sidechain: built-in compressor key input from any track; plugins with a sidechain bus
+- [ ] Per-track peak meters and a CPU/DSP load readout
+- [ ] Freeze (render a track through its devices to audio, devices unloaded) and bounce in place
+- [ ] Input monitoring and per-track record arm; duplex recording with input/output latency compensation
+
+### Phase 9: Audio Editing
+- [ ] Clip gain, reverse, fade handles and crossfades in the playlist; slice to new clips; consolidate
+- [ ] Time-stretch and pitch-shift (offline, high quality, formant-safe for vocals) and stretch-to-tempo for loops
+- [ ] Warp markers (audio follows the tempo map)
+- [ ] Loop recording into takes; take lanes; comping by swiping regions; flatten comp
+- [ ] Audio-to-MIDI (monophonic pitch, drum transients to notes)
+
+### Phase 10: Built-in Instruments and Effects
+- [ ] Subtractive synth (2 oscillators + sub/noise, multimode filter, 2 ADSRs, LFO, unison, glide) with presets
+- [ ] Drum machine on the sampler (kits on pads, per-pad choke and tune)
+- [ ] Effects: parametric EQ (8 bands, analyzer), reverb (algorithmic), delay (tempo-synced, ping-pong), chorus/flanger/phaser, limiter (true-peak, lookahead), gate/expander, filter, bitcrusher, stereo imager, utility (gain/phase/mono)
+- [ ] MIDI effects: arpeggiator, chord, scale lock, note repeat
+- [ ] Device presets (save/load per built-in device)
+
+### Phase 11: Projects, Export and Polish
+- [ ] Export: WAV/AIFF/FLAC (16/24/32-bit, any rate, dither), MP3/AAC through macOS, stems per track/bus, export a range, offline faster than real time
+- [ ] Project templates (new project from template), autosave and crash recovery, collect-and-save (copy samples into the project folder), relative sample paths
+- [ ] Preferences: audio device, sample rate and buffer size, all MIDI inputs, theme (dark/daylight), UI scale
+- [ ] Keyboard shortcuts for every tool and view; copy/paste of clips and notes; marquee select in the playlist; undo/redo covers every edit
+- [ ] Browser: preview samples on click, favorites, search across folders, plugin browser
+- [ ] Multi-core DSP: independent branches run on a real-time worker pool

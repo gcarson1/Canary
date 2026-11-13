@@ -11,7 +11,10 @@ use serde::{Deserialize, Serialize};
 
 pub mod edit;
 mod notes;
+pub mod smf;
+mod tempo;
 pub use notes::{sorted, Note, Pattern, PatternClip, PatternNotes, Playback, MAX_TICKS, PPQ, STEP};
+pub use tempo::{valid_meters, valid_tempos, BarBeat, MeterChange, TempoChange};
 
 /// Bumped when the file format changes incompatibly.
 const FORMAT_VERSION: u32 = 1;
@@ -32,6 +35,12 @@ pub struct Project {
     /// FL-style patterns; each track keeps its own notes for each.
     #[serde(default)]
     pub patterns: Vec<Pattern>,
+    /// Tempo changes after the start (`bpm` holds from tick 0), by rising tick.
+    #[serde(default)]
+    pub tempos: Vec<TempoChange>,
+    /// Time signatures by rising bar, the first at bar 0; empty means 4/4.
+    #[serde(default)]
+    pub meters: Vec<MeterChange>,
 }
 
 /// An ARA plug-in's document state as it wrote it.
@@ -54,6 +63,8 @@ impl Default for Project {
             reference: None,
             ara: Vec::new(),
             patterns: Vec::new(),
+            tempos: Vec::new(),
+            meters: Vec::new(),
         }
     }
 }
@@ -238,6 +249,10 @@ pub enum Action {
         from: usize,
         to: usize,
     },
+    /// Replaces the tempo changes after the start.
+    SetTempoMap(Vec<TempoChange>),
+    /// Replaces the time signatures.
+    SetMeters(Vec<MeterChange>),
     InsertPattern {
         index: usize,
         pattern: Pattern,
@@ -489,6 +504,18 @@ impl Action {
                     from: to,
                     to: from,
                 }
+            }
+            SetTempoMap(changes) => {
+                if !valid_tempos(&changes) {
+                    return Err(ActionError::BadTempo);
+                }
+                SetTempoMap(std::mem::replace(&mut p.tempos, changes))
+            }
+            SetMeters(changes) => {
+                if !valid_meters(&changes) {
+                    return Err(ActionError::BadValue);
+                }
+                SetMeters(std::mem::replace(&mut p.meters, changes))
             }
             InsertPattern { index, pattern } => {
                 if !pattern.is_valid() {
@@ -773,7 +800,9 @@ impl History {
         let mut ids: Vec<u64> = p.patterns.iter().map(|q| q.id).collect();
         ids.sort_unstable();
         unique &= ids.windows(2).all(|w| w[0] != w[1]);
-        let musical = p.patterns.iter().all(Pattern::is_valid)
+        let musical = valid_tempos(&p.tempos)
+            && valid_meters(&p.meters)
+            && p.patterns.iter().all(Pattern::is_valid)
             && p.tracks.iter().all(|t| {
                 // One note list per pattern, or removing a pattern leaves notes behind.
                 let mut lists: Vec<u64> = t.notes.iter().map(|n| n.pattern).collect();
@@ -852,6 +881,15 @@ mod tests {
         for action in [
             Action::SetTempo(140.0),
             Action::SetReference(Some("/refs/master.wav".into())),
+            Action::SetTempoMap(vec![TempoChange {
+                tick: 4 * PPQ,
+                bpm: 90.0,
+            }]),
+            Action::SetMeters(vec![MeterChange {
+                bar: 0,
+                numerator: 3,
+                denominator: 4,
+            }]),
             Action::InsertTrack {
                 index: 0,
                 track: Track::new("Drums"),

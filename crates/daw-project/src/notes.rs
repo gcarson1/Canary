@@ -103,18 +103,6 @@ impl Project {
         self.patterns.iter().find(|p| p.id == id)
     }
 
-    /// Timeline samples at tick `ticks`, at the project tempo.
-    pub fn samples_at(&self, ticks: u64) -> u64 {
-        let per_tick = 60.0 * f64::from(self.sample_rate) / (self.bpm * PPQ as f64);
-        (ticks as f64 * per_tick).round() as u64
-    }
-
-    /// The tick at timeline sample `sample` (rounded down).
-    pub fn ticks_at(&self, sample: u64) -> u64 {
-        let per_sample = self.bpm * PPQ as f64 / (60.0 * f64::from(self.sample_rate));
-        (sample as f64 * per_sample + 1e-6).floor() as u64
-    }
-
     /// The MIDI that `track`'s instrument plays, in timeline samples, sorted with
     /// note-offs before note-ons at the same sample. In pattern mode the pattern
     /// starts at 0 (the engine loops it); notes past the pattern's end are cut.

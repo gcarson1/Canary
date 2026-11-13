@@ -19,13 +19,15 @@ use std::mem;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use daw_core::{Command, ProcessContext, Telemetry};
+use daw_core::{Command, ProcessContext, SeqEvent, Telemetry};
 use daw_graph::{ExecutionPlan, LiveNodes, NodeArena, PlanError};
 use midi::{midi_queue, MidiReceiver};
 use rtrb::{Consumer, Producer, RingBuffer};
 
 /// Plans waiting to be swapped in, and retired plans waiting to be dropped.
 const PLAN_QUEUE_CAPACITY: usize = 8;
+/// Live MIDI events the audio thread logs for recording, between main-thread reads.
+const MIDI_LOG_CAPACITY: usize = 4096;
 
 /// Main-thread side of the engine queues.
 pub struct EngineHandle {
@@ -34,6 +36,11 @@ pub struct EngineHandle {
     /// Live MIDI input for steps added with `ExecutionPlan::route_midi`. Take it to
     /// hand to `connect_midi` or another MIDI source.
     pub midi: Option<MidiSender>,
+    /// Every live MIDI event played while the transport runs, at the timeline
+    /// sample the performer heard it against (one callback earlier than it plays,
+    /// since live input lands a block late). Drain it often; a full log drops
+    /// events. MIDI recording reads it.
+    pub midi_log: Consumer<SeqEvent>,
     plans: Producer<Box<ExecutionPlan>>,
     garbage: Consumer<Box<ExecutionPlan>>,
     /// Nodes the audio thread will hold once every queued plan is applied.
@@ -106,6 +113,7 @@ pub struct AudioEngine {
     plans: Consumer<Box<ExecutionPlan>>,
     garbage: Producer<Box<ExecutionPlan>>,
     midi: MidiReceiver,
+    midi_log: Producer<SeqEvent>,
     plan: Option<Box<ExecutionPlan>>,
     nodes: NodeArena,
     transport: Transport,
@@ -121,12 +129,14 @@ pub fn engine(capacity: usize, sample_rate: f32) -> (EngineHandle, AudioEngine) 
     let (plan_tx, plan_rx) = RingBuffer::new(PLAN_QUEUE_CAPACITY);
     let (garbage_tx, garbage_rx) = RingBuffer::new(PLAN_QUEUE_CAPACITY);
     let (midi_tx, midi_rx) = midi_queue();
+    let (log_tx, log_rx) = RingBuffer::new(MIDI_LOG_CAPACITY);
     let playhead = Arc::new(AtomicU64::new(0));
     (
         EngineHandle {
             commands: command_tx,
             telemetry: telemetry_rx,
             midi: Some(midi_tx),
+            midi_log: log_rx,
             plans: plan_tx,
             garbage: garbage_rx,
             live: LiveNodes::default(),
@@ -139,6 +149,7 @@ pub fn engine(capacity: usize, sample_rate: f32) -> (EngineHandle, AudioEngine) 
             plans: plan_rx,
             garbage: garbage_tx,
             midi: midi_rx,
+            midi_log: log_tx,
             plan: None,
             nodes: NodeArena::default(),
             transport: Transport::default(),
@@ -207,6 +218,17 @@ impl AudioEngine {
                         e.sample_offset -= first;
                     }
                     midi = later;
+                    if self.transport.is_playing() {
+                        // Heard against the timeline one callback earlier.
+                        let back = total as u64;
+                        for e in now.iter() {
+                            let at = self.transport.playhead() + u64::from(e.sample_offset);
+                            let _ = self.midi_log.push(SeqEvent {
+                                at: at.saturating_sub(back),
+                                data: e.data,
+                            });
+                        }
+                    }
                     plan.process(
                         &mut self.nodes,
                         &ProcessContext {
@@ -831,6 +853,32 @@ mod tests {
         assert_no_alloc(|| audio.process(&mut block, 1));
 
         assert_eq!(seen.list(), [(0, 5), (0, 63), (1, 0), (2, 2), (3, 7)]);
+    }
+
+    #[test]
+    fn live_midi_is_logged_at_the_heard_timeline_position_while_playing() {
+        let (mut handle, mut audio) = engine(16, 1_000.0);
+        let seen = Arc::<Seen>::default();
+        handle.send_plan(midi_probe_plan(&seen)).unwrap();
+        audio.midi.set_reference(0);
+        let tx = handle.midi.as_mut().unwrap();
+        tx.send_at(5_000_000, [0x90, 60, 100]);
+        let mut block = vec![0.0; 200];
+        audio.process(&mut block, 1); // stopped: nothing is logged
+        assert!(handle.midi_log.pop().is_err());
+
+        handle.commands.push(Command::Seek(1_000)).unwrap();
+        handle.commands.push(Command::Play).unwrap();
+        audio.midi.set_reference(0);
+        let tx = handle.midi.as_mut().unwrap();
+        tx.send_at(5_000_000, [0x90, 62, 90]);
+        tx.send_at(130_000_000, [0x80, 62, 0]);
+        assert_no_alloc(|| audio.process(&mut block, 1));
+        // Played at 1005 and 1130, heard one 200-frame callback earlier.
+        let logged: Vec<_> = std::iter::from_fn(|| handle.midi_log.pop().ok())
+            .map(|e| (e.at, e.data))
+            .collect();
+        assert_eq!(logged, [(805, [0x90, 62, 90]), (930, [0x80, 62, 0])]);
     }
 
     #[test]

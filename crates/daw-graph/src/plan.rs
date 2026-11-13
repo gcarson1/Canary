@@ -2,7 +2,7 @@ use std::any::Any;
 use std::fmt;
 use std::mem;
 
-use daw_core::{MidiEvent, NodeId, ProcessContext, SeqEvent};
+use daw_core::{automation_value, AutoPoint, MidiEvent, NodeId, ProcessContext, SeqEvent};
 
 use crate::sequence::NoteState;
 use crate::AudioNode;
@@ -72,6 +72,8 @@ struct Step {
     /// Notes the node plays with the transport, sorted by `at` (see `sequence`).
     sequence: Box<[SeqEvent]>,
     notes: NoteState,
+    /// Parameter envelopes applied to the node before each block.
+    automation: Vec<(u32, Box<[AutoPoint]>)>,
     /// Set by `set_latency`; otherwise read from this plan's inserted node, else 0.
     latency: Option<u32>,
     /// Compensation delays on this step's sources, in (input, source) order.
@@ -203,6 +205,7 @@ impl ExecutionPlan {
             takes_midi: false,
             sequence: Box::default(),
             notes: NoteState::default(),
+            automation: Vec::new(),
             latency: None,
             delays: Vec::new(),
         });
@@ -229,6 +232,19 @@ impl ExecutionPlan {
         };
         events.sort_by_key(|e| e.at);
         s.sequence = events.into_boxed_slice();
+        true
+    }
+
+    /// Moves `step`'s parameter `id` along `points` (timeline samples, sorted
+    /// here): the value at the playhead is set before every block, playing or
+    /// not, so a seek lands on the automated value. Returns false if there is no
+    /// such step.
+    pub fn automate(&mut self, step: StepId, id: u32, mut points: Vec<AutoPoint>) -> bool {
+        let Some(s) = self.steps.get_mut(step.0) else {
+            return false;
+        };
+        points.sort_by_key(|p| p.at);
+        s.automation.push((id, points.into_boxed_slice()));
         true
     }
 
@@ -385,6 +401,7 @@ impl ExecutionPlan {
                 delays,
                 sequence,
                 notes,
+                automation,
                 ..
             } = &mut rest[0];
 
@@ -423,6 +440,11 @@ impl ExecutionPlan {
                 }
                 continue;
             };
+            for (id, points) in automation.iter() {
+                if let Some(v) = automation_value(points, context.playhead) {
+                    node.automate(*id, v);
+                }
+            }
             self.midi_out.clear();
             let live = if *takes_midi { midi } else { &[] };
             let midi_in = if sequence.is_empty() && notes.is_idle() {
@@ -775,6 +797,55 @@ mod tests {
             outputs[0].fill(midi_in.len() as f32);
         }
         fn reset(&mut self) {}
+    }
+
+    /// Outputs the last value automated on parameter 3.
+    struct Automatable(f32);
+
+    impl AudioNode for Automatable {
+        fn process(
+            &mut self,
+            _inputs: &[&[f32]],
+            outputs: &mut [&mut [f32]],
+            _midi_in: &[MidiEvent],
+            _midi_out: &mut Vec<MidiEvent>,
+            _context: &ProcessContext,
+        ) {
+            outputs[0].fill(self.0);
+        }
+
+        fn automate(&mut self, id: u32, value: f64) {
+            if id == 3 {
+                self.0 = value as f32;
+            }
+        }
+
+        fn reset(&mut self) {}
+    }
+
+    #[test]
+    fn automation_sets_the_value_at_the_playhead_each_block() {
+        let mut arena = NodeArena::default();
+        let mut plan = ExecutionPlan::new(16);
+        plan.insert(NodeId(1), Box::new(Automatable(-1.0)));
+        let step = plan.add(NodeId(1), vec![], 1).unwrap();
+        let p = |at, value| AutoPoint {
+            at,
+            value,
+            curve: 0.0,
+        };
+        assert!(plan.automate(step, 3, vec![p(200, 1.0), p(100, 0.0)]));
+        assert!(!plan.automate(StepId(5), 3, vec![]));
+        arena.apply(&mut plan);
+        for (playhead, want) in [(0, 0.0), (150, 0.5), (175, 0.75), (999, 1.0)] {
+            let c = ProcessContext {
+                playhead,
+                playing: false, // automation follows the playhead even when stopped
+                ..ctx(16)
+            };
+            plan.process(&mut arena, &c, &[]);
+            assert_eq!(plan.output()[0][0], want, "at {playhead}");
+        }
     }
 
     #[test]

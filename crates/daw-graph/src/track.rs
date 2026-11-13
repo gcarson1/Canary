@@ -22,6 +22,9 @@ const SMOOTHING_SECONDS: f32 = 0.005;
 pub struct TrackNode {
     clips: Box<[Clip]>,
     params: Arc<TrackParams>,
+    /// Automated gain and pan, overriding the params while a plan automates them.
+    auto_gain: Option<f32>,
+    auto_pan: Option<f32>,
     left: Smoother,
     right: Smoother,
 }
@@ -30,10 +33,12 @@ impl TrackNode {
     /// Built on the main thread. Starts settled at the current parameter values so a
     /// rebuilt plan does not fade the track in.
     pub fn new(clips: Vec<Clip>, params: Arc<TrackParams>) -> Self {
-        let (left, right) = target_gains(&params);
+        let (left, right) = target_gains(&params, None, None);
         Self {
             clips: clips.into_boxed_slice(),
             params,
+            auto_gain: None,
+            auto_pan: None,
             left: Smoother::new(left),
             right: Smoother::new(right),
         }
@@ -41,19 +46,24 @@ impl TrackNode {
 }
 
 impl TrackNode {
+    /// Automation parameter ids: gain (linear) and pan (-1..=1).
+    pub const GAIN: u32 = 0;
+    pub const PAN: u32 = 1;
+
     /// Payload for `ExecutionPlan::update` that replaces a live track's clips.
     pub fn clips_update(clips: Vec<Clip>) -> Box<dyn Any + Send> {
         Box::new(clips.into_boxed_slice())
     }
 }
 
-/// Per-channel gains from the params: equal-power pan, zero when inaudible.
-fn target_gains(params: &TrackParams) -> (f32, f32) {
+/// Per-channel gains from the params (or their automated values): equal-power
+/// pan, zero when inaudible.
+fn target_gains(params: &TrackParams, gain: Option<f32>, pan: Option<f32>) -> (f32, f32) {
     if !params.is_audible() {
         return (0.0, 0.0);
     }
-    let angle = (params.pan() + 1.0) * FRAC_PI_4;
-    let gain = params.gain();
+    let angle = (pan.unwrap_or_else(|| params.pan()).clamp(-1.0, 1.0) + 1.0) * FRAC_PI_4;
+    let gain = gain.unwrap_or_else(|| params.gain()).max(0.0);
     (gain * angle.cos(), gain * angle.sin())
 }
 
@@ -97,7 +107,7 @@ impl AudioNode for TrackNode {
             }
         }
 
-        let (left, right) = target_gains(&self.params);
+        let (left, right) = target_gains(&self.params, self.auto_gain, self.auto_pan);
         self.left.set_time(SMOOTHING_SECONDS, context.sample_rate);
         self.right.set_time(SMOOTHING_SECONDS, context.sample_rate);
         self.left.set_target(left);
@@ -125,8 +135,19 @@ impl AudioNode for TrackNode {
         }
     }
 
+    fn automate(&mut self, id: u32, value: f64) {
+        let v = value as f32;
+        if v.is_finite() {
+            match id {
+                Self::GAIN => self.auto_gain = Some(v),
+                Self::PAN => self.auto_pan = Some(v),
+                _ => {}
+            }
+        }
+    }
+
     fn reset(&mut self) {
-        let (left, right) = target_gains(&self.params);
+        let (left, right) = target_gains(&self.params, self.auto_gain, self.auto_pan);
         self.left = Smoother::new(left);
         self.right = Smoother::new(right);
     }

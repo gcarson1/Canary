@@ -25,6 +25,43 @@ pub struct SeqEvent {
     pub data: [u8; 3],
 }
 
+/// One automation breakpoint at timeline position `at` (samples for the engine,
+/// ticks in the UI). `curve` bends the segment to the next point: 0 is straight,
+/// toward +1 it rises late, toward -1 early.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AutoPoint {
+    pub at: u64,
+    pub value: f64,
+    pub curve: f32,
+}
+
+/// How far along a segment bent by `curve` a point `x` (0..=1) of the way
+/// through it lands, 0..=1.
+pub fn curve_shape(x: f64, curve: f32) -> f64 {
+    let c = f64::from(curve);
+    if c.abs() < 1e-3 {
+        x
+    } else {
+        let k = 6.0 * c;
+        ((k * x).exp() - 1.0) / (k.exp() - 1.0)
+    }
+}
+
+/// An envelope's value at `at`: flat before the first point and after the last.
+/// `points` must be sorted by `at`. No allocation, so the audio thread may call it.
+pub fn automation_value(points: &[AutoPoint], at: u64) -> Option<f64> {
+    let after = points.partition_point(|p| p.at <= at);
+    match (after.checked_sub(1).map(|i| points[i]), points.get(after)) {
+        (None, None) => None,
+        (None, Some(b)) => Some(b.value),
+        (Some(a), None) => Some(a.value),
+        (Some(a), Some(b)) => {
+            let x = (at - a.at) as f64 / (b.at - a.at) as f64;
+            Some(a.value + (b.value - a.value) * curve_shape(x, a.curve))
+        }
+    }
+}
+
 /// Per-block information passed to every `AudioNode::process` call.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ProcessContext {
@@ -381,6 +418,21 @@ impl Drop for TrackParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn envelopes_hold_at_the_ends_and_bend_between_points() {
+        let p = |at, value, curve| AutoPoint { at, value, curve };
+        let pts = [p(100, 0.0, 0.5), p(200, 1.0, 0.0), p(300, 0.5, 0.0)];
+        assert_eq!(automation_value(&[], 5), None);
+        assert_eq!(automation_value(&pts, 0), Some(0.0));
+        assert_eq!(automation_value(&pts, 1_000), Some(0.5));
+        assert_eq!(automation_value(&pts, 250), Some(0.75));
+        assert_eq!(automation_value(&pts, 200), Some(1.0));
+        let mid = automation_value(&pts, 150).unwrap();
+        assert!(mid > 0.0 && mid < 0.5, "a positive curve rises late: {mid}");
+        let sym = curve_shape(0.5, -0.5) - (1.0 - curve_shape(0.5, 0.5));
+        assert!(sym.abs() < 1e-9);
+    }
 
     #[test]
     fn sample_data_rejects_ragged_or_empty_channels() {

@@ -244,6 +244,15 @@ fn cubic(x: &[f32], pos: f64, start: usize, end: usize) -> f32 {
 }
 
 impl AudioNode for SamplerNode {
+    /// Attack, release and gain only: the rest reshape the zones, which happens
+    /// on the main thread.
+    fn automate(&mut self, id: u32, value: f64) {
+        let id = id as usize;
+        if [ATTACK, RELEASE, GAIN].contains(&id) {
+            self.params.set(id, value as f32);
+        }
+    }
+
     /// Stereo out; a mono sample plays on both channels. Outputs past the second
     /// are zeroed.
     fn process(

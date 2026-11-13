@@ -22,7 +22,7 @@ use daw_dsp::{integrated_loudness, TruePeak};
 use daw_engine::{EngineHandle, MidiConnection, MidiSender, Recorder};
 use daw_graph::{ExecutionPlan, MasterNode, Monitor, MonitorMode, Source, TrackNode};
 use daw_host::LayerKind;
-use daw_project::{Action, ClipRef, History, Playback, Track};
+use daw_project::{Action, ClipRef, History, Lane, Playback, Target, Track};
 use daw_ui::{theme, EngineView, Inputs, Listen, Request, SampleDrop, Status, Workspace};
 use devices::Devices;
 
@@ -79,6 +79,7 @@ struct App {
     built_sequences: Vec<Vec<SeqEvent>>,
     built_loop: Option<(u64, u64)>,
     built_clicks: Vec<SeqEvent>,
+    built_automation: Vec<Vec<Lane>>,
     /// The metronome switch as last sent to the engine.
     sent_metronome: bool,
     /// Live MIDI to the selected track's instrument: pads and the keyboard.
@@ -193,6 +194,7 @@ impl App {
             built_sequences: Vec::new(),
             built_loop: None,
             built_clicks: Vec::new(),
+            built_automation: Vec::new(),
             sent_metronome: false,
             midi,
             _midi_in: midi_in,
@@ -407,6 +409,10 @@ impl App {
             && self.built_playback == Some(playback)
             && sequences == self.built_sequences
             && clicks == self.built_clicks
+            && tracks
+                .iter()
+                .map(|t| &t.automation)
+                .eq(self.built_automation.iter())
             && loop_range(self.history.project(), playback) == self.built_loop
             && tracks.len() == self.built_clips.len()
             && tracks
@@ -481,19 +487,38 @@ impl App {
             // shortcut: notes held while the selection moves keep sounding until
             // played again; a real fix sends note-offs to the old instrument.
             let selected = self.ws.selected_track == Some(i);
-            let inputs = match self.devices.instrument_step(&mut plan, track, selected) {
-                Some(step) => {
-                    if let Some(seq) = sequences.get(i).filter(|s| !s.is_empty()) {
-                        plan.sequence(step, seq.clone());
+            let mut device_steps = HashMap::new();
+            let inputs =
+                match self
+                    .devices
+                    .instrument_step(&mut plan, track, selected, &mut device_steps)
+                {
+                    Some(step) => {
+                        if let Some(seq) = sequences.get(i).filter(|s| !s.is_empty()) {
+                            plan.sequence(step, seq.clone());
+                        }
+                        (0..2)
+                            .map(|channel| vec![Source { step, channel }])
+                            .collect()
                     }
-                    (0..2)
-                        .map(|channel| vec![Source { step, channel }])
-                        .collect()
-                }
-                None => vec![],
-            };
+                    None => vec![],
+                };
             let track_step = plan.add(id, inputs, 2).expect("inputs are earlier steps");
-            steps.push(self.devices.effects_after(&mut plan, track, track_step));
+            steps.push(
+                self.devices
+                    .effects_after(&mut plan, track, track_step, &mut device_steps),
+            );
+            let project = self.history.project();
+            for lane in &track.automation {
+                let (step, param) = match lane.target {
+                    Target::Gain => (Some(track_step), TrackNode::GAIN),
+                    Target::Pan => (Some(track_step), TrackNode::PAN),
+                    Target::Param { device, id } => (device_steps.get(&device).copied(), id),
+                };
+                if let Some(step) = step {
+                    plan.automate(step, param, project.envelope(lane));
+                }
+            }
         }
         let master = NodeId(0);
         if let Some(node) = self.master.take() {
@@ -538,6 +563,13 @@ impl App {
         self.built_loop = looping;
         plan.set_clicks(clicks.clone());
         self.built_clicks = clicks;
+        self.built_automation = self
+            .history
+            .project()
+            .tracks
+            .iter()
+            .map(|t| t.automation.clone())
+            .collect();
         if let Err(e) = self.engine.commands.push(Command::SetLoop(looping)) {
             eprintln!("engine busy, dropped {e:?}");
             self.built_loop = None; // differs next frame, so the loop is sent again

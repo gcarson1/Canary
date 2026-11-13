@@ -280,10 +280,15 @@ impl Devices {
         plan: &mut ExecutionPlan,
         track: &Track,
         live_midi: bool,
+        steps: &mut HashMap<u64, StepId>,
     ) -> Option<StepId> {
-        let live = track.devices.iter().filter_map(|d| self.live.get(&d.uid));
-        let instrument = live.clone().find(|l| l.instrument)?;
+        let (uid, instrument) = track
+            .devices
+            .iter()
+            .filter_map(|d| Some((d.uid, self.live.get(&d.uid)?)))
+            .find(|(_, l)| l.instrument)?;
         let step = plan.add(instrument.id, vec![], 2).ok()?;
+        steps.insert(uid, step);
         if live_midi {
             plan.route_midi(step);
         }
@@ -294,12 +299,14 @@ impl Devices {
         Some(step)
     }
 
-    /// Chains `track`'s effects after `step` and returns the last step.
+    /// Chains `track`'s effects after `step` and returns the last step. Each
+    /// device's step goes into `steps` by uid, for automation.
     pub fn effects_after(
         &mut self,
         plan: &mut ExecutionPlan,
         track: &Track,
         mut step: StepId,
+        steps: &mut HashMap<u64, StepId>,
     ) -> StepId {
         for d in &track.devices {
             let Some(l) = self.live.get_mut(&d.uid).filter(|l| !l.instrument) else {
@@ -309,6 +316,7 @@ impl Devices {
             if let Ok(next) = plan.add(l.id, vec![from(0), from(1)], 2) {
                 l.latency = l.hosted.latency_samples();
                 plan.set_latency(next, l.latency);
+                steps.insert(d.uid, next);
                 step = next;
             }
         }
@@ -758,7 +766,7 @@ mod tests {
             let mut plan = ExecutionPlan::new(64);
             d.apply_changes(&mut plan);
             let step = d
-                .instrument_step(&mut plan, &p.tracks[0], selected)
+                .instrument_step(&mut plan, &p.tracks[0], selected, &mut HashMap::new())
                 .unwrap();
             assert_eq!(plan.takes_midi(step), selected);
         }

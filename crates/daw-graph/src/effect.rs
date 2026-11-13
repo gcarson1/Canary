@@ -132,6 +132,11 @@ impl EffectNode {
 }
 
 impl AudioNode for EffectNode {
+    /// Writes the shared parameter, so the rack's dial follows the automation.
+    fn automate(&mut self, id: u32, value: f64) {
+        self.params.set(id as usize, value as f32);
+    }
+
     /// Stereo: a mono input feeds both channels. Outputs past the second are zeroed.
     fn process(
         &mut self,

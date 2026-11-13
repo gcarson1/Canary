@@ -123,6 +123,19 @@ fn fixture() -> (History, HashMap<PathBuf, WaveformPyramid>, Vec<PathBuf>) {
         })
         .unwrap();
     }
+    // A gain ride on the first track: down, a bent rise, back to unity.
+    let point = |tick, value, curve| daw_project::Point { tick, value, curve };
+    h.apply(Action::SetAutomation {
+        track: 0,
+        target: daw_project::Target::Gain,
+        points: vec![
+            point(0, 1.0, 0.0),
+            point(2 * PPQ, 0.3, 0.6),
+            point(6 * PPQ, 1.4, 0.0),
+            point(9 * PPQ, 1.0, 0.0),
+        ],
+    })
+    .unwrap();
     (h, waveforms, vec![kick, pad])
 }
 
@@ -137,6 +150,7 @@ fn harness(
     ws.theme = theme;
     ws.page = page;
     ws.song = page == Page::Playlist;
+    ws.automation = Some(daw_project::Target::Gain);
     ws.selected_track = Some(0);
     ws.selected_clip = Some((1, 0));
     Harness::builder()
@@ -380,9 +394,13 @@ fn rig() -> Harness<'static, Rig> {
 
 /// The rig with `rack` as the selected track's devices.
 fn rig_with(rack: Vec<DeviceView>) -> Harness<'static, Rig> {
+    rig_from(Workspace::default(), rack)
+}
+
+/// The rig with `ws` (track 0 selected) and `rack` as its devices.
+fn rig_from(mut ws: Workspace, rack: Vec<DeviceView>) -> Harness<'static, Rig> {
     let (history, waveforms, files) = fixture();
     let engine = EngineView::default();
-    let mut ws = Workspace::default();
     ws.selected_track = Some(0);
     Harness::builder()
         .with_size(Vec2::new(1440.0, 900.0))
@@ -807,4 +825,44 @@ fn double_click_places_the_pattern_and_delete_removes_it() {
     let project = h.state().history.project();
     assert!(project.tracks[1].pattern_clips.is_empty());
     assert_eq!(project.tracks[1].clips.len(), 1, "the audio clip stays");
+}
+
+#[test]
+fn automation_lane_adds_and_removes_points() {
+    let mut ws = Workspace::default();
+    ws.automation = Some(daw_project::Target::Pan);
+    let mut h = rig_from(ws, devices());
+    h.run();
+    // Track 1's lane is y 124..188 (area 130..182); x 520 is tick 1 920.
+    let at = egui::Pos2::new(520.0, 156.0);
+    click(&mut h, at);
+    let lane = h.state().history.project().tracks[0].automation.clone();
+    assert_eq!(lane.len(), 2, "pan joins the fixture's gain lane");
+    let pan = &lane
+        .iter()
+        .find(|l| l.target == daw_project::Target::Pan)
+        .unwrap()
+        .points;
+    assert_eq!(pan.len(), 1);
+    assert_eq!(pan[0].tick, 1_920);
+    assert!(
+        pan[0].value.abs() < 0.05,
+        "middle of the lane is center pan"
+    );
+    // The clip under the lane was not selected or moved by the click.
+    assert_eq!(h.state().history.project().tracks[0].clips[0].start, 0);
+    // Right-click the point: the lane goes.
+    h.hover_at(at);
+    h.run();
+    for pressed in [true, false] {
+        h.event(egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
+        h.run();
+    }
+    let lanes = &h.state().history.project().tracks[0].automation;
+    assert!(lanes.iter().all(|l| l.target != daw_project::Target::Pan));
 }

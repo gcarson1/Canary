@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use daw_dsp::WaveformPyramid;
-use daw_project::{Action, History, Pattern, Playback, Project, Track, TrackProps, PPQ};
+use daw_project::{Action, History, Pattern, Playback, Project, Target, Track, TrackProps, PPQ};
 use egui::{Align2, Color32, Key, Pos2, Rect, Sense, Shape, StrokeKind, Vec2};
 
 pub use rack::{DeviceView, ParamView, PluginChoice, SampleDrop, SamplerView};
@@ -204,6 +204,8 @@ pub struct Workspace {
     pub metronome: bool,
     /// Count in one bar before a MIDI take.
     pub count_in: bool,
+    /// The automation lane drawn over the selected track in the playlist.
+    pub automation: Option<Target>,
     seq: sequencer::View,
     roll: piano::View,
     timeline: timeline::View,
@@ -241,6 +243,7 @@ impl Default for Workspace {
             pattern: None,
             metronome: false,
             count_in: false,
+            automation: None,
             seq: sequencer::View::default(),
             roll: piano::View::default(),
             timeline: timeline::View::default(),
@@ -1106,6 +1109,32 @@ impl Workspace {
                 self.snap = snap;
             }
             x = end + 0.25 * u;
+        }
+        // Automation shown on the selected track's playlist lane.
+        x += 0.75 * u;
+        let label = p.text(
+            Pos2::new(x, cy),
+            Align2::LEFT_CENTER,
+            "AUTO",
+            m.mono(0.625),
+            t.faint,
+        );
+        x = label.max.x + 0.5 * u;
+        let param = matches!(self.automation, Some(Target::Param { .. }));
+        for (target, label, id) in [
+            (None, "OFF", "auto-off"),
+            (Some(Target::Gain), "GAIN", "auto-gain"),
+            (Some(Target::Pan), "PAN", "auto-pan"),
+        ] {
+            let (end, clicked) = seg(x, label, self.automation == target, id);
+            if clicked {
+                self.automation = target;
+            }
+            x = end + 0.25 * u;
+        }
+        if param {
+            // Picked by right-clicking a rack dial.
+            seg(x, "PARAM", true, "auto-param");
         }
     }
 

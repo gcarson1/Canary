@@ -761,6 +761,7 @@ impl Vst3Plugin {
                 has_output: outputs.is_some(),
                 takes_notes,
                 changes: change_rx,
+                automated: crate::Automated::default(),
                 param_changes: ComWrapper::new(ParamChanges {
                     queues: (0..MAX_CHANGED_PARAMS)
                         .map(|_| {
@@ -980,6 +981,7 @@ pub struct Vst3Node {
     has_output: bool,
     takes_notes: bool,
     changes: Consumer<(u32, f64)>,
+    automated: crate::Automated,
     param_changes: ComWrapper<ParamChanges>,
     events: ComWrapper<EventList>,
     max_block: usize,
@@ -1010,6 +1012,24 @@ impl Vst3Node {
             changes.queues[slot]
                 .value
                 .store(value.to_bits(), Ordering::Relaxed);
+        }
+        // Automation last, so it wins over a dial moved in the same block.
+        for (id, value) in self.automated.take() {
+            let slot = changes.queues[..count]
+                .iter()
+                .position(|q| q.id.load(Ordering::Relaxed) == id);
+            let slot = match slot {
+                Some(slot) => slot,
+                None if count < MAX_CHANGED_PARAMS => {
+                    count += 1;
+                    count - 1
+                }
+                None => break,
+            };
+            changes.queues[slot].id.store(id, Ordering::Relaxed);
+            changes.queues[slot]
+                .value
+                .store(value.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
         }
         changes.count.store(count, Ordering::Relaxed);
     }
@@ -1057,6 +1077,11 @@ impl Vst3Node {
 }
 
 impl AudioNode for Vst3Node {
+    /// `value` is the parameter's normalized 0..=1 value, as `params` lists it.
+    fn automate(&mut self, id: u32, value: f64) {
+        self.automated.set(id, value);
+    }
+
     fn process(
         &mut self,
         inputs: &[&[f32]],

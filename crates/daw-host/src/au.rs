@@ -791,6 +791,16 @@ pub struct AuNode {
 }
 
 impl AudioNode for AuNode {
+    fn automate(&mut self, id: u32, value: f64) {
+        if value.is_finite() {
+            // SAFETY: the unit is valid; AU parameter calls are thread-safe and do
+            // not allocate, so hosts set automation from the render thread.
+            unsafe {
+                AudioUnitSetParameter(self.unit.0, id, kAudioUnitScope_Global, 0, value as f32, 0);
+            }
+        }
+    }
+
     fn process(
         &mut self,
         inputs: &[&[f32]],

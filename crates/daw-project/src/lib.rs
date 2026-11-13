@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+mod automation;
+pub use automation::{valid_points, Lane, Point, Target};
 pub mod edit;
 mod notes;
 pub mod smf;
@@ -87,6 +89,9 @@ pub struct Track {
     /// Patterns placed on this playlist row. Each plays on every track.
     #[serde(default)]
     pub pattern_clips: Vec<PatternClip>,
+    /// Automation lanes, at most one per target.
+    #[serde(default)]
+    pub automation: Vec<Lane>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -176,6 +181,7 @@ impl Track {
             devices: Vec::new(),
             notes: Vec::new(),
             pattern_clips: Vec::new(),
+            automation: Vec::new(),
         }
     }
 
@@ -276,6 +282,12 @@ pub enum Action {
         track: usize,
         index: usize,
         clip: PatternClip,
+    },
+    /// Replaces `track`'s automation of `target`; no points removes the lane.
+    SetAutomation {
+        track: usize,
+        target: Target,
+        points: Vec<Point>,
     },
     RemovePatternClip {
         track: usize,
@@ -583,6 +595,33 @@ impl Action {
                     notes: old,
                 }
             }
+            SetAutomation {
+                track: ti,
+                target,
+                points,
+            } => {
+                if !valid_points(target, &points) {
+                    return Err(ActionError::BadValue);
+                }
+                let t = track(p, ti)?;
+                let at = t.automation.iter().position(|l| l.target == target);
+                let old = match at {
+                    Some(i) if points.is_empty() => t.automation.remove(i).points,
+                    Some(i) => std::mem::replace(&mut t.automation[i].points, points),
+                    None if points.is_empty() => Vec::new(),
+                    None => {
+                        // Kept in target order, so undo restores the same list.
+                        let at = t.automation.partition_point(|l| l.target < target);
+                        t.automation.insert(at, Lane { target, points });
+                        Vec::new()
+                    }
+                };
+                SetAutomation {
+                    track: ti,
+                    target,
+                    points: old,
+                }
+            }
             InsertPatternClip {
                 track: ti,
                 index,
@@ -810,6 +849,11 @@ impl History {
                 lists.windows(2).all(|w| w[0] != w[1])
                     && t.notes.iter().flat_map(|n| &n.notes).all(Note::is_valid)
                     && t.pattern_clips.iter().all(PatternClip::is_valid)
+                    && t.automation.iter().all(|l| valid_points(l.target, &l.points))
+                    // One lane per target.
+                    && t.automation.iter().enumerate().all(|(i, a)| {
+                        t.automation[i + 1..].iter().all(|b| a.target != b.target)
+                    })
             });
         if !(p.bpm.is_finite() && p.bpm > 0.0)
             || p.sample_rate == 0
@@ -897,6 +941,29 @@ mod tests {
             Action::InsertTrack {
                 index: 0,
                 track: Track::new("Keys"),
+            },
+            Action::SetAutomation {
+                track: 0,
+                target: Target::Gain,
+                points: vec![Point {
+                    tick: 0,
+                    value: 0.5,
+                    curve: 0.0,
+                }],
+            },
+            Action::SetAutomation {
+                track: 0,
+                target: Target::Param { device: 3, id: 7 },
+                points: vec![Point {
+                    tick: 10,
+                    value: 440.0,
+                    curve: -0.5,
+                }],
+            },
+            Action::SetAutomation {
+                track: 0,
+                target: Target::Gain,
+                points: Vec::new(),
             },
             Action::SetTrackProps { index: 1, props },
             Action::InsertClip {

@@ -251,6 +251,26 @@ pub(crate) fn show(
             );
             let area = Rect::from_min_size(origin, cell);
             let id = ui.scope_id().with(("dial", di, param.id));
+            // Right-click a dial to automate it on the playlist.
+            let right = ui.input(|i| {
+                i.pointer.secondary_clicked()
+                    && i.pointer.interact_pos().is_some_and(|p| area.contains(p))
+            });
+            let uid = inputs
+                .history
+                .project()
+                .tracks
+                .get(track)
+                .and_then(|t| t.devices.get(di))
+                .map(|d| d.uid);
+            if let (true, Some(device)) = (right && !was_open, uid) {
+                ws.automation = Some(daw_project::Target::Param {
+                    device,
+                    id: param.id,
+                });
+                ws.page = crate::Page::Playlist;
+                ws.song = true;
+            }
             if let Some(v) = dial(ui, &p, m, ws, area, param, (!was_open).then_some(id)) {
                 out.push(Request::SetParam {
                     track,

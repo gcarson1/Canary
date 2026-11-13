@@ -380,6 +380,7 @@ impl ClapPlugin {
             max_block,
             events: EventBuffer::with_capacity(EVENT_CAPACITY),
             param_changes: param_rx,
+            automated: crate::Automated::default(),
             steady_time: 0,
             latency,
         };
@@ -549,6 +550,7 @@ pub struct PluginNode {
     max_block: usize,
     events: EventBuffer,
     param_changes: Consumer<(u32, f64)>,
+    automated: crate::Automated,
     steady_time: u64,
     latency: u32,
 }
@@ -562,6 +564,10 @@ impl PluginNode {
             let Ok((id, value)) = self.param_changes.pop() else {
                 break;
             };
+            self.events
+                .push(&ParamValueEvent::new(0, ClapId::new(id), any, value));
+        }
+        for (id, value) in self.automated.take() {
             self.events
                 .push(&ParamValueEvent::new(0, ClapId::new(id), any, value));
         }
@@ -589,6 +595,10 @@ impl PluginNode {
 }
 
 impl AudioNode for PluginNode {
+    fn automate(&mut self, id: u32, value: f64) {
+        self.automated.set(id, value);
+    }
+
     fn process(
         &mut self,
         inputs: &[&[f32]],

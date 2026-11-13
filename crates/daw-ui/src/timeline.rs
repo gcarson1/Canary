@@ -4,9 +4,10 @@
 
 use std::sync::Arc;
 
+use daw_core::{automation_value, AutoPoint};
 use daw_core::{Clip, SampleData};
 use daw_dsp::MinMax;
-use daw_project::{Action, ClipRef, PatternClip, Project, Track, STEP};
+use daw_project::{Action, ClipRef, PatternClip, Point, Project, Target, Track, STEP};
 use egui::{Align2, Pos2, Rect, Sense, StrokeKind};
 
 use crate::theme::Metrics;
@@ -22,6 +23,7 @@ pub(crate) struct View {
     scroll_y: f32,
     drag: Option<Drag>,
     pattern_drag: Option<PatternDrag>,
+    auto_drag: Option<AutoDrag>,
     /// Playhead last frame, to page only when it crosses the right edge.
     last_playhead: u64,
 }
@@ -34,6 +36,7 @@ impl Default for View {
             scroll_y: 0.0,
             drag: None,
             pattern_drag: None,
+            auto_drag: None,
             last_playhead: 0,
         }
     }
@@ -58,6 +61,268 @@ struct Drag {
     /// Project revision at the start; any other edit cancels the drag, since its
     /// indices may no longer point at the clip.
     revision: u64,
+}
+
+/// An automation point being moved, or a segment being bent (`curve` holds the
+/// curve and pointer height when the bend began).
+struct AutoDrag {
+    track: usize,
+    target: Target,
+    points: Vec<Point>,
+    index: usize,
+    curve: Option<(f32, f32)>,
+    revision: u64,
+}
+
+/// How an automation target's values map to the lane's height.
+#[derive(Debug, Clone, Copy)]
+struct Scale {
+    min: f64,
+    max: f64,
+    log: bool,
+    /// The value with no automation: the fader or dial setting.
+    rest: f64,
+}
+
+impl Scale {
+    fn norm(&self, v: f64) -> f64 {
+        let n = if self.log && self.min > 0.0 {
+            (v.max(self.min) / self.min).ln() / (self.max / self.min).ln()
+        } else {
+            (v - self.min) / (self.max - self.min)
+        };
+        n.clamp(0.0, 1.0)
+    }
+
+    fn value(&self, n: f64) -> f64 {
+        let n = n.clamp(0.0, 1.0);
+        if self.log && self.min > 0.0 {
+            self.min * (self.max / self.min).powf(n)
+        } else {
+            self.min + n * (self.max - self.min)
+        }
+    }
+}
+
+/// The value range of `target` on track `ti`: fixed for gain and pan, from the
+/// rack's parameter for a device (only the selected track's devices are known).
+fn scale_for(target: Target, inputs: &Inputs<'_>, ti: usize) -> Option<Scale> {
+    let track = &inputs.history.project().tracks[ti];
+    match target {
+        Target::Gain => Some(Scale {
+            min: 0.0,
+            max: 2.0,
+            log: false,
+            rest: f64::from(track.gain),
+        }),
+        Target::Pan => Some(Scale {
+            min: -1.0,
+            max: 1.0,
+            log: false,
+            rest: f64::from(track.pan),
+        }),
+        Target::Param { device, id } => {
+            let index = track.devices.iter().position(|d| d.uid == device)?;
+            let p = inputs
+                .devices
+                .get(index)?
+                .params
+                .iter()
+                .find(|p| p.id == id)?;
+            (p.max > p.min).then_some(Scale {
+                min: p.min,
+                max: p.max,
+                log: p.log,
+                rest: p.value,
+            })
+        }
+    }
+}
+
+/// Draws and edits the selected track's automation lane. Click to add a point
+/// (snapped), drag a point to move it, Option-drag a segment to bend it,
+/// right-click a point to remove it; each gesture is one `SetAutomation`.
+/// Returns true while the pointer is over the lane, which then takes it from
+/// the clips underneath.
+#[allow(clippy::too_many_arguments)]
+fn automation_lane(
+    ws: &mut Workspace,
+    ui: &egui::Ui,
+    p: &egui::Painter,
+    m: &Metrics,
+    lanes: Rect,
+    lane: Rect,
+    ti: usize,
+    inputs: &Inputs<'_>,
+) -> bool {
+    let (t, u) = (ws.theme, m.u);
+    let project = inputs.history.project();
+    let Some(target) = ws.automation else {
+        return false;
+    };
+    let Some(scale) = scale_for(target, inputs, ti) else {
+        return false;
+    };
+    let stale = ws.timeline.auto_drag.as_ref().is_some_and(|d| {
+        d.revision != inputs.history.revision() || d.track != ti || d.target != target
+    });
+    if stale {
+        ws.timeline.auto_drag = None;
+    }
+    let area = lane.shrink2(egui::Vec2::new(0.0, 0.375 * u));
+    let stored: Vec<Point> = project
+        .lane(ti, target)
+        .map_or_else(Vec::new, |l| l.points.clone());
+    let shown = ws
+        .timeline
+        .auto_drag
+        .as_ref()
+        .map_or(stored.clone(), |d| d.points.clone());
+    let view = View {
+        start: ws.timeline.start,
+        zoom: ws.timeline.zoom,
+        ..View::default()
+    };
+    let view = &view;
+    let snap = ws.snap;
+    let x_of_tick = |tick: u64| view.x_of(lanes, project.samples_at(tick) as f64);
+    let y_of = |v: f64| area.max.y - area.height() * scale.norm(v) as f32;
+    let tick_at = |x: f32| {
+        let at = snap_f(view.sample_at(lanes, x), snap, project);
+        project.ticks_at(at as u64)
+    };
+    let value_at_y = |y: f32| scale.value(f64::from((area.max.y - y) / area.height()));
+
+    // The envelope, sampled every two pixels, and its points.
+    let lp = p.with_clip_rect(lane.intersect(lanes));
+    let env: Vec<AutoPoint> = shown
+        .iter()
+        .map(|p| AutoPoint {
+            at: p.tick,
+            value: p.value,
+            curve: p.curve,
+        })
+        .collect();
+    let mut line = Vec::new();
+    let mut x = lanes.min.x;
+    while x <= lanes.max.x {
+        let tick = project.ticks_at(view.sample_at(lanes, x) as u64);
+        let v = automation_value(&env, tick).unwrap_or(scale.rest);
+        line.push(Pos2::new(x, y_of(v)));
+        x += 2.0 * m.px.max(1.0);
+    }
+    let color = if shown.is_empty() {
+        t.line_2
+    } else {
+        t.accent_cyan
+    };
+    lp.add(egui::Shape::line(
+        line,
+        egui::Stroke::new(0.09375 * u, color),
+    ));
+    let dragged = ws.timeline.auto_drag.as_ref().map(|d| d.index);
+    for (i, pt) in shown.iter().enumerate() {
+        let c = Pos2::new(x_of_tick(pt.tick), y_of(pt.value));
+        let fill = if dragged == Some(i) {
+            t.accent_amber
+        } else {
+            t.accent_cyan
+        };
+        lp.rect_filled(
+            Rect::from_center_size(c, egui::Vec2::splat(0.375 * u)),
+            0.0,
+            fill,
+        );
+    }
+
+    // Gestures.
+    let (pointer, pressed, released, right, alt) = ui.input(|i| {
+        (
+            i.pointer.hover_pos(),
+            i.pointer.primary_pressed(),
+            !i.pointer.primary_down(),
+            i.pointer.secondary_clicked(),
+            i.modifiers.alt,
+        )
+    });
+    let over = pointer.is_some_and(|p| lane.contains(p) && lanes.contains(p));
+    let near = |pos: Pos2| {
+        shown
+            .iter()
+            .position(|pt| Pos2::new(x_of_tick(pt.tick), y_of(pt.value)).distance(pos) < 0.5 * u)
+    };
+    let begin = |points: Vec<Point>, index, curve| AutoDrag {
+        track: ti,
+        target,
+        points,
+        index,
+        curve,
+        revision: inputs.history.revision(),
+    };
+    if let (true, true, Some(pos)) = (over, pressed, pointer) {
+        if ws.tool == Tool::Draw && ws.timeline.auto_drag.is_none() {
+            let tick = project.ticks_at(view.sample_at(lanes, pos.x) as u64);
+            let left = stored.partition_point(|p| p.tick <= tick).checked_sub(1);
+            ws.timeline.auto_drag = match (near(pos), alt, left) {
+                (_, true, Some(l)) if l + 1 < stored.len() => {
+                    Some(begin(stored.clone(), l, Some((stored[l].curve, pos.y))))
+                }
+                (Some(i), _, _) => Some(begin(stored.clone(), i, None)),
+                _ => {
+                    let point = Point {
+                        tick: tick_at(pos.x),
+                        value: value_at_y(pos.y),
+                        curve: 0.0,
+                    };
+                    let mut points = stored.clone();
+                    points.retain(|p| p.tick != point.tick);
+                    let at = points.partition_point(|p| p.tick < point.tick);
+                    points.insert(at, point);
+                    Some(begin(points, at, None))
+                }
+            };
+        }
+    }
+    if let (Some(d), Some(pos)) = (ws.timeline.auto_drag.as_mut(), pointer) {
+        match d.curve {
+            Some((base, from)) => {
+                let c = base + (from - pos.y) / area.height() * 2.0;
+                d.points[d.index].curve = c.clamp(-1.0, 1.0);
+            }
+            None => {
+                let lo = d.index.checked_sub(1).map_or(0, |i| d.points[i].tick + 1);
+                let hi = d
+                    .points
+                    .get(d.index + 1)
+                    .map_or(daw_project::MAX_TICKS, |p| p.tick - 1);
+                d.points[d.index].tick = tick_at(pos.x).clamp(lo, hi.max(lo));
+                d.points[d.index].value = value_at_y(pos.y);
+            }
+        }
+    }
+    let mut edit = None;
+    if released {
+        if let Some(d) = ws.timeline.auto_drag.take() {
+            if d.points != stored {
+                edit = Some(d.points);
+            }
+        }
+    }
+    if let (true, true, Some(pos)) = (over, right, pointer) {
+        if let Some(i) = near(pos) {
+            let mut points = stored.clone();
+            points.remove(i);
+            edit = Some(points);
+        }
+    }
+    if let Some(points) = edit {
+        ws.edit(Action::SetAutomation {
+            track: ti,
+            target,
+            points,
+        });
+    }
+    over || ws.timeline.auto_drag.is_some()
 }
 
 /// A pattern clip being moved or trimmed; positions in ticks.
@@ -97,7 +362,7 @@ fn trim_pattern(clip: &PatternClip, grab: Grab, at: u64, grid: u64) -> PatternCl
 
 impl View {
     pub(crate) fn is_dragging(&self) -> bool {
-        self.drag.is_some() || self.pattern_drag.is_some()
+        self.drag.is_some() || self.pattern_drag.is_some() || self.auto_drag.is_some()
     }
 
     fn x_of(&self, lanes: Rect, sample: f64) -> f32 {
@@ -431,6 +696,22 @@ pub(crate) fn show(
     if phit.is_some() {
         hit = None;
     }
+    // The automation lane sits over everything on the selected track's row.
+    let auto_lane = ws
+        .selected_track
+        .filter(|&ti| ti < project.tracks.len() && ws.automation.is_some())
+        .map(|ti| (ti, lane_rect(ti, &ws.timeline)));
+    let auto_owns = match auto_lane {
+        Some((ti, lane)) => automation_lane(ws, ui, p, m, lanes, lane, ti, inputs),
+        None => {
+            ws.timeline.auto_drag = None;
+            false
+        }
+    };
+    if auto_owns {
+        hit = None;
+        phit = None;
+    }
     let grid_ticks = crate::piano::snap_ticks(ws.snap);
     let snap_tick = |sample: f64| {
         let tick = project.ticks_at(sample.max(0.0) as u64);
@@ -512,7 +793,7 @@ pub(crate) fn show(
         }
     }
     // Double-click empty lane space to place the current pattern there.
-    if lanes_resp.double_clicked() && hit.is_none() && phit.is_none() {
+    if lanes_resp.double_clicked() && hit.is_none() && phit.is_none() && !auto_owns {
         let pattern = ws
             .current_pattern(project)
             .and_then(|id| project.pattern(id));

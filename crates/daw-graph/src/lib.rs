@@ -51,6 +51,11 @@ pub trait AudioNode: Send {
     /// the audio thread. Runs on the audio thread: never allocate or drop here.
     /// Data of a type the node does not expect is ignored.
     fn exchange(&mut self, _data: &mut (dyn Any + Send)) {}
+    /// Sets parameter `id` from automation, at the start of the block about to be
+    /// processed (`ExecutionPlan::automate` calls it every block). Ids are the
+    /// node's own (a plugin's parameter ids; `TrackNode::GAIN`/`PAN`). Runs on
+    /// the audio thread: never allocate, lock or block. Unknown ids are ignored.
+    fn automate(&mut self, _id: u32, _value: f64) {}
 }
 
 /// Multiplies each input channel by a fixed linear gain into the matching output

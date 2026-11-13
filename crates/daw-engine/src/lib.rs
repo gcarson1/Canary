@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use daw_core::{Command, ProcessContext, SeqEvent, Telemetry};
+use daw_dsp::Click;
 use daw_graph::{ExecutionPlan, LiveNodes, NodeArena, PlanError};
 use midi::{midi_queue, MidiReceiver};
 use rtrb::{Consumer, Producer, RingBuffer};
@@ -114,6 +115,7 @@ pub struct AudioEngine {
     garbage: Producer<Box<ExecutionPlan>>,
     midi: MidiReceiver,
     midi_log: Producer<SeqEvent>,
+    click: Click,
     plan: Option<Box<ExecutionPlan>>,
     nodes: NodeArena,
     transport: Transport,
@@ -150,6 +152,7 @@ pub fn engine(capacity: usize, sample_rate: f32) -> (EngineHandle, AudioEngine) 
             garbage: garbage_tx,
             midi: midi_rx,
             midi_log: log_tx,
+            click: Click::default(),
             plan: None,
             nodes: NodeArena::default(),
             transport: Transport::default(),
@@ -203,6 +206,8 @@ impl AudioEngine {
                 // and a loop wrap must fall between chunks.
                 let total = output.len() / channels;
                 let mut done = 0;
+                // Meters see the mix, never the metronome.
+                let (mut peak, mut sum) = ([0.0f32; 2], [0.0f32; 2]);
                 while done < total {
                     let mut frames = (total - done).min(plan.max_block());
                     if let Some(wrap) = self.transport.frames_until_wrap() {
@@ -218,7 +223,9 @@ impl AudioEngine {
                         e.sample_offset -= first;
                     }
                     midi = later;
-                    if self.transport.is_playing() {
+                    let count_in = self.transport.count_in();
+                    let rolling = self.transport.is_rolling();
+                    if rolling {
                         // Heard against the timeline one callback earlier.
                         let back = total as u64;
                         for e in now.iter() {
@@ -235,7 +242,7 @@ impl AudioEngine {
                             sample_rate: self.sample_rate,
                             num_samples: frames,
                             playhead: self.transport.playhead(),
-                            playing: self.transport.is_playing(),
+                            playing: rolling,
                         },
                         now,
                     );
@@ -245,9 +252,46 @@ impl AudioEngine {
                             *sample = master.get(ch).map_or(0.0, |m| m[frame]);
                         }
                     }
+                    measure(chunk, channels, &mut peak, &mut sum);
+                    // The metronome: count-in beats, or the plan's beats while rolling.
+                    let clicks = plan.clicks();
+                    let playhead = self.transport.playhead();
+                    let mut next = clicks.partition_point(|c| c.at < playhead);
+                    let metronome = rolling && self.transport.metronome();
+                    for (f, out) in chunk.chunks_exact_mut(channels).enumerate() {
+                        let f = f as u64;
+                        if let Some(c) = count_in {
+                            let at = c.elapsed + f;
+                            if at.is_multiple_of(c.beat) {
+                                let beat = at / c.beat;
+                                let accent = beat.is_multiple_of(u64::from(c.beats_per_bar));
+                                self.click.trigger(accent, self.sample_rate);
+                            }
+                        } else if metronome {
+                            while clicks.get(next).is_some_and(|c| c.at <= playhead + f) {
+                                if clicks[next].at == playhead + f {
+                                    self.click
+                                        .trigger(clicks[next].data[0] == 1, self.sample_rate);
+                                }
+                                next += 1;
+                            }
+                        }
+                        let s = self.click.tick();
+                        if s != 0.0 {
+                            for sample in out.iter_mut() {
+                                *sample += s;
+                            }
+                        }
+                    }
                     self.transport.advance(frames as u64);
                     done += frames;
                 }
+                let _ = self.telemetry.push(Telemetry::Playhead {
+                    sample: self.transport.playhead(),
+                    playing: self.transport.is_playing(),
+                });
+                let _ = self.telemetry.push(finish_levels(peak, sum, total));
+                return;
             }
         }
 
@@ -264,6 +308,12 @@ impl AudioEngine {
 /// reports the same level on both sides.
 fn levels(output: &[f32], channels: usize) -> Telemetry {
     let (mut peak, mut sum) = ([0.0f32; 2], [0.0f32; 2]);
+    measure(output, channels, &mut peak, &mut sum);
+    finish_levels(peak, sum, output.len() / channels)
+}
+
+/// Adds `output`'s first two channels to running peaks and sums of squares.
+fn measure(output: &[f32], channels: usize, peak: &mut [f32; 2], sum: &mut [f32; 2]) {
     for frame in output.chunks_exact(channels) {
         for side in 0..2 {
             let s = frame[side.min(channels - 1)];
@@ -271,7 +321,10 @@ fn levels(output: &[f32], channels: usize) -> Telemetry {
             sum[side] += s * s;
         }
     }
-    let frames = (output.len() / channels).max(1) as f32;
+}
+
+fn finish_levels(peak: [f32; 2], sum: [f32; 2], frames: usize) -> Telemetry {
+    let frames = frames.max(1) as f32;
     Telemetry::Levels {
         peak,
         rms: sum.map(|s| (s / frames).sqrt()),
@@ -1002,6 +1055,55 @@ mod tests {
         handle.send_plan(probe(vec![on(5, 62)], false)).unwrap();
         audio.process(&mut block, 1);
         assert_eq!(block[0], -60.0);
+    }
+
+    #[test]
+    fn metronome_and_count_in_click_without_moving_meters_or_allocating() {
+        use daw_core::SeqEvent;
+        let (mut handle, mut audio) = engine(16, 48_000.0);
+        let mut plan = ExecutionPlan::new(64);
+        plan.insert(NodeId(1), Box::new(GainNode { gain: 1.0 }));
+        plan.add(NodeId(1), vec![], 1).unwrap(); // silence
+        plan.set_clicks(vec![
+            SeqEvent {
+                at: 2_010,
+                data: [1, 0, 0],
+            },
+            SeqEvent {
+                at: 2_100,
+                data: [0, 0, 0],
+            },
+        ]);
+        handle.send_plan(Box::new(plan)).unwrap();
+        for c in [
+            Command::Seek(2_000),
+            Command::SetMetronome(true),
+            Command::CountIn {
+                frames: 100,
+                beat: 50,
+                beats_per_bar: 2,
+            },
+            Command::Play,
+        ] {
+            handle.commands.push(c).unwrap();
+        }
+        let mut block = vec![0.0; 128];
+        assert_no_alloc(|| audio.process(&mut block, 1));
+        // Count-in clicks at 0 and 50 (a sine burst: sample 0 is 0, 1 is not),
+        // then the plan's click at 2010 lands at frame 100 + 10.
+        let sounding = |i: usize| block[i] != 0.0;
+        assert!(sounding(1) && sounding(51) && sounding(111));
+        assert_eq!(audio.transport().playhead(), 2_028, "held for the count-in");
+        while let Ok(t) = handle.telemetry.pop() {
+            if let Telemetry::Levels { peak, .. } = t {
+                assert_eq!(peak, [0.0, 0.0], "the click is not metered");
+            }
+        }
+        // Metronome off: silence once the tail dies.
+        handle.commands.push(Command::SetMetronome(false)).unwrap();
+        let mut long = vec![0.0; 9_600];
+        audio.process(&mut long, 1);
+        assert!(long[4_800..].iter().all(|&s| s == 0.0));
     }
 
     #[test]

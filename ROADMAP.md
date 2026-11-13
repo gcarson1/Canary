@@ -86,7 +86,8 @@ The UI follows Styles.md whichever framework is chosen.
 
 ### Phase 7: Time, Automation and Transport
 - [x] Tempo map and time-signature map (`daw-project`), ticks ↔ samples through it everywhere; the bar:beat clock, playlist grid, snap and piano roll follow it. Option-click the playlist ruler to add a tempo change (drag it to set the tempo, right-click removes); the `4/4` readout by the BPM sets the opening meter (drag: beats, right-click: note value). Audio clips stay at their sample positions (no warping yet). Still to do: meter changes after bar 1 in the UI
-- [ ] Loop region on the playlist, metronome (accented downbeat), count-in, punch in/out
+- [x] Metronome (accented downbeat, follows the tempo and meter maps; clicks are mixed after the meters) and a one-bar count-in for MIDI takes: MET and CNT in the top bar. `Command::SetMetronome`, `Command::CountIn` (the playhead holds while it counts), `ExecutionPlan::set_clicks`
+- [ ] Loop region on the playlist, punch in/out, count-in for audio takes
 - [ ] Automation lanes: track gain/pan/mute and any plugin or built-in parameter, breakpoints with curve shapes, applied per block chunk on the audio thread; draw/edit in the playlist and piano roll lanes; record automation from the rack (latch/touch)
 - [ ] Transport info to plugins (tempo, position, playing, loop) for CLAP, VST3 and AU; ARA content access for the tempo map
 - [ ] Plugin delay compensation for sequenced instruments (notes scheduled early by the instrument path's latency)

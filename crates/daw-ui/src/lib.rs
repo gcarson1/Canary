@@ -200,6 +200,10 @@ pub struct Workspace {
     pub song: bool,
     /// The pattern the sequencer and piano roll edit; see `current_pattern`.
     pub pattern: Option<u64>,
+    /// Click on every beat while playing.
+    pub metronome: bool,
+    /// Count in one bar before a MIDI take.
+    pub count_in: bool,
     seq: sequencer::View,
     roll: piano::View,
     timeline: timeline::View,
@@ -235,6 +239,8 @@ impl Default for Workspace {
             page: Page::Playlist,
             song: true,
             pattern: None,
+            metronome: false,
+            count_in: false,
             seq: sequencer::View::default(),
             roll: piano::View::default(),
             timeline: timeline::View::default(),
@@ -740,6 +746,42 @@ impl Workspace {
         }
         if rec_resp.clicked() {
             out.push(Request::ToggleRecord);
+        }
+        // Metronome and count-in switches.
+        let mut x = rec.max.x + 0.75 * u;
+        for (label, id) in [("MET", "met"), ("CNT", "count")] {
+            let on = if id == "met" {
+                self.metronome
+            } else {
+                self.count_in
+            };
+            let g = p.layout_no_wrap(label.into(), m.mono(0.625), t.text);
+            let rect = m.snap_rect(Rect::from_min_size(
+                Pos2::new(x, cy - 0.625 * u),
+                Vec2::new(g.size().x + 0.75 * u, 1.25 * u),
+            ));
+            let resp = ui.interact(rect, ui.scope_id().with(id), Sense::click());
+            if on {
+                p.rect_filled(rect, 0.0, t.accent_amber);
+            } else {
+                let line = if resp.hovered() { t.text } else { t.line_2 };
+                p.rect_stroke(rect, 0.0, m.hair(line), StrokeKind::Inside);
+            }
+            p.text(
+                rect.center(),
+                Align2::CENTER_CENTER,
+                label,
+                m.mono(0.625),
+                if on { t.ink_text } else { t.muted },
+            );
+            if resp.clicked() {
+                if id == "met" {
+                    self.metronome ^= true;
+                } else {
+                    self.count_in ^= true;
+                }
+            }
+            x = rect.max.x + 0.25 * u;
         }
 
         // Right: device rate and the dirty-project square.

@@ -78,6 +78,9 @@ struct App {
     built_playback: Option<Playback>,
     built_sequences: Vec<Vec<SeqEvent>>,
     built_loop: Option<(u64, u64)>,
+    built_clicks: Vec<SeqEvent>,
+    /// The metronome switch as last sent to the engine.
+    sent_metronome: bool,
     /// Live MIDI to the selected track's instrument: pads and the keyboard.
     midi: Option<Arc<Mutex<MidiSender>>>,
     _midi_in: Option<MidiConnection>,
@@ -189,6 +192,8 @@ impl App {
             built_playback: None,
             built_sequences: Vec::new(),
             built_loop: None,
+            built_clicks: Vec::new(),
+            sent_metronome: false,
             midi,
             _midi_in: midi_in,
             queued: None,
@@ -388,6 +393,7 @@ impl App {
         let sequences: Vec<Vec<SeqEvent>> = (0..project.tracks.len())
             .map(|i| project.sequence(i, playback))
             .collect();
+        let clicks = metronome_clicks(project, playback);
         let rate = self.view.sample_rate as f32;
         for e in self.devices.sync(self.history.project(), rate, MAX_BLOCK) {
             self.error(e);
@@ -400,6 +406,7 @@ impl App {
             && self.built_selected == self.ws.selected_track
             && self.built_playback == Some(playback)
             && sequences == self.built_sequences
+            && clicks == self.built_clicks
             && loop_range(self.history.project(), playback) == self.built_loop
             && tracks.len() == self.built_clips.len()
             && tracks
@@ -414,7 +421,7 @@ impl App {
             self.set_params();
             self.built = Some(revision);
         } else {
-            self.rebuild(playback, sequences);
+            self.rebuild(playback, sequences, clicks);
         }
     }
 
@@ -430,7 +437,12 @@ impl App {
     /// Sends the engine a plan for the current project: per track, its instrument
     /// (if any) into a track node into its effects, all summed into a master.
     /// Track nodes are rebuilt; plugin nodes persist and keep their state.
-    fn rebuild(&mut self, playback: Playback, sequences: Vec<Vec<SeqEvent>>) {
+    fn rebuild(
+        &mut self,
+        playback: Playback,
+        sequences: Vec<Vec<SeqEvent>>,
+        clicks: Vec<SeqEvent>,
+    ) {
         let count = self
             .history
             .project()
@@ -524,6 +536,8 @@ impl App {
         self.built_playback = Some(playback);
         self.built_sequences = sequences;
         self.built_loop = looping;
+        plan.set_clicks(clicks.clone());
+        self.built_clicks = clicks;
         if let Err(e) = self.engine.commands.push(Command::SetLoop(looping)) {
             eprintln!("engine busy, dropped {e:?}");
             self.built_loop = None; // differs next frame, so the loop is sent again
@@ -857,6 +871,18 @@ impl App {
         let length = self.history.project().pattern(id).map_or(1, |p| p.length);
         while self.engine.midi_log.pop().is_ok() {} // nothing from before the take
         self.midi_take = Some(take::MidiTake::new(track, id, length));
+        if self.ws.count_in {
+            // One bar of the meter at the playhead, at the tempo there.
+            let project = self.history.project();
+            let tick = project.ticks_at(self.view.playhead);
+            let meter = project.bar_beat(tick).meter;
+            let beat = project.samples_at(tick + meter.beat_ticks()) - project.samples_at(tick);
+            let _ = self.engine.commands.push(Command::CountIn {
+                frames: beat * u64::from(meter.numerator),
+                beat,
+                beats_per_bar: meter.numerator,
+            });
+        }
         let _ = self.engine.commands.push(Command::Play);
     }
 
@@ -977,6 +1003,15 @@ impl eframe::App for App {
         for request in requests {
             self.handle(request);
         }
+        if self.ws.metronome != self.sent_metronome
+            && self
+                .engine
+                .commands
+                .push(Command::SetMetronome(self.ws.metronome))
+                .is_ok()
+        {
+            self.sent_metronome = self.ws.metronome;
+        }
         self.sync();
 
         let name = self
@@ -999,6 +1034,27 @@ impl eframe::App for App {
         let busy = self.view.playing || self.view.recording || !self.pending.is_empty();
         ctx.request_repaint_after(Duration::from_millis(if busy { 16 } else { 250 }));
     }
+}
+
+/// The metronome's beats as timeline samples (`data[0] == 1` on downbeats):
+/// the pattern's in PAT mode, else the song's and 64 bars past its end.
+fn metronome_clicks(project: &daw_project::Project, playback: Playback) -> Vec<SeqEvent> {
+    let end = match playback {
+        Playback::Pattern(id) => project.pattern(id).map_or(0, |p| p.length),
+        Playback::Song => {
+            let bar = project.song_end().max(1);
+            let bars = project.bar_beat(bar).bar + 64;
+            project.bar_tick(bars).min(daw_project::MAX_TICKS)
+        }
+    };
+    project
+        .beats(end)
+        .into_iter()
+        .map(|(tick, down)| SeqEvent {
+            at: project.samples_at(tick),
+            data: [u8::from(down), 0, 0],
+        })
+        .collect()
 }
 
 /// Where to put a playhead at `at` so it plays inside `looping`: `None` if it

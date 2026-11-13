@@ -141,6 +141,42 @@ impl Project {
         tick
     }
 
+    /// Every beat before tick `end`, with `true` on each bar's first beat.
+    pub fn beats(&self, end: u64) -> Vec<(u64, bool)> {
+        let mut out = Vec::new();
+        let mut bar = 0u64;
+        loop {
+            let start = self.bar_tick(bar);
+            if start >= end {
+                return out;
+            }
+            let meter = self.bar_beat(start).meter;
+            for b in 0..u64::from(meter.numerator) {
+                let tick = start + b * meter.beat_ticks();
+                if tick >= end {
+                    return out;
+                }
+                out.push((tick, b == 0));
+            }
+            bar += 1;
+        }
+    }
+
+    /// The tick where the last clip or pattern clip ends.
+    pub fn song_end(&self) -> u64 {
+        self.tracks
+            .iter()
+            .flat_map(|t| {
+                t.clips
+                    .iter()
+                    .map(|c| self.ticks_at(c.start.saturating_add(c.length)) + 1)
+                    .chain(t.pattern_clips.iter().map(|c| c.end()))
+            })
+            .max()
+            .unwrap_or(0)
+            .min(MAX_TICKS)
+    }
+
     /// Bar, beat and ticks into the beat at `tick`.
     pub fn bar_beat(&self, tick: u64) -> BarBeat {
         let (mut start, mut bar) = (0u64, 0u64);
@@ -219,5 +255,9 @@ mod tests {
         assert!(valid_meters(&p.meters));
         assert!(!valid_meters(&p.meters[1..]), "must start at bar 0");
         assert!(!valid_tempos(&[TempoChange { tick: 0, bpm: 90.0 }]));
+        let beats = p.beats(8 * PPQ + PPQ);
+        assert_eq!(beats.len(), 8 + 2);
+        assert_eq!(beats[8], (8 * PPQ, true));
+        assert_eq!(beats[9], (8 * PPQ + eighth, false));
     }
 }

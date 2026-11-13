@@ -119,6 +119,8 @@ pub struct ExecutionPlan {
     midi_out: Vec<MidiEvent>,
     /// A sequenced step's MIDI for the block: its notes merged with live input.
     midi_in: Vec<MidiEvent>,
+    /// Metronome beats by timeline sample; `data[0]` is 1 on a downbeat.
+    clicks: Box<[SeqEvent]>,
     inserts: Vec<(NodeId, Option<Box<dyn AudioNode>>)>,
     removals: Vec<NodeId>,
     /// Receives removed nodes on the audio thread; capacity reserved in `remove`.
@@ -139,6 +141,7 @@ impl ExecutionPlan {
             max_block,
             midi_out: Vec::with_capacity(MIDI_CAPACITY),
             midi_in: Vec::with_capacity(MIDI_CAPACITY),
+            clicks: Box::default(),
             inserts: Vec::new(),
             removals: Vec::new(),
             retired: Vec::new(),
@@ -227,6 +230,17 @@ impl ExecutionPlan {
         events.sort_by_key(|e| e.at);
         s.sequence = events.into_boxed_slice();
         true
+    }
+
+    /// The metronome's beats while this plan plays: timeline samples, with
+    /// `data[0] == 1` on downbeats. Sorted here.
+    pub fn set_clicks(&mut self, mut clicks: Vec<SeqEvent>) {
+        clicks.sort_by_key(|c| c.at);
+        self.clicks = clicks.into_boxed_slice();
+    }
+
+    pub fn clicks(&self) -> &[SeqEvent] {
+        &self.clicks
     }
 
     /// Hands each step the held-note state of the step running the same node in

@@ -65,6 +65,16 @@ pub enum Command {
     /// with `end <= start` is ignored. The playhead wraps when it reaches `end`;
     /// starting play past `end` plays on without wrapping.
     SetLoop(Option<(u64, u64)>),
+    /// Click on every beat while the transport runs (beats come with the plan).
+    SetMetronome(bool),
+    /// Before the playhead moves on the next Play, count in for `frames`, clicking
+    /// every `beat` frames with an accent every `beats_per_bar` beats. Stop
+    /// cancels it. Ignored unless every field is above zero.
+    CountIn {
+        frames: u64,
+        beat: u64,
+        beats_per_bar: u8,
+    },
 }
 
 /// Audio thread → main thread. Each variant is sent once per block; dropped if the

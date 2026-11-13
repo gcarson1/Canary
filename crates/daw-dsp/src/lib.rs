@@ -1,11 +1,13 @@
 //! Pure signal processing primitives: filters, envelopes, oscillators, delay lines. No OS or UI dependencies.
 
+mod click;
 pub mod effects;
 mod filter;
 mod meter;
 pub mod slice;
 mod waveform;
 
+pub use click::Click;
 pub use filter::{db_to_gain, gain_to_db, Biquad, Envelope, FilterKind};
 pub use meter::{integrated_loudness, Loudness, TruePeak};
 pub use waveform::{MinMax, WaveformPyramid, LEVELS};

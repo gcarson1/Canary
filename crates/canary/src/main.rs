@@ -197,6 +197,7 @@ impl App {
         for source in sources {
             app.load(source, None);
         }
+        app.devices.restore_ara(app.history.project().ara.clone());
         Ok(app)
     }
 
@@ -340,7 +341,10 @@ impl App {
                         self.place(&done.path, track, at);
                     }
                 }
-                Err(e) => self.error(format!("could not load {}: {e}", done.path.display())),
+                Err(e) => {
+                    self.built = None; // an ARA restore waiting on this file can go
+                    self.error(format!("could not load {}: {e}", done.path.display()));
+                }
             }
         }
     }
@@ -478,7 +482,15 @@ impl App {
             .collect();
         self.built = Some(self.history.revision());
         self.built_selected = self.ws.selected_track;
-        self.devices.sync_ara(self.history.project(), &self.audio);
+        let pending = &self.pending;
+        let errors = self
+            .devices
+            .sync_ara(self.history.project(), &self.audio, |p| {
+                pending.contains_key(p)
+            });
+        for e in errors {
+            self.error(e);
+        }
         self.send(Box::new(plan));
     }
 
@@ -705,12 +717,18 @@ impl App {
         for (uid, state) in self.devices.states() {
             self.history.store_device_state(uid, state);
         }
+        let (archives, errors) = self.devices.ara_archives(&self.history.project().ara);
+        self.history.store_ara(archives);
         match self.history.save(&self.project_path) {
             Ok(()) => {
                 self.ws.status = Some(Status {
                     text: "SAVED".into(),
                     error: false,
                 });
+                // After SAVED, so a plug-in that lost its edits is what shows.
+                for e in errors {
+                    self.error(e);
+                }
                 true
             }
             Err(e) => {

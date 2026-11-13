@@ -21,6 +21,21 @@ pub struct Project {
     /// A finished track to A/B the mix against, level-matched; never mixed in.
     #[serde(default)]
     pub reference: Option<PathBuf>,
+    /// Each ARA plug-in's document (its edits to the project's audio), saved
+    /// with the project. Not undoable: the plug-in keeps its own undo.
+    #[serde(default)]
+    pub ara: Vec<AraArchive>,
+}
+
+/// An ARA plug-in's document state as it wrote it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AraArchive {
+    /// The plug-in's ARA factory id: which plug-in reads this.
+    pub factory: String,
+    /// The archive format id the plug-in wrote it under.
+    pub archive_id: String,
+    #[serde(with = "base64")]
+    pub bytes: Vec<u8>,
 }
 
 impl Default for Project {
@@ -30,6 +45,7 @@ impl Default for Project {
             sample_rate: 48_000,
             tracks: Vec::new(),
             reference: None,
+            ara: Vec::new(),
         }
     }
 }
@@ -453,6 +469,11 @@ impl History {
         if let Some(d) = device {
             d.state = state;
         }
+    }
+
+    /// Records ARA document archives for the next save, like `store_device_state`.
+    pub fn store_ara(&mut self, archives: Vec<AraArchive>) {
+        self.project.ara = archives;
     }
 
     /// Applies an edit, makes it undoable and clears the redo stack.

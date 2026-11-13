@@ -80,6 +80,31 @@ impl AraFactory {
         text(self.get().plugInName)
     }
 
+    /// The factory's persistent id; names whose document an archive belongs to.
+    pub fn id(&self) -> String {
+        text(self.get().factoryID)
+    }
+
+    /// Whether this factory restores archives written with `archive_id`: its own
+    /// current id or one it lists as compatible.
+    fn reads(&self, archive_id: &str) -> bool {
+        let f = self.get();
+        if text(f.documentArchiveID) == archive_id {
+            return true;
+        }
+        if f.compatibleDocumentArchiveIDs.is_null() {
+            return false;
+        }
+        // SAFETY: the plug-in's array of that length.
+        let ids = unsafe {
+            std::slice::from_raw_parts(
+                f.compatibleDocumentArchiveIDs,
+                f.compatibleDocumentArchiveIDsCount,
+            )
+        };
+        ids.iter().any(|&id| text(id) == archive_id)
+    }
+
     /// The API generation both sides support, newest first.
     fn generation(&self) -> i32 {
         self.get()
@@ -105,6 +130,9 @@ fn c(s: &str) -> CString {
 pub struct AraClip {
     /// Stable across edits, so the plug-in keeps its edits to the region.
     pub id: u64,
+    /// Names the clip's audio across sessions (its file path): the persistent id
+    /// a saved archive finds the plug-in's edits to this audio by. One per audio.
+    pub source: String,
     pub track: usize,
     pub name: String,
     pub audio: Arc<SampleData>,
@@ -268,6 +296,71 @@ impl Document {
         self.factory
     }
 
+    /// Writes the plug-in's whole document state (its edits to every audio
+    /// source) to an archive. Returns the archive id it was written under and
+    /// the bytes, for `restore` in a later session.
+    pub fn store(&self) -> Result<(String, Vec<u8>), HostError> {
+        let store = self.dc_fn(
+            std::mem::offset_of!(sys::ARADocumentControllerInterface, storeObjectsToArchive),
+            |dc| dc.storeObjectsToArchive,
+        );
+        let store = store.ok_or(HostError::NoAra)?;
+        let id = text(self.factory.get().documentArchiveID);
+        let mut archive = Archive {
+            bytes: Vec::new(),
+            id: c(&id),
+        };
+        let writer = (&mut archive as *mut Archive).cast();
+        // SAFETY: not editing; `archive` outlives the call; no filter stores all.
+        let ok = unsafe { store(self.r(), writer, ptr::null()) };
+        if ok == 0 {
+            return Err(HostError::State);
+        }
+        Ok((id, archive.bytes))
+    }
+
+    /// Gives the plug-in back its state from `store`. Its objects are matched by
+    /// persistent id, so call it once `sync` has placed the clips the archive was
+    /// saved with; state for audio not in the document is ignored.
+    pub fn restore(&mut self, archive_id: &str, bytes: &[u8]) -> Result<(), HostError> {
+        if !self.factory.reads(archive_id) {
+            return Err(HostError::State);
+        }
+        let restore = self.dc_fn(
+            std::mem::offset_of!(
+                sys::ARADocumentControllerInterface,
+                restoreObjectsFromArchive
+            ),
+            |dc| dc.restoreObjectsFromArchive,
+        );
+        let restore = restore.ok_or(HostError::NoAra)?;
+        let mut archive = Archive {
+            bytes: bytes.to_vec(),
+            id: c(archive_id),
+        };
+        let reader = (&mut archive as *mut Archive).cast();
+        let mut ok = 0;
+        // SAFETY: inside editing, as ARA requires; `archive` outlives the call.
+        self.edit(|d| ok = unsafe { restore(d.r(), reader, ptr::null()) });
+        if ok == 0 {
+            return Err(HostError::State);
+        }
+        Ok(())
+    }
+
+    /// A document controller function, None if the plug-in's interface struct
+    /// (`structSize`) is too old to have the field at `offset`.
+    fn dc_fn<F>(
+        &self,
+        offset: usize,
+        field: impl FnOnce(&sys::ARADocumentControllerInterface) -> Option<F>,
+    ) -> Option<F> {
+        let dc = self.dc();
+        (offset + size_of::<Option<F>>() <= dc.structSize)
+            .then(|| field(&dc))
+            .flatten()
+    }
+
     /// The controller ref plug-in instances are bound to.
     pub fn controller_ref(&self) -> *mut c_void {
         self.r().cast()
@@ -427,8 +520,8 @@ impl Document {
         if !self.sources.contains_key(&key) {
             // Only needed for the call: the plug-in copies what it keeps.
             let ids = [
-                c(&format!("canary.source.{key:x}")),
-                c(&format!("canary.mod.{key:x}")),
+                c(&format!("canary.source.{}", clip.source)),
+                c(&format!("canary.mod.{}", clip.source)),
             ];
             let name = c(&clip.name);
             let host = Box::new(SourceHost {
@@ -864,8 +957,11 @@ mod tests {
     unsafe extern "C" fn new_source(
         _: R,
         _: sys::ARAAudioSourceHostRef,
-        _: *const sys::ARAAudioSourceProperties,
+        props: *const sys::ARAAudioSourceProperties,
     ) -> sys::ARAAudioSourceRef {
+        // SAFETY: the host's properties, alive for this call.
+        let id = text(unsafe { ptr::addr_of!((*props).persistentID).read_unaligned() });
+        log(format!("source id {id}"));
         new_ref("source")
     }
     unsafe extern "C" fn access(_: R, s: sys::ARAAudioSourceRef, on: sys::ARABool) {
@@ -913,6 +1009,11 @@ mod tests {
         log("uninit".into());
     }
 
+    struct Ids([*const c_char; 1]);
+    // SAFETY: static C string pointers, never written.
+    unsafe impl Sync for Ids {}
+    static COMPATIBLE_IDS: Ids = Ids([c"canary.test.v1".as_ptr()]);
+
     struct Fake {
         dc: sys::ARADocumentControllerInterface,
         instance: sys::ARADocumentControllerInstance,
@@ -923,15 +1024,61 @@ mod tests {
     thread_local!(static FAKE: std::cell::Cell<*const sys::ARADocumentControllerInstance> =
         const { std::cell::Cell::new(ptr::null()) });
 
+    thread_local!(static HOST: std::cell::Cell<*const sys::ARADocumentControllerHostInstance> =
+        const { std::cell::Cell::new(ptr::null()) });
+
     unsafe extern "C" fn create_dc(
-        _: *const sys::ARADocumentControllerHostInstance,
+        host: *const sys::ARADocumentControllerHostInstance,
         _: *const sys::ARADocumentProperties,
     ) -> *const sys::ARADocumentControllerInstance {
+        HOST.with(|h| h.set(host));
         FAKE.with(|f| f.get())
     }
 
-    #[test]
-    fn document_keeps_ara_call_order_through_edits_and_teardown() {
+    fn archiving() -> (
+        sys::ARAArchivingControllerHostRef,
+        sys::ARAArchivingControllerInterface,
+    ) {
+        // SAFETY: the host instance of the live test document.
+        HOST.with(|h| unsafe {
+            let host = h.get().read_unaligned();
+            (
+                host.archivingControllerHostRef,
+                host.archivingControllerInterface.read_unaligned(),
+            )
+        })
+    }
+
+    unsafe extern "C" fn store(
+        _: R,
+        w: sys::ARAArchiveWriterHostRef,
+        _: *const sys::ARAStoreObjectsFilter,
+    ) -> sys::ARABool {
+        let (r, a) = archiving();
+        log("store".into());
+        // SAFETY: the host's writer, alive for this call.
+        unsafe { (a.writeBytesToArchive.unwrap())(r, w, 0, 5, b"edits".as_ptr()) }
+    }
+
+    unsafe extern "C" fn restore(
+        _: R,
+        reader: sys::ARAArchiveReaderHostRef,
+        _: *const sys::ARARestoreObjectsFilter,
+    ) -> sys::ARABool {
+        let (r, a) = archiving();
+        // SAFETY: the host's reader, alive for this call.
+        unsafe {
+            let size = (a.getArchiveSize.unwrap())(r, reader);
+            let mut bytes = vec![0; size];
+            let ok = (a.readBytesFromArchive.unwrap())(r, reader, 0, size, bytes.as_mut_ptr());
+            let id = text((a.getDocumentArchiveID.unwrap())(r, reader));
+            log(format!("restore {id} {}", String::from_utf8_lossy(&bytes)));
+            ok
+        }
+    }
+
+    /// The fake plug-in and its factory; keep both alive while the document is.
+    fn fake() -> (Box<Fake>, Box<sys::ARAFactory>) {
         let mut fake = Box::new(Fake {
             dc: sys::ARADocumentControllerInterface {
                 structSize: size_of::<sys::ARADocumentControllerInterface>(),
@@ -950,6 +1097,8 @@ mod tests {
                 createPlaybackRegion: Some(new_region),
                 updatePlaybackRegionProperties: Some(update_region),
                 destroyPlaybackRegion: Some(drop_region),
+                storeObjectsToArchive: Some(store),
+                restoreObjectsFromArchive: Some(restore),
                 ..Default::default()
             },
             instance: Default::default(),
@@ -971,17 +1120,32 @@ mod tests {
             initializeARAWithConfiguration: Some(init),
             uninitializeARA: Some(uninit),
             createDocumentControllerWithDocument: Some(create_dc),
+            factoryID: c"canary.test".as_ptr(),
+            documentArchiveID: c"canary.test.v2".as_ptr(),
+            compatibleDocumentArchiveIDsCount: 1,
+            compatibleDocumentArchiveIDs: COMPATIBLE_IDS.0.as_ptr(),
             ..Default::default()
         };
+        (fake, Box::new(factory))
+    }
+
+    fn open(factory: &sys::ARAFactory) -> Document {
         // SAFETY: a complete fake factory that outlives the document.
-        let factory = unsafe { AraFactory::from_raw((&factory as *const sys::ARAFactory).cast()) };
-        let mut doc = Document::new(factory.unwrap(), "test", 48_000.0).unwrap();
+        let factory = unsafe { AraFactory::from_raw((factory as *const sys::ARAFactory).cast()) };
+        Document::new(factory.unwrap(), "test", 48_000.0).unwrap()
+    }
+
+    #[test]
+    fn document_keeps_ara_call_order_through_edits_and_teardown() {
+        let (fake, factory) = fake();
+        let mut doc = open(&factory);
         take_log();
 
         let audio = |n| Arc::new(SampleData::new(48_000, vec![vec![0.5; n]]).unwrap());
         let (one, two) = (audio(100), audio(200));
         let clip = |id, audio: &Arc<SampleData>, start| AraClip {
             id,
+            source: format!("/a/{}.wav", audio.frames()),
             track: 0,
             name: "c".into(),
             audio: audio.clone(),
@@ -1004,13 +1168,12 @@ mod tests {
         unsafe { doc.bind(0, ext) };
         let mut rendered = take_log();
         rendered.sort();
-        assert_eq!(
-            rendered,
-            regions
-                .iter()
-                .map(|r| format!("render region {r}"))
-                .collect::<Vec<_>>()
-        );
+        let mut want: Vec<_> = regions
+            .iter()
+            .map(|r| format!("render region {r}"))
+            .collect();
+        want.sort();
+        assert_eq!(rendered, want);
 
         // Moving a clip updates it in place; removing one keeps its region while
         // the renderer has it, and asks for the track's instance to be remade.
@@ -1042,6 +1205,43 @@ mod tests {
         assert!(pos("destroy sequence") < pos("destroy context"));
         assert!(pos("end") < pos("destroy controller"));
         assert_eq!(log.last().map(String::as_str), Some("uninit"));
+    }
+
+    #[test]
+    fn archives_store_and_restore_with_stable_source_ids() {
+        let (_fake, factory) = fake();
+        let mut doc = open(&factory);
+        let audio = Arc::new(SampleData::new(48_000, vec![vec![0.5; 100]]).unwrap());
+        let clip = AraClip {
+            id: 1,
+            source: "/a/vox.wav".into(),
+            track: 0,
+            name: "vox".into(),
+            audio,
+            start: 0,
+            offset: 0,
+            length: 50,
+        };
+        doc.sync(&[clip]);
+        assert!(take_log().contains(&"source id canary.source./a/vox.wav".to_string()));
+
+        assert_eq!(
+            doc.store().unwrap(),
+            ("canary.test.v2".into(), b"edits".to_vec())
+        );
+        assert_eq!(take_log(), ["store"]);
+        doc.restore("canary.test.v1", b"older").unwrap();
+        assert_eq!(take_log(), ["begin", "restore canary.test.v1 older", "end"]);
+        assert!(matches!(
+            doc.restore("other.v9", b"x"),
+            Err(HostError::State)
+        ));
+        assert!(
+            take_log().is_empty(),
+            "an unknown archive never reaches the plug-in"
+        );
+        drop(doc);
+        take_log();
     }
 
     #[test]

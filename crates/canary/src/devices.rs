@@ -11,7 +11,7 @@ use daw_core::{NodeId, SampleData};
 use daw_graph::{AudioNode, ExecutionPlan, Source, StepId, MAX_NODES};
 use daw_host::ara::{self, AraClip};
 use daw_host::{Catalog, Format, Hosted, Sampler};
-use daw_project::{Device, PluginFormat, Project, Track};
+use daw_project::{AraArchive, Device, PluginFormat, Project, Track};
 use daw_ui::{DeviceView, ParamView, PluginChoice, SamplerView};
 
 /// Node ids from here up belong to devices; tracks and the master use those below.
@@ -45,6 +45,12 @@ pub struct Devices {
     /// One ARA document per plug-in factory. First field, so documents go before
     /// the catalog unloads the plug-in libraries.
     ara: Vec<ara::Document>,
+    /// Saved ARA documents not yet given back to their plug-in: it is not
+    /// loaded, or some of its clips' audio is not.
+    pending_ara: Vec<AraArchive>,
+    /// Saved ARA documents the plug-in failed to read; saved again unchanged
+    /// rather than overwritten with what the plug-in has now.
+    kept_ara: Vec<AraArchive>,
     catalog: Catalog,
     pub choices: Vec<PluginChoice>,
     live: HashMap<u64, Live>,
@@ -99,6 +105,8 @@ impl Devices {
             .collect();
         Self {
             ara: Vec::new(),
+            pending_ara: Vec::new(),
+            kept_ara: Vec::new(),
             catalog,
             choices,
             live: HashMap::new(),
@@ -350,14 +358,25 @@ impl Devices {
     /// tracks its plug-ins sit on. A renderer's regions can only be set before it
     /// is activated, so ARA plug-ins whose track gained or lost regions, or which
     /// moved to another track, are retired here and made again on the next sync.
-    // shortcut: clip ids are (track, index), so reordering clips recreates regions
-    // and the plug-in's edits to them; give clips stable ids for real ARA editing.
-    // shortcut: ARA document archives are not saved with the project yet.
-    pub fn sync_ara(&mut self, project: &Project, audio: &HashMap<PathBuf, Arc<SampleData>>) {
+    /// A saved document goes back to its plug-in once no clip it plays is still
+    /// loading, so the plug-in finds each source its edits belong to. Returns errors.
+    // shortcut: region ids are (track, index), so reordering clips recreates
+    // regions and remakes the track's instances. Edits survive: ARA keeps them on
+    // the audio modification (one per file), which has a stable persistent id.
+    /// `loading` says whether a file's audio is still on its way; a file that
+    /// failed to load does not hold the restore back (only its edits are lost).
+    pub fn sync_ara(
+        &mut self,
+        project: &Project,
+        audio: &HashMap<PathBuf, Arc<SampleData>>,
+        loading: impl Fn(&Path) -> bool,
+    ) -> Vec<String> {
+        let mut errors = Vec::new();
         if self.ara.is_empty() {
-            return;
+            return errors;
         }
         let mut clips: Vec<Vec<AraClip>> = (0..self.ara.len()).map(|_| Vec::new()).collect();
+        let mut missing = vec![false; self.ara.len()];
         let mut remake = Vec::new();
         for (ti, track) in project.tracks.iter().enumerate() {
             let docs: Vec<usize> = track
@@ -372,9 +391,11 @@ impl Devices {
                 })
                 .collect();
             for doc in docs {
+                missing[doc] |= track.clips.iter().any(|c| loading(&c.source));
                 clips[doc].extend(track.clips.iter().enumerate().filter_map(|(ci, c)| {
                     Some(AraClip {
                         id: (ti as u64) << 32 | ci as u64,
+                        source: c.source.to_string_lossy().into_owned(),
                         track: ti,
                         name: c.source.file_stem()?.to_string_lossy().into_owned(),
                         audio: audio.get(&c.source)?.clone(),
@@ -389,7 +410,18 @@ impl Devices {
             let mut clips = clips.clone();
             clips.sort_by_key(|c| c.id);
             clips.dedup_by_key(|c| c.id); // two ARA devices on one track
-            for track in document.sync(&clips) {
+            let stale = document.sync(&clips);
+            let factory = document.factory().id();
+            let saved = self.pending_ara.iter().position(|a| a.factory == factory);
+            if let (Some(i), false) = (saved, missing[doc]) {
+                let a = self.pending_ara.remove(i);
+                if let Err(e) = document.restore(&a.archive_id, &a.bytes) {
+                    let name = document.factory().name();
+                    errors.push(format!("{name}: saved ARA edits not restored: {e}"));
+                    self.kept_ara.push(a);
+                }
+            }
+            for track in stale {
                 remake.extend(project.tracks.get(track).into_iter().flat_map(|t| {
                     t.devices.iter().map(|d| d.uid).filter(|uid| {
                         self.live
@@ -402,6 +434,25 @@ impl Devices {
         for uid in remake {
             self.retire(uid);
         }
+        errors
+    }
+
+    /// Saved ARA documents from the project, given back as their plug-ins load.
+    pub fn restore_ara(&mut self, archives: Vec<AraArchive>) {
+        self.pending_ara = archives;
+    }
+
+    /// Every ARA document to save, with errors; see `merge_archives`.
+    pub fn ara_archives(&self, previous: &[AraArchive]) -> (Vec<AraArchive>, Vec<String>) {
+        let live = self
+            .ara
+            .iter()
+            .map(|d| {
+                let stored = d.store().map_err(|e| e.to_string());
+                (d.factory().id(), d.factory().name(), stored)
+            })
+            .collect();
+        merge_archives(&self.pending_ara, &self.kept_ara, live, previous)
     }
 
     /// Shows device `uid`'s own editor, or brings its window forward.
@@ -565,6 +616,46 @@ impl Devices {
     }
 }
 
+/// A live ARA document at save time: factory id, plug-in name, `store` result.
+type LiveArchive = (String, String, Result<(String, Vec<u8>), String>);
+
+/// What a save writes for ARA: an archive not yet restored (`pending`) or one
+/// the plug-in could not read (`kept`) is written back unchanged in place of its
+/// plug-in's live document; every other live document as `store` gave it
+/// (factory, name, result), or the `previous` save's archive if storing failed.
+/// Each lost set of edits is an error, so the user hears of it.
+fn merge_archives(
+    pending: &[AraArchive],
+    kept: &[AraArchive],
+    live: Vec<LiveArchive>,
+    previous: &[AraArchive],
+) -> (Vec<AraArchive>, Vec<String>) {
+    let mut errors = Vec::new();
+    let mut out: Vec<AraArchive> = pending.iter().chain(kept).cloned().collect();
+    for (factory, name, stored) in live {
+        if out.iter().any(|a| a.factory == factory) {
+            if kept.iter().any(|a| a.factory == factory) {
+                errors.push(format!(
+                    "{name}: ARA edits from this session not saved; the saved ones it could not read are kept"
+                ));
+            }
+            continue;
+        }
+        match stored {
+            Ok((archive_id, bytes)) => out.push(AraArchive {
+                factory,
+                archive_id,
+                bytes,
+            }),
+            Err(e) => {
+                errors.push(format!("{name}: ARA edits not saved: {e}"));
+                out.extend(previous.iter().filter(|a| a.factory == factory).cloned());
+            }
+        }
+    }
+    (out, errors)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -671,5 +762,38 @@ mod tests {
                 .unwrap();
             assert_eq!(plan.takes_midi(step), selected);
         }
+    }
+
+    #[test]
+    fn saves_keep_unrestored_archives_and_the_last_good_one() {
+        let a = |factory: &str, bytes: &[u8]| AraArchive {
+            factory: factory.into(),
+            archive_id: "v1".into(),
+            bytes: bytes.to_vec(),
+        };
+        let stored = |bytes: &[u8]| Ok(("v1".to_string(), bytes.to_vec()));
+        let live = vec![
+            ("pending".into(), "P".into(), stored(b"empty")),
+            ("kept".into(), "K".into(), stored(b"new")),
+            ("ok".into(), "O".into(), stored(b"now")),
+            ("broken".into(), "B".into(), Err("fail".to_string())),
+        ];
+        let previous = [a("broken", b"last"), a("ok", b"old")];
+        let (out, errors) = merge_archives(
+            &[a("pending", b"saved")],
+            &[a("kept", b"unread")],
+            live,
+            &previous,
+        );
+        assert_eq!(
+            out,
+            [
+                a("pending", b"saved"),
+                a("kept", b"unread"),
+                a("ok", b"now"),
+                a("broken", b"last")
+            ]
+        );
+        assert_eq!(errors.len(), 2, "{errors:?}"); // K's session edits, B's store
     }
 }

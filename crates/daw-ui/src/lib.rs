@@ -40,6 +40,8 @@ pub struct EngineView {
     pub listen: Listen,
     /// The reference plays instead of the mix.
     pub reference_on: bool,
+    /// Audio thread time per block over the block's length (1.0 = overloaded).
+    pub dsp_load: f32,
 }
 
 /// What the master outputs.
@@ -65,6 +67,7 @@ impl Default for EngineView {
             correlation: 0.0,
             listen: Listen::Stereo,
             reference_on: false,
+            dsp_load: 0.0,
         }
     }
 }
@@ -134,6 +137,8 @@ pub enum Request {
         ratio: f64,
         semitones: f64,
     },
+    /// Audition a file from the browser (`None` stops).
+    Preview(Option<PathBuf>),
     /// Write `track`'s notes in the current pattern to a MIDI file.
     ExportMidi {
         track: usize,
@@ -1075,6 +1080,19 @@ impl Workspace {
             m.mono(0.75),
             t.muted,
         );
+        // DSP load, red when the engine cannot keep up.
+        let load = p.text(
+            Pos2::new(rate.min.x - 1.0 * u, cy),
+            Align2::RIGHT_CENTER,
+            format!("DSP {:>3.0}%", engine.dsp_load * 100.0),
+            m.mono(0.75),
+            if engine.dsp_load >= 0.9 {
+                t.bad
+            } else {
+                t.muted
+            },
+        );
+        let rate = load;
         // EXPORT (Shift: with stems); right-click picks the format.
         let label = format!("EXPORT {}", self.export_format.label());
         let g = p.layout_no_wrap(label.clone(), m.mono(0.625), t.text);
@@ -1328,13 +1346,23 @@ impl Workspace {
                 p.hline(label.x_range(), m.snap(label.max.y), m.hair(t.text));
             }
             let nudge = if resp.hovered() { 0.25 * u } else { 0.0 };
+            // The arrow auditions the file; the rest of the row adds it.
+            let hear = Rect::from_x_y_ranges(r.max.x - 2.25 * u..=r.max.x, row.y_range());
+            let hear_resp = ui.interact(hear, ui.scope_id().with(("hear", i)), Sense::click());
             p.text(
                 Pos2::new(r.max.x - 0.75 * u + nudge - 0.25 * u, row.center().y),
                 Align2::RIGHT_CENTER,
-                "→",
+                if hear_resp.hovered() { "▶" } else { "→" },
                 m.mono(0.75),
-                t.faint,
+                if hear_resp.hovered() {
+                    t.accent_amber
+                } else {
+                    t.faint
+                },
             );
+            if hear_resp.clicked() {
+                out.push(Request::Preview(Some(path.clone())));
+            }
             p.hline(r.x_range(), m.snap(row.max.y), m.hair(t.line));
             if resp.clicked() {
                 out.push(Request::AddFile {

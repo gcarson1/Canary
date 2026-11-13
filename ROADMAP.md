@@ -97,7 +97,7 @@ The UI follows Styles.md whichever framework is chosen.
 - [x] MIXER view: channel strips with ladder faders (-60..+6 dB, double-click resets), pan dials, per-track peak meters (`TrackParams::report_peak`), M/S, output selector and send rows; drags are one undo step each (`History::apply_gesture`). Insert slots stay in the rack
 - [x] Buses: `+ BUS` in the mixer; any track outputs to the master or a bus, and sends post-fader to buses (`Track::id`/`bus`/`output`/`sends`, `Action::SetRouting`, refused if it would loop; `Project::route_order` schedules sources first). Still to do: pre-fader sends, folder tracks in the playlist
 - [x] Sidechain: built-in compressor key input from any track (`Device::sidechain`, `Action::SetSidechain`, key on the effect's inputs 2-3, `Effect::process_keyed`); KEY in a built-in module's header picks the source track. Still to do: plugins with a sidechain bus
-- [ ] CPU/DSP load readout (per-track peak meters are in the mixer)
+- [x] DSP load readout in the top bar (`Telemetry::Load`: render time over block time, red from 90%)
 - [ ] Freeze (render a track through its devices to audio, devices unloaded) and bounce in place
 - [ ] Input monitoring and per-track record arm; duplex recording with input/output latency compensation
 
@@ -121,5 +121,5 @@ The UI follows Styles.md whichever framework is chosen.
 - [x] Project template (Cmd+Shift+T saves the project as `Templates/Default.daw`; new projects start from it), autosave every minute to `<project>.autosave.daw` (removed on save; a newer one at startup says so, Cmd+Shift+R recovers it). Still to do: collect-and-save, relative sample paths
 - [ ] Preferences: audio device, sample rate and buffer size, all MIDI inputs, theme (dark/daylight), UI scale
 - [x] Shortcuts: F5 playlist, F6 step sequencer, F7 piano roll, F9 mixer, P draw, C slice, Cmd+Shift+L daylight theme; Cmd+C/X/V for playlist clips (pasted at the playhead on the selected track) and piano-roll notes. Still to do: marquee select in the playlist
-- [ ] Browser: preview samples on click, favorites, search across folders, plugin browser
+- [x] Browser preview: the arrow at a file row's end auditions it through the master (`daw_graph::PreviewNode`, kept across plans, left out of exports). Still to do: favorites, search across folders
 - [ ] Multi-core DSP: independent branches run on a real-time worker pool

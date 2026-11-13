@@ -926,6 +926,7 @@ dependencies = [
  "assert_no_alloc",
  "daw-core",
  "daw-dsp",
+ "rtrb",
 ]
 
 [[package]]

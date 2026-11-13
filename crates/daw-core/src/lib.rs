@@ -127,6 +127,9 @@ pub enum Telemetry {
         peak: [f32; 2],
         rms: [f32; 2],
     },
+    /// Time spent rendering the block over the time the block lasts: above 1.0
+    /// the engine cannot keep up.
+    Load(f32),
 }
 
 /// Decoded audio, one plane per channel. Built on the main thread and shared with

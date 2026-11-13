@@ -5,6 +5,7 @@ mod effect;
 mod monitor;
 mod plan;
 mod poly;
+mod preview;
 mod sampler;
 mod sequence;
 mod synth;
@@ -17,6 +18,7 @@ pub use plan::{
     MAX_NODES,
 };
 pub use poly::{PolySynthNode, SYNTH_PARAMS};
+pub use preview::{Preview, PreviewNode};
 pub use sampler::{SamplerData, SamplerNode, Zone, SAMPLER_PARAMS};
 pub use synth::SynthNode;
 pub use track::TrackNode;

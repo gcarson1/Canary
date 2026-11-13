@@ -173,6 +173,16 @@ impl AudioEngine {
     /// Renders one block of interleaved audio with `channels` channels.
     /// Commands and plans queued before the call take effect at the start of the block.
     pub fn process(&mut self, output: &mut [f32], channels: usize) {
+        let began = std::time::Instant::now();
+        self.render(output, channels);
+        let frames = (output.len() / channels.max(1)).max(1) as f32;
+        let budget = frames / self.sample_rate.max(1.0);
+        let _ = self
+            .telemetry
+            .push(Telemetry::Load(began.elapsed().as_secs_f32() / budget));
+    }
+
+    fn render(&mut self, output: &mut [f32], channels: usize) {
         while let Ok(command) = self.commands.pop() {
             self.transport.apply(command);
         }

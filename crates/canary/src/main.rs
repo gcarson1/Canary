@@ -22,7 +22,8 @@ use daw_dsp::WaveformPyramid;
 use daw_dsp::{integrated_loudness, TruePeak};
 use daw_engine::{EngineHandle, MidiConnection, MidiSender, Recorder};
 use daw_graph::{
-    ExecutionPlan, MasterNode, Monitor, MonitorMode, PeakTap, SendNode, Source, StepId, TrackNode,
+    ExecutionPlan, MasterNode, Monitor, MonitorMode, PeakTap, Preview, PreviewNode, SendNode,
+    Source, StepId, TrackNode,
 };
 use daw_host::LayerKind;
 use daw_project::{Action, ClipRef, History, Lane, Playback, Target, Track};
@@ -36,7 +37,9 @@ const REFERENCE_NODE: NodeId = NodeId(devices::FIRST_DEVICE_NODE - 1);
 /// Track nodes are 1..=MAX_TRACKS; send nodes take the ids after them, up to
 /// the reference's.
 const MAX_TRACKS: usize = 1023;
-const SEND_NODES: std::ops::Range<u32> = MAX_TRACKS as u32 + 1..REFERENCE_NODE.0;
+const SEND_NODES: std::ops::Range<u32> = MAX_TRACKS as u32 + 1..PREVIEW_NODE.0;
+/// The browser's audition voice, inserted once and kept, like the master.
+const PREVIEW_NODE: NodeId = NodeId(REFERENCE_NODE.0 - 1);
 const AUDIO_EXTENSIONS: [&str; 7] = ["wav", "flac", "mp3", "m4a", "aac", "aif", "aiff"];
 const MIDI_EXTENSIONS: [&str; 2] = ["mid", "midi"];
 /// New projects start from this, under the samples folder.
@@ -123,6 +126,11 @@ struct App {
     midi_take: Option<take::MidiTake>,
     /// A mix export in progress.
     export: Option<export::Export>,
+    /// The preview node until the first plan inserts it, and its control.
+    preview_node: Option<Box<PreviewNode>>,
+    preview: Preview,
+    /// A file to audition once it has loaded.
+    preview_wanted: Option<PathBuf>,
     last_autosave: Instant,
     /// The monitor mode and A/B reference to put back after an export.
     export_restore: Option<(MonitorMode, bool)>,
@@ -211,6 +219,7 @@ impl App {
         let (loads_tx, loads_rx) = mpsc::channel();
         let (stretch_tx, stretch_rx) = mpsc::channel();
         let (master, monitor) = MasterNode::new(config.sample_rate as f32);
+        let (preview_node, preview) = PreviewNode::new();
         let mut app = Self {
             ws,
             history,
@@ -260,6 +269,9 @@ impl App {
             stretch_rx,
             title: String::new(),
             master: Some(Box::new(master)),
+            preview_node: Some(Box::new(preview_node)),
+            preview,
+            preview_wanted: None,
             monitor,
             built_reference: None,
             reference_lufs: None,
@@ -671,6 +683,15 @@ impl App {
         if let Some(node) = self.master.take() {
             plan.insert(master, node);
         }
+        // The browser preview joins the mix, but not an export's.
+        if let Some(node) = self.preview_node.take() {
+            plan.insert(PREVIEW_NODE, node);
+        }
+        if self.export.is_none() {
+            if let Ok(step) = plan.add(PREVIEW_NODE, vec![], 2) {
+                steps.push(step);
+            }
+        }
         let sum = |channel| steps.iter().map(|&step| Source { step, channel }).collect();
         let mut inputs: Vec<Vec<Source>> = vec![sum(0), sum(1)];
         self.live = (1..=count as u32).map(NodeId).chain(sends).collect();
@@ -778,6 +799,10 @@ impl App {
                     self.view.playhead = sample;
                     self.view.playing = playing;
                 }
+                Telemetry::Load(load) => {
+                    // Shown as a slow-falling peak, so short spikes are seen.
+                    self.view.dsp_load = load.max(self.view.dsp_load * 0.97);
+                }
                 Telemetry::Levels { peak: p, rms } => {
                     got_levels = true;
                     peak = [peak[0].max(p[0]), peak[1].max(p[1])];
@@ -857,6 +882,20 @@ impl App {
             Request::ExportMidi { track } => self.export_midi(track),
             Request::ToggleRecord => self.toggle_record(),
             Request::Export { stems } => self.toggle_export(stems),
+            Request::Preview(path) => {
+                self.preview_wanted = None;
+                match path {
+                    Some(p) if has_extension(&p, &MIDI_EXTENSIONS) => {}
+                    Some(p) => match self.audio.get(&p) {
+                        Some(audio) => drop(self.preview.play(Some(audio.clone()))),
+                        None => {
+                            self.preview_wanted = Some(p.clone());
+                            self.load(p, None);
+                        }
+                    },
+                    None => drop(self.preview.play(None)),
+                }
+            }
             Request::Stretch {
                 track,
                 index,
@@ -1548,6 +1587,16 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         self.receive_loads();
         self.receive_stretches();
+        self.preview.collect();
+        if let Some(audio) = self
+            .preview_wanted
+            .as_ref()
+            .and_then(|p| self.audio.get(p))
+            .cloned()
+        {
+            self.preview_wanted = None;
+            self.preview.play(Some(audio));
+        }
         self.read_telemetry();
         self.tend_export();
         self.engine.collect_garbage();

@@ -261,12 +261,17 @@ pub(crate) fn show(
                     )
                     .collect();
                 let now = choices.iter().position(|&c| c == d.sidechain).unwrap_or(0);
-                // Sources that would loop are refused; the next click moves on.
-                ws.edit(Action::SetSidechain {
-                    track,
-                    device: di,
-                    source: choices[(now + 1) % choices.len()],
-                });
+                // The next source on that would not feed the track back into itself.
+                let next = (1..choices.len())
+                    .map(|k| Action::SetSidechain {
+                        track,
+                        device: di,
+                        source: choices[(now + k) % choices.len()],
+                    })
+                    .find(|a| a.applies_to(project));
+                if let Some(action) = next {
+                    ws.edit(action);
+                }
             }
             title_end = key.min.x;
         }

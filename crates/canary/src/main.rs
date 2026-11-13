@@ -12,7 +12,7 @@ mod take;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{env, fs, thread};
@@ -22,7 +22,7 @@ use daw_dsp::WaveformPyramid;
 use daw_dsp::{integrated_loudness, TruePeak};
 use daw_engine::{EngineHandle, MidiConnection, MidiSender, Recorder};
 use daw_graph::{
-    ExecutionPlan, GainNode, MasterNode, Monitor, MonitorMode, Source, StepId, TrackNode,
+    ExecutionPlan, MasterNode, Monitor, MonitorMode, PeakTap, SendNode, Source, StepId, TrackNode,
 };
 use daw_host::LayerKind;
 use daw_project::{Action, ClipRef, History, Lane, Playback, Target, Track};
@@ -88,6 +88,8 @@ struct App {
     built_clicks: Vec<SeqEvent>,
     built_automation: Vec<Vec<Lane>>,
     built_routing: Vec<Routing>,
+    /// Each live send's (track, bus) and its level, set without a rebuild.
+    send_levels: Vec<((usize, usize), Arc<AtomicU32>)>,
     /// Each track's output peak for the mixer, held and falling.
     meters: Vec<[f32; 2]>,
     /// The metronome switch as last sent to the engine.
@@ -208,6 +210,7 @@ impl App {
             built_clicks: Vec::new(),
             built_automation: Vec::new(),
             built_routing: Vec::new(),
+            send_levels: Vec::new(),
             meters: Vec::new(),
             sent_metronome: false,
             midi,
@@ -452,11 +455,22 @@ impl App {
     }
 
     fn set_params(&self) {
-        for (track, params) in self.history.project().tracks.iter().zip(&self.params) {
+        let project = self.history.project();
+        // A soloed track keeps the buses it feeds and the sources of a soloed bus.
+        let solo = project.solo_set();
+        for (i, (track, params)) in project.tracks.iter().zip(&self.params).enumerate() {
             params.set_gain(track.gain);
             params.set_pan(track.pan);
             params.set_mute(track.mute);
-            params.set_solo(track.solo);
+            params.set_solo(solo.get(i).copied().unwrap_or(false));
+        }
+        for ((from, to), level) in &self.send_levels {
+            let gain = project
+                .sends_of(*from)
+                .iter()
+                .find(|s| s.0 == *to)
+                .map_or(0.0, |s| s.1);
+            level.store(gain.to_bits(), Ordering::Relaxed);
         }
     }
 
@@ -494,6 +508,7 @@ impl App {
         let mut bus_in: Vec<Vec<StepId>> = vec![Vec::new(); count];
         let mut steps = Vec::with_capacity(count);
         let mut sends = Vec::new();
+        let mut send_levels = Vec::new();
         for &i in &order {
             let track = &tracks[i];
             // An ARA plug-in on the track renders its clips itself.
@@ -548,6 +563,13 @@ impl App {
                 self.devices
                     .effects_after(&mut plan, track, track_step, &mut device_steps, &keys);
             out_step[i] = Some(last);
+            // The meter reads the track after its effects.
+            plan.tap(
+                last,
+                Box::new(PeakTap {
+                    params: self.params[i].clone(),
+                }),
+            );
             match project.output_of(i).filter(|&j| j < count) {
                 Some(j) => bus_in[j].push(last),
                 None => steps.push(last),
@@ -557,7 +579,9 @@ impl App {
                 if j >= count || !SEND_NODES.contains(&id.0) {
                     continue;
                 }
-                plan.insert(id, Box::new(GainNode { gain: level }));
+                let atomic = Arc::new(AtomicU32::new(level.to_bits()));
+                plan.insert(id, Box::new(SendNode::new(atomic.clone())));
+                send_levels.push(((i, j), atomic));
                 let from = |channel| {
                     vec![Source {
                         step: last,
@@ -594,6 +618,7 @@ impl App {
         let sum = |channel| steps.iter().map(|&step| Source { step, channel }).collect();
         let mut inputs: Vec<Vec<Source>> = vec![sum(0), sum(1)];
         self.live = (1..=count as u32).map(NodeId).chain(sends).collect();
+        self.send_levels = send_levels;
         // The reference plays in sync, into the master's spare inputs, never the mix.
         let reference = self.history.project().reference.clone();
         if let Some(audio) = reference.as_ref().and_then(|p| self.audio.get(p)) {
@@ -702,7 +727,7 @@ impl App {
         for (shown, params) in self.meters.iter_mut().zip(&self.params) {
             let peak = params.take_peak();
             for side in 0..2 {
-                shown[side] = peak[side].max(shown[side] * 0.93);
+                shown[side] = peak[side].max(shown[side] * 0.963);
             }
         }
         let r = self.monitor.readings();
@@ -1266,15 +1291,9 @@ impl eframe::App for App {
     }
 }
 
-/// What of a track's routing the plan depends on: id, bus, output, sends and
-/// each device's sidechain.
-type Routing = (
-    u64,
-    bool,
-    Option<u64>,
-    Vec<daw_project::Send>,
-    Vec<Option<u64>>,
-);
+/// What of a track's routing the plan's shape depends on: id, bus, output, the
+/// buses it sends to (levels are set live) and each device's sidechain.
+type Routing = (u64, bool, Option<u64>, Vec<u64>, Vec<Option<u64>>);
 
 fn routing(project: &daw_project::Project) -> Vec<Routing> {
     project
@@ -1282,7 +1301,13 @@ fn routing(project: &daw_project::Project) -> Vec<Routing> {
         .iter()
         .map(|t| {
             let keys = t.devices.iter().map(|d| d.sidechain).collect();
-            (t.id, t.bus, t.output, t.sends.clone(), keys)
+            (
+                t.id,
+                t.bus,
+                t.output,
+                t.sends.iter().map(|s| s.to).collect(),
+                keys,
+            )
         })
         .collect()
 }

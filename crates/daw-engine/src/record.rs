@@ -120,7 +120,11 @@ pub fn bounce_tap(input: RecordInput, max_block: usize) -> Box<dyn daw_graph::Ta
 }
 
 impl daw_graph::Tap for BounceTap {
-    fn write(&mut self, left: &[f32], right: &[f32]) {
+    /// Writes only while the transport rolls.
+    fn write(&mut self, left: &[f32], right: &[f32], context: &daw_core::ProcessContext) {
+        if !context.playing {
+            return;
+        }
         let n = left.len().min(right.len()).min(self.scratch.len() / 2);
         for i in 0..n {
             self.scratch[2 * i] = left[i];

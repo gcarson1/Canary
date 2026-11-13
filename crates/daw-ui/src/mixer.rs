@@ -153,13 +153,17 @@ pub(crate) fn show(
                 )
                 .collect();
             let now = choices.iter().position(|&c| c == track.output).unwrap_or(0);
-            let output = choices[(now + 1) % choices.len()];
-            // A choice that would loop a bus back into itself is refused.
-            ws.edit(Action::SetRouting {
-                track: ti,
-                output,
-                sends: track.sends.clone(),
-            });
+            // The next choice on that does not loop a bus back into itself.
+            let next = (1..choices.len())
+                .map(|k| Action::SetRouting {
+                    track: ti,
+                    output: choices[(now + k) % choices.len()],
+                    sends: track.sends.clone(),
+                })
+                .find(|a| a.applies_to(project));
+            if let Some(action) = next {
+                ws.edit(action);
+            }
         }
         y = row.max.y + 0.375 * u;
 

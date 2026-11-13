@@ -85,14 +85,59 @@ impl Project {
         (order.len() == n).then_some(order)
     }
 
-    /// A track id not used in the project.
+    /// A track id never used in the project: past every track's id and every id
+    /// an output, send or sidechain still points at, so a new track never picks
+    /// up a removed one's routing.
     pub fn new_track_id(&self) -> u64 {
+        let referenced = self.tracks.iter().flat_map(|t| {
+            t.output
+                .into_iter()
+                .chain(t.sends.iter().map(|s| s.to))
+                .chain(t.devices.iter().filter_map(|d| d.sidechain))
+        });
         self.tracks
             .iter()
-            .map(|t| t.id.saturating_add(1))
+            .map(|t| t.id)
+            .chain(referenced)
+            .map(|id| id.saturating_add(1))
             .max()
             .unwrap_or(1)
             .max(1)
+    }
+
+    /// Which tracks play while any is soloed: the soloed ones, every track they
+    /// feed (their buses and send returns) and every track feeding them (the
+    /// sources of a soloed bus). Empty when nothing is soloed.
+    pub fn solo_set(&self) -> Vec<bool> {
+        let n = self.tracks.len();
+        if !self.tracks.iter().any(|t| t.solo) {
+            return Vec::new();
+        }
+        let mut down: Vec<Vec<usize>> = vec![Vec::new(); n];
+        let mut up: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for (i, feeds) in down.iter_mut().enumerate() {
+            for j in self
+                .output_of(i)
+                .into_iter()
+                .chain(self.sends_of(i).into_iter().map(|s| s.0))
+            {
+                feeds.push(j);
+                up[j].push(i);
+            }
+        }
+        let mut on = vec![false; n];
+        for edges in [&down, &up] {
+            let mut stack: Vec<usize> = (0..n).filter(|&i| self.tracks[i].solo).collect();
+            let mut seen = vec![false; n];
+            while let Some(i) = stack.pop() {
+                if std::mem::replace(&mut seen[i], true) {
+                    continue;
+                }
+                on[i] = true;
+                stack.extend(&edges[i]);
+            }
+        }
+        on
     }
 }
 
@@ -128,6 +173,42 @@ mod tests {
         assert_eq!(p.sends_of(1).len(), 1);
         p.tracks[0].output = Some(3);
         assert_eq!(p.route_order(), None, "1 -> 3 -> 1");
+    }
+
+    #[test]
+    fn solo_keeps_the_path_through_buses_and_sends() {
+        // Kick -> Drums bus; Vox sends to Verb; Pad on its own.
+        let mut p = Project {
+            tracks: vec![
+                track(1, false),
+                track(2, true),
+                track(3, false),
+                track(4, true),
+                track(5, false),
+            ],
+            ..Project::default()
+        };
+        p.tracks[0].output = Some(2);
+        p.tracks[2].sends.push(Send { to: 4, level: 0.5 });
+        assert!(p.solo_set().is_empty());
+        p.tracks[0].solo = true;
+        assert_eq!(p.solo_set(), [true, true, false, false, false]);
+        p.tracks[0].solo = false;
+        p.tracks[1].solo = true; // the bus: its sources play
+        assert_eq!(p.solo_set(), [true, true, false, false, false]);
+        p.tracks[1].solo = false;
+        p.tracks[2].solo = true; // the vocal keeps its reverb
+        assert_eq!(p.solo_set(), [false, false, true, true, false]);
+    }
+
+    #[test]
+    fn removed_ids_are_never_reused() {
+        let mut p = Project {
+            tracks: vec![track(1, false)],
+            ..Project::default()
+        };
+        p.tracks[0].output = Some(9); // a bus that was deleted
+        assert_eq!(p.new_track_id(), 10);
     }
 
     #[test]

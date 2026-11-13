@@ -58,6 +58,74 @@ pub trait AudioNode: Send {
     fn automate(&mut self, _id: u32, _value: f64) {}
 }
 
+/// Reports a step's peak to a track's params every block: the track meter,
+/// taken after the track's effects.
+pub struct PeakTap {
+    pub params: std::sync::Arc<daw_core::TrackParams>,
+}
+
+impl Tap for PeakTap {
+    fn write(&mut self, left: &[f32], right: &[f32], _context: &ProcessContext) {
+        let peak = |x: &[f32]| x.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        self.params.report_peak([peak(left), peak(right)]);
+    }
+}
+
+/// A send: stereo through a level the main thread sets (`f32` bits, linear),
+/// glided over 20 ms so moving it does not click.
+pub struct SendNode {
+    level: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    smoother: daw_dsp::Smoother,
+}
+
+impl SendNode {
+    /// Starts settled at the level's current value.
+    pub fn new(level: std::sync::Arc<std::sync::atomic::AtomicU32>) -> Self {
+        let now = f32::from_bits(level.load(std::sync::atomic::Ordering::Relaxed));
+        Self {
+            level,
+            smoother: daw_dsp::Smoother::new(now),
+        }
+    }
+}
+
+impl AudioNode for SendNode {
+    fn process(
+        &mut self,
+        inputs: &[&[f32]],
+        outputs: &mut [&mut [f32]],
+        _midi_in: &[MidiEvent],
+        _midi_out: &mut Vec<MidiEvent>,
+        context: &ProcessContext,
+    ) {
+        let target = f32::from_bits(self.level.load(std::sync::atomic::Ordering::Relaxed));
+        self.smoother.set_time(0.02, context.sample_rate);
+        self.smoother
+            .set_target(if target.is_finite() { target } else { 0.0 });
+        let [l, r, rest @ ..] = outputs else {
+            outputs.iter_mut().for_each(|o| o.fill(0.0));
+            return;
+        };
+        rest.iter_mut().for_each(|o| o.fill(0.0));
+        let (il, ir) = match inputs {
+            [a, b, ..] => (*a, *b),
+            [a] => (*a, *a),
+            [] => {
+                l.fill(0.0);
+                r.fill(0.0);
+                return;
+            }
+        };
+        for i in 0..l.len() {
+            let g = self.smoother.tick();
+            l[i] = il[i] * g;
+            r[i] = ir[i] * g;
+        }
+    }
+
+    fn reset(&mut self) {}
+}
+
 /// Multiplies each input channel by a fixed linear gain into the matching output
 /// channel. Output channels with no matching input are zeroed.
 pub struct GainNode {

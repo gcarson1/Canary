@@ -441,6 +441,12 @@ fn track(p: &mut Project, i: usize) -> Result<&mut Track, ActionError> {
 }
 
 impl Action {
+    /// Whether the edit would apply to `project`, without changing it. Clones
+    /// the project: for pickers checking a handful of choices on a click.
+    pub fn applies_to(&self, project: &Project) -> bool {
+        self.clone().apply(&mut project.clone()).is_ok()
+    }
+
     /// Applies the edit and returns the action that undoes it. Changes nothing on error.
     fn apply(self, p: &mut Project) -> Result<Action, ActionError> {
         use Action::*;
@@ -940,6 +946,9 @@ impl History {
         }
         // Projects from before routing have no track ids: number them.
         let first = file.project.new_track_id();
+        if first == u64::MAX {
+            return Err(ProjectError::Invalid);
+        }
         let unnumbered = file.project.tracks.iter_mut().filter(|t| t.id == 0);
         for (id, t) in (first..).zip(unnumbered) {
             t.id = id;
@@ -948,6 +957,7 @@ impl History {
         let mut track_ids: Vec<u64> = p.tracks.iter().map(|t| t.id).collect();
         track_ids.sort_unstable();
         let routable = track_ids.windows(2).all(|w| w[0] != w[1])
+            && track_ids.last().is_none_or(|&id| id < u64::MAX)
             && p.route_order().is_some()
             && p.tracks
                 .iter()

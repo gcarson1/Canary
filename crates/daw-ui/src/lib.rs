@@ -426,7 +426,7 @@ impl Workspace {
         );
         self.tool_strip(ui, &p, &m, z.tools);
         match self.page {
-            Page::Sequencer => sequencer::show(self, ui, &p, &m, z.timeline, &inputs),
+            Page::Sequencer => sequencer::show(self, ui, &p, &m, z.timeline, &inputs, &mut out),
             Page::Playlist => timeline::show(self, ui, &p, &m, z.timeline, &inputs, &mut out),
             Page::PianoRoll => piano::show(self, ui, &p, &m, z.timeline, &inputs, &mut out),
             Page::Mixer => mixer::show(self, ui, &p, &m, z.timeline, &inputs),

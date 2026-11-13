@@ -112,7 +112,8 @@ pub(crate) fn show(
     let was_open = ws.picker.is_some();
     let module_w = 16.0 * u;
     let width = |d: &DeviceView| {
-        if d.sampler.is_some() {
+        // The sampler's panel, or more dials than one module holds, take two.
+        if d.sampler.is_some() || d.params.len() > DIALS {
             2.0 * module_w
         } else {
             module_w
@@ -313,10 +314,12 @@ pub(crate) fn show(
             dials_x = panel.max.x;
         }
         let cell = Vec2::new(module_w / 4.0, (module.height() - 2.5 * u) / 2.0);
-        for (pi, param) in device.params.iter().take(DIALS).enumerate() {
+        // Two rows of as many columns as fit beside any panel.
+        let cols = (((module.max.x - dials_x) / cell.x).round() as usize).max(1);
+        for (pi, param) in device.params.iter().take(cols * 2).enumerate() {
             let origin = Pos2::new(
-                dials_x + (pi % 4) as f32 * cell.x,
-                top + 1.25 * u + (pi / 4) as f32 * cell.y,
+                dials_x + (pi % cols) as f32 * cell.x,
+                top + 1.25 * u + (pi / cols) as f32 * cell.y,
             );
             let area = Rect::from_min_size(origin, cell);
             let id = ui.scope_id().with(("dial", di, param.id));

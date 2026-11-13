@@ -58,11 +58,20 @@ pub trait Effect: Send {
 }
 
 /// The built-in effects by id, for the device picker: (id, display name).
-pub const EFFECTS: [(&str, &str); 4] = [
+pub const EFFECTS: [(&str, &str); 13] = [
+    ("canary.eq", "EQ"),
     ("canary.compressor", "Compressor"),
+    ("canary.limiter", "Limiter"),
+    ("canary.gate", "Gate"),
     ("canary.saturator", "Saturator"),
     ("canary.dynamic_eq", "Dynamic EQ"),
     ("canary.deesser", "De-esser"),
+    ("canary.filter", "Filter"),
+    ("canary.reverb", "Reverb"),
+    ("canary.delay", "Delay"),
+    ("canary.chorus", "Chorus / Flanger"),
+    ("canary.crusher", "Bitcrusher"),
+    ("canary.utility", "Utility"),
 ];
 
 /// Makes the effect with `id` (see `EFFECTS`), set to its defaults.
@@ -72,6 +81,15 @@ pub fn effect(id: &str, sample_rate: f32) -> Option<Box<dyn Effect>> {
         "canary.saturator" => Box::new(Saturator::default()),
         "canary.dynamic_eq" => Box::new(DynamicEq::default()),
         "canary.deesser" => Box::new(DeEsser::default()),
+        "canary.eq" => Box::new(crate::fx::Eq::default()),
+        "canary.limiter" => Box::new(crate::fx::Limiter::default()),
+        "canary.gate" => Box::new(crate::fx::Gate::default()),
+        "canary.filter" => Box::new(crate::fx::Filter::default()),
+        "canary.reverb" => Box::new(crate::fx::Reverb::default()),
+        "canary.delay" => Box::new(crate::fx::Delay::default()),
+        "canary.chorus" => Box::new(crate::fx::Chorus::default()),
+        "canary.crusher" => Box::new(crate::fx::Crusher::default()),
+        "canary.utility" => Box::new(crate::fx::Utility::default()),
         _ => return None,
     };
     fx.set_sample_rate(sample_rate);

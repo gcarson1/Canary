@@ -7,3 +7,6 @@ publish.workspace = true
 [dependencies]
 daw-core = { path = "../daw-core" }
 daw-dsp = { path = "../daw-dsp" }
+
+[dev-dependencies]
+assert_no_alloc = "1.1"

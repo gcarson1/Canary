@@ -6,7 +6,7 @@ use daw_project::{Action, Note, Pattern, Project, STEP};
 use egui::{Align2, Pos2, Rect, Sense, StrokeKind, Vec2};
 
 use crate::theme::Metrics;
-use crate::{header, Inputs, Workspace};
+use crate::{header, Inputs, Request, Workspace};
 
 /// The note a new step plays: middle C, where a sampler's root key sits.
 pub(crate) const STEP_KEY: u8 = 60;
@@ -40,6 +40,7 @@ pub(crate) fn show(
     m: &Metrics,
     r: Rect,
     inputs: &Inputs<'_>,
+    out: &mut Vec<Request>,
 ) {
     let (t, u) = (ws.theme, m.u);
     let project = inputs.history.project();
@@ -175,6 +176,48 @@ pub(crate) fn show(
             ws.set_notes(project, ti, next);
         }
         rp.hline(r.x_range(), row.max.y, m.hair(t.line));
+    }
+
+    // New channels with a built-in instrument, under the rows.
+    let y = rows.min.y + project.tracks.len() as f32 * row_h - ws.seq.scroll_y + 0.75 * u;
+    let mut x = r.min.x + 0.75 * u;
+    for (label, name) in [("+ SYNTH", "Synth"), ("+ SAMPLER", "Sampler")] {
+        let choice = inputs
+            .plugins
+            .iter()
+            .position(|c| c.format == "CANARY" && c.name == name);
+        let (Some(choice), true) = (choice, (rows.min.y..rows.max.y - 0.5 * u).contains(&y)) else {
+            continue;
+        };
+        let g = rp.text(
+            Pos2::new(x, y),
+            Align2::LEFT_CENTER,
+            label,
+            m.mono(0.6875),
+            t.muted,
+        );
+        let resp = ui.interact(
+            g.expand(0.25 * u),
+            ui.scope_id().with(("add-channel", name)),
+            Sense::click(),
+        );
+        if resp.hovered() {
+            rp.hline(g.x_range(), m.snap(g.max.y), m.hair(t.muted));
+        }
+        if resp.clicked() {
+            let index = project.tracks.len();
+            ws.edit(Action::InsertTrack {
+                index,
+                track: daw_project::Track::new(format!("{name} {}", index + 1)),
+            });
+            ws.selected_track = Some(index);
+            // Handled after this frame's edits, so the track exists by then.
+            out.push(Request::AddDevice {
+                track: index,
+                choice,
+            });
+        }
+        x = g.max.x + 1.5 * u;
     }
 
     // Velocity lane for the selected track.

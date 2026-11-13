@@ -922,6 +922,7 @@ dependencies = [
 name = "daw-graph"
 version = "0.1.0"
 dependencies = [
+ "assert_no_alloc",
  "daw-core",
  "daw-dsp",
 ]

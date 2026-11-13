@@ -3,6 +3,7 @@
 mod click;
 pub mod effects;
 mod filter;
+pub mod fx;
 mod meter;
 pub mod slice;
 mod waveform;

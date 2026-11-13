@@ -4,6 +4,7 @@
 mod effect;
 mod monitor;
 mod plan;
+mod poly;
 mod sampler;
 mod sequence;
 mod synth;
@@ -15,6 +16,7 @@ pub use plan::{
     ExecutionPlan, LiveNodes, NodeArena, PlanError, Source, StepId, Tap, MAX_CHANNELS, MAX_LATENCY,
     MAX_NODES,
 };
+pub use poly::{PolySynthNode, SYNTH_PARAMS};
 pub use sampler::{SamplerData, SamplerNode, Zone, SAMPLER_PARAMS};
 pub use synth::SynthNode;
 pub use track::TrackNode;

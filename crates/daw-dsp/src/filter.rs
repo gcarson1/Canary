@@ -11,8 +11,9 @@ pub fn gain_to_db(gain: f32) -> f32 {
     20.0 * gain.max(1e-6).log10()
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FilterKind {
+    #[default]
     LowPass,
     HighPass,
     /// Constant 0 dB peak gain: `x + (g - 1) * band(x)` is a peaking EQ of gain `g`.
@@ -75,6 +76,16 @@ impl Biquad {
     pub fn reset(&mut self) {
         self.z1 = 0.0;
         self.z2 = 0.0;
+    }
+
+    /// The filter's memory, to carry across a change of coefficients.
+    pub fn state(&self) -> (f32, f32) {
+        (self.z1, self.z2)
+    }
+
+    pub fn set_state(&mut self, (z1, z2): (f32, f32)) {
+        self.z1 = z1;
+        self.z2 = z2;
     }
 }
 

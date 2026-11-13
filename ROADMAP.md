@@ -109,9 +109,9 @@ The UI follows Styles.md whichever framework is chosen.
 - [ ] Audio-to-MIDI (monophonic pitch, drum transients to notes)
 
 ### Phase 10: Built-in Instruments and Effects
-- [ ] Subtractive synth (2 oscillators + sub/noise, multimode filter, 2 ADSRs, LFO, unison, glide) with presets
+- [x] Subtractive synth (`canary.synth`, `daw_graph::PolySynthNode`): 16 voices, two PolyBLEP oscillators (saw/square/triangle/sine, interval, detune, mix), resonant TPT low-pass with its own envelope, amp ADSR, glide, velocity. `+ SYNTH` / `+ SAMPLER` under the step sequencer add a channel with it. Still to do: LFO, noise/sub, unison, presets
 - [ ] Drum machine on the sampler (kits on pads, per-pad choke and tune)
-- [ ] Effects: parametric EQ (8 bands, analyzer), reverb (algorithmic), delay (tempo-synced, ping-pong), chorus/flanger/phaser, limiter (true-peak, lookahead), gate/expander, filter, bitcrusher, stereo imager, utility (gain/phase/mono)
+- [x] Effects (`daw_dsp::fx`): EQ (low cut, low/high shelves, mid bell), reverb (Freeverb-style with predelay), delay (ping-pong, tone), chorus/flanger, limiter (brickwall, no lookahead), gate, multimode filter with drive, bitcrusher, utility (gain, width, pan, polarity). Devices with more than 8 parameters get a double-width rack module. Still to do: 8-band EQ with analyzer, tempo-synced delay, phaser, true-peak lookahead limiter
 - [ ] MIDI effects: arpeggiator, chord, scale lock, note repeat
 - [ ] Device presets (save/load per built-in device)
 

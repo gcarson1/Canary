@@ -4,13 +4,16 @@
 use std::sync::Arc;
 
 use daw_dsp::effects::{effect, EFFECTS};
-use daw_graph::{EffectNode, ParamBank};
+use daw_graph::{EffectNode, ParamBank, PolySynthNode};
 
 use crate::{HostError, Hosted, Instance, ParamInfo, PluginInfo};
 
 /// The built-in effects, for the catalog.
+/// The built-in synth's id.
+pub const SYNTH: &str = "canary.synth";
+
 pub fn builtins() -> Vec<PluginInfo> {
-    [(crate::sampler::ID, "Sampler")]
+    [(crate::sampler::ID, "Sampler"), (SYNTH, "Synth")]
         .iter()
         .chain(&EFFECTS)
         .map(|(id, name)| PluginInfo {
@@ -25,8 +28,14 @@ pub fn instantiate(id: &str, sample_rate: f32, max_block: usize) -> Result<Insta
     if id == crate::sampler::ID {
         return Ok(crate::sampler::instantiate());
     }
-    let fx = effect(id, sample_rate).ok_or_else(|| HostError::UnknownPlugin(id.into()))?;
-    let (node, params) = EffectNode::new(fx, sample_rate, max_block);
+    let (node, params, instrument): (Box<dyn daw_graph::AudioNode>, _, _) = if id == SYNTH {
+        let (node, params) = PolySynthNode::new();
+        (Box::new(node), params, true)
+    } else {
+        let fx = effect(id, sample_rate).ok_or_else(|| HostError::UnknownPlugin(id.into()))?;
+        let (node, params) = EffectNode::new(fx, sample_rate, max_block);
+        (Box::new(node), params, false)
+    };
     let infos = params
         .specs()
         .iter()
@@ -40,12 +49,21 @@ pub fn instantiate(id: &str, sample_rate: f32, max_block: usize) -> Result<Insta
             log: p.log,
         })
         .collect();
-    Ok((Box::new(Builtin { params, infos }), Box::new(node)))
+    Ok((
+        Box::new(Builtin {
+            params,
+            infos,
+            instrument,
+        }),
+        node,
+    ))
 }
 
 struct Builtin {
     params: Arc<ParamBank>,
     infos: Vec<ParamInfo>,
+    /// The synth: no audio input, plays MIDI.
+    instrument: bool,
 }
 
 impl Hosted for Builtin {
@@ -82,7 +100,7 @@ impl Hosted for Builtin {
         0
     }
     fn has_audio_input(&self) -> bool {
-        true
+        !self.instrument
     }
 }
 

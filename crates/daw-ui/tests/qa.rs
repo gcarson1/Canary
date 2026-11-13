@@ -207,6 +207,11 @@ fn plugins() -> Vec<PluginChoice> {
             vendor: "Apple".into(),
             format: "AU",
         })
+        .chain(std::iter::once(PluginChoice {
+            name: "Synth".into(),
+            vendor: "Canary".into(),
+            format: "CANARY",
+        }))
         .collect()
 }
 
@@ -897,4 +902,20 @@ fn automation_lane_adds_and_removes_points() {
     }
     let lanes = &h.state().history.project().tracks[0].automation;
     assert!(lanes.iter().all(|l| l.target != daw_project::Target::Pan));
+}
+
+#[test]
+fn plus_synth_adds_a_track_with_the_built_in_synth() {
+    let mut h = rig();
+    h.run();
+    // SEQUENCER, then + SYNTH under the four 40pt rows from y 128.
+    click(&mut h, egui::Pos2::new(140.0, 28.0));
+    click(&mut h, egui::Pos2::new(310.0, 300.0));
+    let tracks = &h.state().history.project().tracks;
+    assert_eq!(tracks.len(), 5);
+    assert_eq!(tracks[4].name, "Synth 5");
+    assert!(h.state().requests.contains(&Request::AddDevice {
+        track: 4,
+        choice: 3
+    }));
 }

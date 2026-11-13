@@ -452,7 +452,6 @@ impl Devices {
         errors
     }
 
-    /// Saved ARA documents from the project, given back as their plug-ins load.
     /// Retires every live device and forgets kept state, so the next `sync`
     /// makes each one fresh from the project (a recovered autosave).
     pub fn reset(&mut self) {
@@ -464,6 +463,7 @@ impl Devices {
         self.failed.clear();
     }
 
+    /// Saved ARA documents from the project, given back as their plug-ins load.
     pub fn restore_ara(&mut self, archives: Vec<AraArchive>) {
         self.pending_ara = archives;
     }

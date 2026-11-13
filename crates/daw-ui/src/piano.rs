@@ -643,6 +643,20 @@ fn keys_pressed(
                     .collect();
                 let mut notes = stored.to_vec();
                 notes.extend(&pasted);
+                // The next paste goes on from this one, never on top of it.
+                ws.roll.copied = pasted.clone();
+                // A paste past the pattern's end grows it to whole bars, so the
+                // notes are heard and seen.
+                let end = pasted.iter().map(Note::end).max().unwrap_or(0);
+                let bar = project.bar_tick(1).max(1);
+                let index = ws
+                    .current_pattern(project)
+                    .and_then(|id| project.patterns.iter().position(|p| p.id == id));
+                if let Some(i) = index.filter(|&i| project.patterns[i].length < end) {
+                    let mut pattern = project.patterns[i].clone();
+                    pattern.length = (end.div_ceil(bar) * bar).min(daw_project::MAX_TICKS);
+                    ws.edit(daw_project::Action::SetPattern { index: i, pattern });
+                }
                 Some((notes, pasted))
             }
             Key::E if mods.command => {

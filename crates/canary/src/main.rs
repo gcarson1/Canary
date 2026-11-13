@@ -508,7 +508,8 @@ impl App {
                 .map(|t| &t.automation)
                 .eq(self.built_automation.iter())
             && routing(self.history.project()) == self.built_routing
-            && loop_range(self.history.project(), playback) == self.built_loop
+            && loop_range(self.history.project(), playback, self.export.is_some())
+                == self.built_loop
             && tracks.len() == self.built_clips.len()
             && tracks
                 .iter()
@@ -751,7 +752,7 @@ impl App {
         self.built = Some(self.history.revision());
         self.built_selected = self.ws.selected_track;
         // PAT mode loops the pattern; jump into it if the playhead is past its end.
-        let looping = loop_range(self.history.project(), playback);
+        let looping = loop_range(self.history.project(), playback, self.export.is_some());
         // A loop that changed (mode, pattern length, tempo) may now end behind the
         // playhead, which the transport would never wrap: move it in.
         if looping != self.built_loop {
@@ -880,7 +881,8 @@ impl App {
                 if self.export.is_some() => {}
             Request::Play => command(self, Command::Play),
             Request::Stop => {
-                // Stop also silences an audition.
+                // Stop also silences an audition, and one still loading.
+                self.preview_wanted = None;
                 let _ = self.preview.play(None);
                 command(self, Command::Stop)
             }
@@ -901,7 +903,10 @@ impl App {
                 match path {
                     Some(p) if has_extension(&p, &MIDI_EXTENSIONS) => {}
                     Some(p) => match self.audio.get(&p) {
-                        Some(audio) => drop(self.preview.play(Some(audio.clone()))),
+                        Some(audio) => {
+                            self.preview_wanted = None;
+                            let _ = self.preview.play(Some(audio.clone()));
+                        }
                         None => {
                             // Loaded on its own, never kept: browsing must not
                             // fill memory or rebuild the plan.
@@ -916,7 +921,10 @@ impl App {
                             });
                         }
                     },
-                    None => drop(self.preview.play(None)),
+                    None => {
+                        self.preview_wanted = None;
+                        let _ = self.preview.play(None);
+                    }
                 }
             }
             Request::Stretch {
@@ -961,6 +969,7 @@ impl App {
                 if let Some(uid) = self.device_uid(track, device) {
                     self.devices.set_param(uid, param, value);
                     self.history.mark_dirty(); // so quitting saves the plugin's state
+                    self.autosaved = None; // and the next autosave includes it
                 }
             }
             Request::OpenEditor { track, device } => {
@@ -997,6 +1006,7 @@ impl App {
                     self.sample_requests.remove(&path);
                     s.add_layer(path, kind);
                     self.history.mark_dirty();
+                    self.autosaved = None;
                 }
             }
             Request::Note { key, on, .. } => {
@@ -1021,6 +1031,7 @@ impl App {
                 if let Some(s) = uid.and_then(|uid| self.devices.sampler(uid)) {
                     s.edit_marker(at, add);
                     self.history.mark_dirty();
+                    self.autosaved = None;
                 }
             }
         }
@@ -1770,7 +1781,12 @@ fn into_loop(looping: Option<(u64, u64)>, at: u64) -> Option<u64> {
 }
 
 /// The transport loop for `playback`: the whole pattern in PAT mode.
-fn loop_range(project: &daw_project::Project, playback: Playback) -> Option<(u64, u64)> {
+/// An export plays the whole song, so the song loop is off while it runs.
+fn loop_range(
+    project: &daw_project::Project,
+    playback: Playback,
+    exporting: bool,
+) -> Option<(u64, u64)> {
     match playback {
         Playback::Pattern(id) => project
             .pattern(id)
@@ -1778,7 +1794,7 @@ fn loop_range(project: &daw_project::Project, playback: Playback) -> Option<(u64
         // The song loops its region when the loop is on.
         Playback::Song => project
             .loop_region
-            .filter(|_| project.loop_on)
+            .filter(|_| project.loop_on && !exporting)
             .map(|(a, b)| {
                 (
                     project.samples_at(a),

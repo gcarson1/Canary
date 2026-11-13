@@ -291,8 +291,7 @@ pub struct Workspace {
     rack_scroll: f32,
     /// What Cmd+C or Cmd+X took, for Cmd+V.
     clipboard: Option<Clipboard>,
-    /// The browser file last auditioned.
-    auditioning: Option<PathBuf>,
+
     /// Where a Shift-drag on the ruler began (ticks), and the region it draws.
     loop_anchor: Option<u64>,
     loop_drag: Option<(u64, u64)>,
@@ -335,7 +334,7 @@ impl Default for Workspace {
             device_drag: None,
             rack_scroll: 0.0,
             clipboard: None,
-            auditioning: None,
+
             loop_anchor: None,
             loop_drag: None,
             mixer_scroll: 0.0,
@@ -1378,11 +1377,9 @@ impl Workspace {
                     t.faint
                 },
             );
-            // Clicking the arrow of the file playing stops it.
+            // Stop silences an audition.
             if hear_resp.clicked() {
-                let again = self.auditioning.as_ref() == Some(path);
-                self.auditioning = (!again).then(|| path.clone());
-                out.push(Request::Preview(self.auditioning.clone()));
+                out.push(Request::Preview(Some(path.clone())));
             }
             p.hline(r.x_range(), m.snap(row.max.y), m.hair(t.line));
             if resp.clicked() {

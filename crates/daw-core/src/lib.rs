@@ -116,8 +116,6 @@ pub struct Musical {
     pub bar: i32,
     pub numerator: u16,
     pub denominator: u16,
-    /// The loop region in quarter notes, while the transport loops.
-    pub looping: Option<(f64, f64)>,
 }
 
 impl Default for Musical {
@@ -129,7 +127,6 @@ impl Default for Musical {
             bar: 0,
             numerator: 4,
             denominator: 4,
-            looping: None,
         }
     }
 }
@@ -166,7 +163,6 @@ pub fn musical_at(segments: &[TempoSegment], sample: u64, sample_rate: f32) -> M
         bar: seg.bar + bars as i32,
         numerator: seg.numerator,
         denominator: seg.denominator,
-        looping: None,
     }
 }
 

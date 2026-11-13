@@ -6,6 +6,7 @@ mod filter;
 pub mod fx;
 mod meter;
 pub mod slice;
+pub mod stretch;
 mod waveform;
 
 pub use click::Click;

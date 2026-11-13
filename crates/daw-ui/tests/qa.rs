@@ -51,6 +51,9 @@ fn fixture() -> (History, HashMap<PathBuf, WaveformPyramid>, Vec<PathBuf>) {
         length,
         fade_in,
         fade_out,
+        gain: 1.0,
+        reverse: false,
+        stretch: None,
     };
     let mut h = History::default();
     for (i, (name, clips)) in [
@@ -918,4 +921,26 @@ fn plus_synth_adds_a_track_with_the_built_in_synth() {
         track: 4,
         choice: 3
     }));
+}
+
+#[test]
+fn clip_keys_reverse_and_step_the_gain_of_the_selected_clip() {
+    let mut h = rig();
+    h.run();
+    click(&mut h, egui::Pos2::new(700.0, 230.0)); // the pad clip on row 2
+    h.key_press(egui::Key::R);
+    h.run();
+    h.key_press(egui::Key::ArrowUp);
+    h.run();
+    let clip = &h.state().history.project().tracks[1].clips[0];
+    assert!(clip.reverse);
+    assert!(
+        (20.0 * clip.gain.log10() - 1.0).abs() < 1e-3,
+        "{}",
+        clip.gain
+    );
+    assert!(h.state().history.project().tracks[0]
+        .clips
+        .iter()
+        .all(|c| !c.reverse));
 }

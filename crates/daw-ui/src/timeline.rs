@@ -47,6 +47,9 @@ enum Grab {
     Body,
     Start,
     End,
+    /// An audio clip's fade handles, at its title strip's corners.
+    FadeIn,
+    FadeOut,
 }
 
 struct Drag {
@@ -61,6 +64,8 @@ struct Drag {
     /// Project revision at the start; any other edit cancels the drag, since its
     /// indices may no longer point at the clip.
     revision: u64,
+    /// Option held on the end edge: the clip is time-stretched to the new length.
+    stretching: bool,
 }
 
 /// An automation point being moved, or a segment being bent (`curve` holds the
@@ -427,6 +432,11 @@ fn core_clip(c: &ClipRef, audio: &Arc<SampleData>) -> Option<Clip> {
         c.fade_in,
         c.fade_out,
     )
+    .map(|mut clip| {
+        clip.gain = c.gain;
+        clip.reversed = c.reverse;
+        clip
+    })
 }
 
 fn clip_ref(source: &ClipRef, c: &Clip) -> ClipRef {
@@ -437,6 +447,9 @@ fn clip_ref(source: &ClipRef, c: &Clip) -> ClipRef {
         length: c.length_samples(),
         fade_in: c.fade_in_samples(),
         fade_out: c.fade_out_samples(),
+        gain: c.gain,
+        reverse: c.reversed,
+        stretch: source.stretch.clone(),
     }
 }
 
@@ -624,7 +637,10 @@ pub(crate) fn show(
                 lane.min.y + m.px..=lane.max.y - m.px,
             ));
             if probe.is_some_and(|p| rect.contains(p)) && !dragging {
+                let title = rect.min.y + 1.125 * u;
                 let grab = match probe {
+                    Some(p) if p.y < title && p.x - rect.min.x < 2.0 * edge => Grab::FadeIn,
+                    Some(p) if p.y < title && rect.max.x - p.x < 2.0 * edge => Grab::FadeOut,
                     Some(p) if p.x - rect.min.x < edge => Grab::Start,
                     Some(p) if rect.max.x - p.x < edge => Grab::End,
                     _ => Grab::Body,
@@ -844,6 +860,7 @@ pub(crate) fn show(
                 preview: clip,
                 to_track: ti,
                 revision: inputs.history.revision(),
+                stretching: grab == Grab::End && ui.input(|i| i.modifiers.alt),
             });
         }
     }
@@ -860,13 +877,21 @@ pub(crate) fn show(
                     let lane = ((pos.y - lanes.min.y + ws.timeline.scroll_y) / lane_h).floor();
                     d.to_track = (lane.max(0.0) as usize).min(project.tracks.len() - 1);
                 }
+                Grab::End if d.stretching => {
+                    let to = snap_f(at, ws.snap, project) as u64;
+                    let min = original.length / 4 + 1;
+                    let max = original.length * 4;
+                    d.preview.length = to.saturating_sub(original.start).clamp(min, max);
+                }
                 grab => {
                     if let Some(mut c) = audio.as_ref().and_then(|a| core_clip(original, a)) {
                         let to = snap_f(at, ws.snap, project) as u64;
-                        if grab == Grab::Start {
-                            c.trim_start(to);
-                        } else {
-                            c.trim_end(to);
+                        let (fin, fout) = (c.fade_in_samples(), c.fade_out_samples());
+                        match grab {
+                            Grab::Start => c.trim_start(to),
+                            Grab::FadeIn => c.set_fades(to.saturating_sub(c.start_sample), fout),
+                            Grab::FadeOut => c.set_fades(fin, c.end_sample().saturating_sub(to)),
+                            _ => c.trim_end(to),
                         }
                         d.preview = clip_ref(original, &c);
                     }
@@ -875,6 +900,22 @@ pub(crate) fn show(
         }
     }
     if lanes_resp.drag_stopped() {
+        if let Some(d) = ws.timeline.drag.take_if(|d| d.stretching) {
+            let original = &project.tracks[d.track].clips[d.index];
+            let (ratio, semitones) = original
+                .stretch
+                .as_ref()
+                .map_or((1.0, 0.0), |s| (s.ratio, s.semitones));
+            let factor = d.preview.length as f64 / original.length.max(1) as f64;
+            if (factor - 1.0).abs() > 1e-3 {
+                out.push(Request::Stretch {
+                    track: d.track,
+                    index: d.index,
+                    ratio: (ratio * factor).clamp(0.25, 4.0),
+                    semitones,
+                });
+            }
+        }
         if let Some(d) = ws.timeline.drag.take() {
             let action = if d.to_track == d.track {
                 Action::SetClip {
@@ -1131,10 +1172,21 @@ fn draw_clip(
     let title_h = 1.125 * u;
     let title = Rect::from_x_y_ranges(rect.x_range(), rect.min.y..=m.snap(rect.min.y + title_h));
     p.hline(rect.x_range(), title.max.y, m.hair(t.line_2));
-    let name = clip
+    let mut name = clip
         .source
         .file_stem()
         .map_or_else(String::new, |s| s.to_string_lossy().into_owned());
+    if clip.gain != 1.0 {
+        let db = if clip.gain > 0.0 {
+            format!("{:+.1} dB", 20.0 * clip.gain.log10())
+        } else {
+            "-INF dB".into()
+        };
+        name = format!("{name} · {db}");
+    }
+    if clip.reverse {
+        name = format!("{name} · REV");
+    }
     p.with_clip_rect(rect.intersect(p.clip_rect())).text(
         Pos2::new(rect.min.x + 0.375 * u, title.center().y),
         Align2::LEFT_CENTER,
@@ -1154,23 +1206,32 @@ fn draw_clip(
         let zoom = ws.timeline.zoom;
         let cols = (visible.width() / m.px).ceil() as usize;
         let mut bins = vec![MinMax::EMPTY; cols];
-        // Source frame under the first visible column.
-        let first = clip.offset as f64 + f64::from(visible.min.x - rect.min.x) * zoom;
+        // Source frame under the first visible column; a reversed clip reads the
+        // mirrored stretch and draws it back to front.
+        let first = if clip.reverse {
+            (clip.offset + clip.length) as f64 - f64::from(visible.max.x - rect.min.x) * zoom
+        } else {
+            clip.offset as f64 + f64::from(visible.min.x - rect.min.x) * zoom
+        };
         // One mesh per clip, a one-pixel quad per column, not a shape per column.
         let mut mesh = egui::Mesh::default();
         for ch in 0..channels {
             let band_h = body.height() / channels as f32;
             let mid = body.min.y + band_h * (ch as f32 + 0.5);
             let half = band_h * 0.45;
-            w.view(ch, first, zoom * f64::from(m.px), &mut bins);
+            w.view(ch, first.max(0.0), zoom * f64::from(m.px), &mut bins);
+            if clip.reverse {
+                bins.reverse();
+            }
             let end = (clip.offset + clip.length) as f64;
             for (i, b) in bins.iter().enumerate() {
                 let frame = first + i as f64 * zoom * f64::from(m.px);
-                if b.is_empty() || frame >= end {
+                if b.is_empty() || (!clip.reverse && frame >= end) {
                     continue;
                 }
                 let x = visible.min.x + i as f32 * m.px;
-                let (lo, hi) = (b.min.clamp(-1.0, 1.0), b.max.clamp(-1.0, 1.0));
+                let g = clip.gain;
+                let (lo, hi) = ((b.min * g).clamp(-1.0, 1.0), (b.max * g).clamp(-1.0, 1.0));
                 mesh.add_colored_rect(
                     Rect::from_x_y_ranges(
                         x..=x + m.px,

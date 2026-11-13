@@ -228,6 +228,36 @@ pub struct ClipRef {
     pub length: u64,
     pub fade_in: u64,
     pub fade_out: u64,
+    /// Linear clip gain, 0..=4 (+12 dB).
+    #[serde(default = "unity")]
+    pub gain: f32,
+    #[serde(default)]
+    pub reverse: bool,
+    /// Set when `source` is a time-stretched or pitch-shifted copy: what it was
+    /// made from and how, so a new stretch starts from the original again.
+    #[serde(default)]
+    pub stretch: Option<Stretch>,
+}
+
+/// How a clip's audio was rendered from an original file.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Stretch {
+    pub original: PathBuf,
+    /// Length factor, 0.25..=4 (2 = twice as long).
+    pub ratio: f64,
+    /// -24..=24.
+    pub semitones: f64,
+}
+
+fn unity() -> f32 {
+    1.0
+}
+
+impl ClipRef {
+    /// Clip gain is finite and within 0..=4 (+12 dB).
+    pub fn gain_ok(&self) -> bool {
+        self.gain.is_finite() && (0.0..=4.0).contains(&self.gain)
+    }
 }
 
 /// One undoable edit. Each is applied by `History::apply`, which records its exact
@@ -494,6 +524,9 @@ impl Action {
                 index,
                 clip,
             } => {
+                if !clip.gain_ok() {
+                    return Err(ActionError::BadValue);
+                }
                 let t = track(p, ti)?;
                 if index > t.clips.len() {
                     return Err(ActionError::OutOfRange);
@@ -517,6 +550,9 @@ impl Action {
                 index,
                 clip,
             } => {
+                if !clip.gain_ok() {
+                    return Err(ActionError::BadValue);
+                }
                 let slot = track(p, ti)?
                     .clips
                     .get_mut(index)
@@ -979,7 +1015,8 @@ impl History {
         let mut ids: Vec<u64> = p.patterns.iter().map(|q| q.id).collect();
         ids.sort_unstable();
         unique &= ids.windows(2).all(|w| w[0] != w[1]);
-        let musical = valid_tempos(&p.tempos)
+        let musical = p.tracks.iter().flat_map(|t| &t.clips).all(ClipRef::gain_ok)
+            && valid_tempos(&p.tempos)
             && valid_meters(&p.meters)
             && p.patterns.iter().all(Pattern::is_valid)
             && p.tracks.iter().all(|t| {
@@ -1049,6 +1086,9 @@ mod tests {
             length: 100,
             fade_in: 0,
             fade_out: 0,
+            gain: 1.0,
+            reverse: false,
+            stretch: None,
         }
     }
 

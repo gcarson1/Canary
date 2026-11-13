@@ -7,7 +7,7 @@ mod peaks;
 mod record;
 mod transport;
 
-pub use load::{load_audio, resample, LoadError};
+pub use load::{load_audio, resample, write_wav, LoadError};
 pub use midi::{connect_midi, midi_input_ports, MidiConnection, MidiError, MidiSender};
 pub use output::{start_output, OutputError};
 pub use peaks::cached_waveform;

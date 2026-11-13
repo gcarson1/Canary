@@ -102,8 +102,8 @@ The UI follows Styles.md whichever framework is chosen.
 - [ ] Input monitoring and per-track record arm; duplex recording with input/output latency compensation
 
 ### Phase 9: Audio Editing
-- [ ] Clip gain, reverse, fade handles and crossfades in the playlist; slice to new clips; consolidate
-- [ ] Time-stretch and pitch-shift (offline, high quality, formant-safe for vocals) and stretch-to-tempo for loops
+- [x] Clip gain (Up/Down 1 dB, Shift 0.1 dB, shown in the clip title and waveform), reverse (R) and fade handles (drag a clip title's corner). Slicing to new clips was already the SLICE tool. Still to do: consolidate
+- [x] Time-stretch and pitch-shift, offline (`daw_dsp::stretch`, WSOLA): Option-drag a clip's end edge to stretch it, [ and ] shift it a semitone. Rendered from the original file to `Stretched/`, recorded in `ClipRef::stretch` so a new stretch starts from the original. Still to do: formant preservation, stretch-to-tempo
 - [ ] Warp markers (audio follows the tempo map)
 - [ ] Loop recording into takes; take lanes; comping by swiping regions; flatten comp
 - [ ] Audio-to-MIDI (monophonic pitch, drum transients to notes)

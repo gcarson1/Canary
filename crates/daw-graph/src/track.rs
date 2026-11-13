@@ -94,10 +94,19 @@ impl AudioNode for TrackNode {
                 }
                 let out_range = (start - block_start) as usize..(end - block_start) as usize;
                 let first = start - clip.start_sample;
-                let source = (clip.offset_samples() + first) as usize
-                    ..(clip.offset_samples() + end - clip.start_sample) as usize;
                 let audio = clip.audio();
                 let last_channel = audio.num_channels() - 1;
+                if clip.reversed {
+                    for (ch, output) in outputs.iter_mut().take(2).enumerate() {
+                        let from = audio.channel(ch.min(last_channel));
+                        for (o, i) in output[out_range.clone()].iter_mut().zip(first..) {
+                            *o += from[clip.source_frame(i) as usize] * clip.gain_at(i);
+                        }
+                    }
+                    continue;
+                }
+                let source = (clip.offset_samples() + first) as usize
+                    ..(clip.offset_samples() + end - clip.start_sample) as usize;
                 for (ch, output) in outputs.iter_mut().take(2).enumerate() {
                     let from = &audio.channel(ch.min(last_channel))[source.clone()];
                     for ((o, s), i) in output[out_range.clone()].iter_mut().zip(from).zip(first..) {
@@ -171,6 +180,20 @@ mod tests {
     fn clip(start: u64, frames: usize, value: f32) -> Clip {
         let audio = SampleData::new(48_000, vec![vec![value; frames]]).unwrap();
         Clip::new(start, Arc::new(audio))
+    }
+
+    #[test]
+    fn a_reversed_clip_plays_back_to_front_at_its_gain() {
+        let ramp: Vec<f32> = (0..8).map(|i| i as f32).collect();
+        let audio = Arc::new(SampleData::new(48_000, vec![ramp]).unwrap());
+        // The window is frames 2..6 (2, 3, 4, 5), reversed, at half gain.
+        let mut c = Clip::with_window(10, audio, 2, 4, 0, 0).unwrap();
+        c.reversed = true;
+        c.gain = 0.5;
+        let mut node = TrackNode::new(vec![c], params(-1.0));
+        let (l, _) = run(&mut node, 8, 8, true);
+        assert_eq!(&l[2..6], &[2.5, 2.0, 1.5, 1.0]);
+        assert_eq!((l[1], l[6]), (0.0, 0.0));
     }
 
     fn run(node: &mut TrackNode, playhead: u64, n: usize, playing: bool) -> (Vec<f32>, Vec<f32>) {

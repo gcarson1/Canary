@@ -184,6 +184,10 @@ pub struct Clip {
     length: u64,
     fade_in: u64,
     fade_out: u64,
+    /// Linear gain on the whole clip (clip gain, before the track fader).
+    pub gain: f32,
+    /// Plays the window back to front.
+    pub reversed: bool,
 }
 
 impl Clip {
@@ -196,6 +200,8 @@ impl Clip {
             offset: 0,
             fade_in: 0,
             fade_out: 0,
+            gain: 1.0,
+            reversed: false,
         }
     }
 
@@ -219,6 +225,8 @@ impl Clip {
             length,
             fade_in,
             fade_out,
+            gain: 1.0,
+            reversed: false,
         })
     }
 
@@ -318,7 +326,7 @@ impl Clip {
     #[inline]
     pub fn gain_at(&self, frame: u64) -> f32 {
         use std::f64::consts::FRAC_PI_2;
-        if frame >= self.length {
+        let fade = if frame >= self.length {
             0.0
         } else if frame < self.fade_in {
             ((frame as f64 + 0.5) / self.fade_in as f64 * FRAC_PI_2).sin() as f32
@@ -327,6 +335,16 @@ impl Clip {
             ((left - 0.5) / self.fade_out as f64 * FRAC_PI_2).sin() as f32
         } else {
             1.0
+        };
+        fade * self.gain
+    }
+
+    /// The audio frame heard at clip frame `frame` (0 = the clip's start).
+    pub fn source_frame(&self, frame: u64) -> u64 {
+        if self.reversed {
+            self.offset + self.length - 1 - frame.min(self.length - 1)
+        } else {
+            self.offset + frame
         }
     }
 }

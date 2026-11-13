@@ -47,6 +47,20 @@ fn has_extension(path: &Path, list: &[&str]) -> bool {
 }
 
 /// A finished background load.
+/// A stretch render finished on a worker thread.
+struct Stretched {
+    track: usize,
+    index: usize,
+    /// The clip as it was when the render started.
+    clip: ClipRef,
+    original: PathBuf,
+    path: PathBuf,
+    ratio: f64,
+    semitones: f64,
+    /// Frames rendered.
+    result: Result<u64, String>,
+}
+
 struct Loaded {
     path: PathBuf,
     result: Result<(Arc<SampleData>, WaveformPyramid), String>,
@@ -106,6 +120,9 @@ struct App {
     midi_take: Option<take::MidiTake>,
     /// A mix export in progress.
     export: Option<export::Export>,
+    /// Stretched or pitched clip renders coming back from worker threads.
+    stretch_tx: mpsc::Sender<Stretched>,
+    stretch_rx: mpsc::Receiver<Stretched>,
     title: String,
     /// The master node until the first plan takes it; it then stays in the
     /// engine for good, so meters keep their history across edits.
@@ -178,6 +195,7 @@ impl App {
             });
         }
         let (loads_tx, loads_rx) = mpsc::channel();
+        let (stretch_tx, stretch_rx) = mpsc::channel();
         let (master, monitor) = MasterNode::new(config.sample_rate as f32);
         let mut app = Self {
             ws,
@@ -220,6 +238,8 @@ impl App {
             recorder: None,
             midi_take: None,
             export: None,
+            stretch_tx,
+            stretch_rx,
             title: String::new(),
             master: Some(Box::new(master)),
             monitor,
@@ -280,6 +300,9 @@ impl App {
             length: audio.frames() as u64,
             fade_in: 0,
             fade_out: 0,
+            gain: 1.0,
+            reverse: false,
+            stretch: None,
         };
         let tracks = &self.history.project().tracks;
         let action = match track.filter(|&t| t < tracks.len()) {
@@ -521,7 +544,12 @@ impl App {
                 .filter(|_| !ara && !pattern_mode)
                 .filter_map(|c| {
                     let audio = self.audio.get(&c.source)?.clone();
-                    Clip::with_window(c.start, audio, c.offset, c.length, c.fade_in, c.fade_out)
+                    let mut clip = Clip::with_window(
+                        c.start, audio, c.offset, c.length, c.fade_in, c.fade_out,
+                    )?;
+                    clip.gain = c.gain;
+                    clip.reversed = c.reverse;
+                    Some(clip)
                 })
                 .collect();
             let id = NodeId(i as u32 + 1);
@@ -784,6 +812,12 @@ impl App {
             Request::ExportMidi { track } => self.export_midi(track),
             Request::ToggleRecord => self.toggle_record(),
             Request::Export { stems } => self.toggle_export(stems),
+            Request::Stretch {
+                track,
+                index,
+                ratio,
+                semitones,
+            } => self.stretch_clip(track, index, ratio, semitones),
             Request::AddDevice { track, choice } => {
                 let uid = self.history.new_device_uid();
                 let rate = self.view.sample_rate as f32;
@@ -881,6 +915,122 @@ impl App {
                     s.edit_marker(at, add);
                     self.history.mark_dirty();
                 }
+            }
+        }
+    }
+
+    /// Renders clip `index` on `track` from its original file, `ratio` times as
+    /// long and `semitones` higher, on a worker thread; `receive_stretches`
+    /// swaps it in.
+    fn stretch_clip(&mut self, track: usize, index: usize, ratio: f64, semitones: f64) {
+        let Some(clip) = self
+            .history
+            .project()
+            .tracks
+            .get(track)
+            .and_then(|t| t.clips.get(index))
+            .cloned()
+        else {
+            return;
+        };
+        let original = clip
+            .stretch
+            .as_ref()
+            .map_or_else(|| clip.source.clone(), |s| s.original.clone());
+        let stem = original
+            .file_stem()
+            .map_or_else(|| "clip".into(), |s| s.to_string_lossy().into_owned());
+        let dir = self.samples_dir.join("Stretched");
+        let path = dir.join(format!("{stem} x{ratio:.3} {semitones:+.0}st.wav"));
+        let (tx, rate) = (self.stretch_tx.clone(), self.view.sample_rate);
+        self.ws.status = Some(Status {
+            text: "RENDERING STRETCH".into(),
+            error: false,
+        });
+        thread::spawn(move || {
+            let result = (|| -> Result<u64, String> {
+                fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+                let audio = daw_engine::load_audio(&original)
+                    .and_then(|a| daw_engine::resample(&a, rate))
+                    .map_err(|e| e.to_string())?;
+                let channels: Vec<Vec<f32>> = (0..audio.num_channels())
+                    .map(|c| audio.channel(c).to_vec())
+                    .collect();
+                let out = daw_dsp::stretch::stretch_and_pitch(&channels, ratio, semitones);
+                let frames = out.first().map_or(0, Vec::len) as u64;
+                daw_engine::write_wav(&path, &out, rate)?;
+                Ok(frames)
+            })();
+            let _ = tx.send(Stretched {
+                track,
+                index,
+                clip,
+                original,
+                path,
+                ratio,
+                semitones,
+                result,
+            });
+        });
+    }
+
+    /// Puts finished stretch renders in place of their clips, if the clip is
+    /// still the one the render started from.
+    fn receive_stretches(&mut self) {
+        if self.ws.is_dragging() {
+            return;
+        }
+        while let Ok(done) = self.stretch_rx.try_recv() {
+            let frames = match done.result {
+                Ok(frames) if frames > 0 => frames,
+                Ok(_) => continue,
+                Err(e) => {
+                    self.error(format!("stretch failed: {e}"));
+                    continue;
+                }
+            };
+            let tracks = &self.history.project().tracks;
+            let same = tracks
+                .get(done.track)
+                .and_then(|t| t.clips.get(done.index))
+                .is_some_and(|c| *c == done.clip);
+            if !same {
+                self.error("clip changed while stretching; render discarded".into());
+                continue;
+            }
+            // Scale the window from the old render's frames to the new one's.
+            let old = done.clip.stretch.as_ref().map_or(1.0, |s| s.ratio);
+            let scale = done.ratio / old;
+            let at = |v: u64| ((v as f64 * scale).round() as u64).min(frames);
+            let offset = at(done.clip.offset).min(frames - 1);
+            let length = at(done.clip.length).clamp(1, frames - offset);
+            let fade_in = at(done.clip.fade_in).min(length);
+            let clip = ClipRef {
+                source: done.path.clone(),
+                offset,
+                length,
+                fade_in,
+                fade_out: at(done.clip.fade_out).min(length - fade_in),
+                stretch: Some(daw_project::Stretch {
+                    original: done.original,
+                    ratio: done.ratio,
+                    semitones: done.semitones,
+                }),
+                ..done.clip
+            };
+            match self.history.apply(Action::SetClip {
+                track: done.track,
+                index: done.index,
+                clip,
+            }) {
+                Ok(()) => {
+                    self.load(done.path, None);
+                    self.ws.status = Some(Status {
+                        text: "STRETCHED".into(),
+                        error: false,
+                    });
+                }
+                Err(e) => self.error(format!("stretch: {e}")),
             }
         }
     }
@@ -1223,6 +1373,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.receive_loads();
+        self.receive_stretches();
         self.read_telemetry();
         self.tend_export();
         self.engine.collect_garbage();

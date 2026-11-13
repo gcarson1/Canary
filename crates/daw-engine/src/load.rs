@@ -157,6 +157,31 @@ pub fn resample(audio: &Arc<SampleData>, sample_rate: u32) -> Result<Arc<SampleD
         .ok_or(LoadError::Empty)
 }
 
+/// Writes `channels` (equal lengths) as a 32-bit float WAV at `sample_rate`,
+/// through a temporary file renamed into place, so a crash never leaves half a
+/// file at `path`.
+pub fn write_wav(path: &Path, channels: &[Vec<f32>], sample_rate: u32) -> Result<(), String> {
+    let spec = hound::WavSpec {
+        channels: channels.len().clamp(1, u16::MAX as usize) as u16,
+        sample_rate,
+        bits_per_sample: 32,
+        sample_format: hound::SampleFormat::Float,
+    };
+    let tmp = path.with_extension("wav.tmp");
+    let write = || -> Result<(), hound::Error> {
+        let mut w = hound::WavWriter::create(&tmp, spec)?;
+        let frames = channels.first().map_or(0, Vec::len);
+        for i in 0..frames {
+            for c in channels {
+                w.write_sample(c.get(i).copied().unwrap_or(0.0))?;
+            }
+        }
+        w.finalize()
+    };
+    write().map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, path).map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

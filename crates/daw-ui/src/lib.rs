@@ -126,6 +126,14 @@ pub enum Request {
     Export {
         stems: bool,
     },
+    /// Render clip `index` on `track` again from its original audio, `ratio`
+    /// times as long and `semitones` higher, and put the result in its place.
+    Stretch {
+        track: usize,
+        index: usize,
+        ratio: f64,
+        semitones: f64,
+    },
     /// Write `track`'s notes in the current pattern to a MIDI file.
     ExportMidi {
         track: usize,
@@ -581,6 +589,82 @@ impl Workspace {
             } else {
                 Request::Play
             });
+        }
+        // The selected audio clip: R reverses it, Up and Down step its gain by
+        // 1 dB (Shift: 0.1 dB). Each press is one undo step.
+        let clip_keys = ui.input(|i| {
+            let fine = i.modifiers.shift;
+            let step = if fine { 0.1 } else { 1.0 };
+            let mut db = 0.0;
+            let mut flip = false;
+            let mut semis = 0.0;
+            for e in &i.events {
+                if let egui::Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } = e
+                {
+                    if modifiers.command {
+                        continue;
+                    }
+                    match key {
+                        Key::ArrowUp => db += step,
+                        Key::ArrowDown => db -= step,
+                        Key::R => flip ^= true,
+                        Key::OpenBracket => semis -= 1.0,
+                        Key::CloseBracket => semis += 1.0,
+                        _ => {}
+                    }
+                }
+            }
+            (db, flip, semis)
+        });
+        if let (Page::Playlist, Some((ti, ci)), (db, flip, semis)) =
+            (self.page, self.selected_clip, clip_keys)
+        {
+            let clip = inputs
+                .history
+                .project()
+                .tracks
+                .get(ti)
+                .and_then(|t| t.clips.get(ci));
+            // [ and ] shift the clip's pitch a semitone, rendered from its original.
+            if let (Some(c), true) = (clip, semis != 0.0) {
+                let (ratio, now) = c
+                    .stretch
+                    .as_ref()
+                    .map_or((1.0, 0.0), |s| (s.ratio, s.semitones));
+                out.push(Request::Stretch {
+                    track: ti,
+                    index: ci,
+                    ratio,
+                    semitones: (now + semis).clamp(-24.0, 24.0),
+                });
+            }
+            if let (Some(c), true) = (clip, db != 0.0 || flip) {
+                let mut c = c.clone();
+                c.reverse ^= flip;
+                if db != 0.0 {
+                    let now = if c.gain > 0.0 {
+                        20.0 * c.gain.log10()
+                    } else {
+                        -60.0
+                    };
+                    let next = (now + db).clamp(-60.0, 12.0);
+                    c.gain = if next <= -60.0 {
+                        0.0
+                    } else {
+                        10f32.powf(next / 20.0)
+                    };
+                }
+                self.edit(Action::SetClip {
+                    track: ti,
+                    index: ci,
+                    clip: c,
+                });
+            }
         }
         if undo {
             self.edits.push(Edit::Undo);

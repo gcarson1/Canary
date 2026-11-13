@@ -8,9 +8,9 @@ use std::sync::Arc;
 
 use daw_core::SampleData;
 use daw_dsp::WaveformPyramid;
-use daw_project::{Action, ClipRef, History, Track};
+use daw_project::{Action, ClipRef, History, Note, Pattern, PatternClip, Track, PPQ, STEP};
 use daw_ui::{
-    theme, DeviceView, EngineView, Inputs, ParamView, PluginChoice, Request, SampleDrop,
+    theme, DeviceView, EngineView, Inputs, Page, ParamView, PluginChoice, Request, SampleDrop,
     SamplerView, Theme, Workspace,
 };
 use egui::epaint::ColorMode;
@@ -75,13 +75,68 @@ fn fixture() -> (History, HashMap<PathBuf, WaveformPyramid>, Vec<PathBuf>) {
         track.mute = i == 2;
         h.apply(Action::InsertTrack { index: i, track }).unwrap();
     }
+    // A pattern: a four-on-the-floor kick and a short bass line, placed twice.
+    h.apply(Action::InsertPattern {
+        index: 0,
+        pattern: Pattern {
+            id: 1,
+            name: "Pattern 1".into(),
+            length: 4 * PPQ,
+        },
+    })
+    .unwrap();
+    let note = |start, length, key, velocity| Note {
+        start,
+        length,
+        key,
+        velocity,
+    };
+    h.apply(Action::SetNotes {
+        track: 0,
+        pattern: 1,
+        notes: (0..4)
+            .map(|b| note(b * PPQ, STEP, 60, 70 + 15 * b as u8))
+            .collect(),
+    })
+    .unwrap();
+    h.apply(Action::SetNotes {
+        track: 1,
+        pattern: 1,
+        notes: vec![
+            note(0, 2 * STEP, 48, 100),
+            note(3 * STEP, STEP, 55, 90),
+            note(2 * PPQ, 4 * STEP, 51, 110),
+        ],
+    })
+    .unwrap();
+    for start in [0, 8 * PPQ] {
+        let index = h.project().tracks[2].pattern_clips.len();
+        h.apply(Action::InsertPatternClip {
+            track: 2,
+            index,
+            clip: PatternClip {
+                pattern: 1,
+                start,
+                length: 8 * PPQ,
+                offset: 0,
+            },
+        })
+        .unwrap();
+    }
     (h, waveforms, vec![kick, pad])
 }
 
-fn harness(size: (f32, f32, f32), theme: Theme, engine: EngineView) -> Harness<'static> {
+fn harness(
+    size: (f32, f32, f32),
+    theme: Theme,
+    engine: EngineView,
+    page: Page,
+) -> Harness<'static> {
     let (mut history, waveforms, files) = fixture();
     let mut ws = Workspace::default();
     ws.theme = theme;
+    ws.page = page;
+    ws.song = page == Page::Playlist;
     ws.selected_track = Some(0);
     ws.selected_clip = Some((1, 0));
     Harness::builder()
@@ -260,28 +315,34 @@ fn every_viewport_and_theme_renders_and_passes_the_audits() {
     std::fs::create_dir_all(&dir).unwrap();
     for (theme, name) in [(Theme::DARK, "dark"), (Theme::LIGHT, "light")] {
         let allowed = theme.tokens();
-        for size in SIZES {
-            let mut h = harness(size, theme, playing());
+        for (size, page) in SIZES
+            .into_iter()
+            .flat_map(|s| [Page::Playlist, Page::Sequencer, Page::PianoRoll].map(|p| (s, p)))
+        {
+            let mut h = harness(size, theme, playing(), page);
             h.run();
             let (mut colors, mut rounded) = (Vec::new(), 0);
             for clipped in &h.output().shapes {
                 audit(&clipped.shape, &mut colors, &mut rounded);
             }
-            assert_eq!(rounded, 0, "{name} {size:?}: rounded corners");
+            assert_eq!(rounded, 0, "{name} {size:?} {page:?}: rounded corners");
             let stray: Vec<_> = colors
                 .iter()
                 .filter(|c| c.a() != 0 && !allowed.contains(c))
                 .collect();
             assert!(
                 stray.is_empty(),
-                "{name} {size:?}: off-palette colors {stray:?}"
+                "{name} {size:?} {page:?}: off-palette colors {stray:?}"
             );
 
             let image = h.render().expect("wgpu render");
             image
                 .save(dir.join(format!(
-                    "workspace-{name}-{}x{}@{}x.png",
-                    size.0, size.1, size.2
+                    "{}-{name}-{}x{}@{}x.png",
+                    format!("{page:?}").to_lowercase(),
+                    size.0,
+                    size.1,
+                    size.2
                 )))
                 .unwrap();
         }
@@ -325,6 +386,8 @@ fn rig_with(rack: Vec<DeviceView>) -> Harness<'static, Rig> {
     ws.selected_track = Some(0);
     Harness::builder()
         .with_size(Vec2::new(1440.0, 900.0))
+        // 60 FPS, so two clicks a few frames apart make a double-click.
+        .with_step_dt(1.0 / 60.0)
         .with_context_setup(theme::install_fonts)
         .build_ui_state(
             move |ui, rig: &mut Rig| {
@@ -639,4 +702,109 @@ fn dock_switches_listening_and_takes_a_reference_drop() {
         .unwrap();
     click(&mut h, egui::Pos2::new(1130.0, 600.0)); // the LUFS_I readout
     assert!(h.state().requests.contains(&Request::ResetMeters));
+}
+
+#[test]
+fn tabs_switch_views_and_steps_toggle_notes() {
+    let mut h = rig();
+    h.run();
+    // SEQUENCER tab, then step 2 of row 3 (cells are 32pt every 36pt from x 440).
+    click(&mut h, egui::Pos2::new(140.0, 28.0));
+    click(&mut h, egui::Pos2::new(492.0, 228.0));
+    let notes = h.state().history.project().tracks[2].notes_in(1).to_vec();
+    assert_eq!(
+        notes,
+        [Note {
+            start: STEP,
+            length: STEP,
+            key: 60,
+            velocity: 100
+        }]
+    );
+    // Clicking it again clears it.
+    click(&mut h, egui::Pos2::new(492.0, 228.0));
+    assert!(h.state().history.project().tracks[2].notes_in(1).is_empty());
+}
+
+#[test]
+fn piano_roll_draws_moves_and_deletes_notes() {
+    let mut h = rig();
+    h.run();
+    click(&mut h, egui::Pos2::new(300.0, 28.0)); // PIANO ROLL
+                                                 // Grid from x 344 at 4 ticks per point; key 72 sits at y 292..304.
+    let at = egui::Pos2::new(470.0, 298.0);
+    click(&mut h, at);
+    let drawn = Note {
+        start: 480,
+        length: STEP,
+        key: 72,
+        velocity: 100,
+    };
+    let got = h.state().history.project().tracks[0].notes_in(1).to_vec();
+    assert!(got.contains(&drawn), "{got:?}");
+    assert!(
+        h.state().requests.contains(&Request::Note {
+            track: 0,
+            key: 72,
+            on: true
+        }),
+        "a new note sounds"
+    );
+    // Drag it a beat (240pt) right and one key up.
+    h.hover_at(at + Vec2::new(4.0, 0.0));
+    h.run();
+    press(&mut h, at + Vec2::new(4.0, 0.0), true);
+    h.run();
+    for step in 1..=10 {
+        h.hover_at(at + Vec2::new(4.0 + 24.0 * step as f32, -1.2 * step as f32));
+        h.run();
+    }
+    press(&mut h, at + Vec2::new(244.0, -12.0), false);
+    h.run();
+    let moved = Note {
+        start: 480 + PPQ,
+        key: 73,
+        ..drawn
+    };
+    let notes = h.state().history.project().tracks[0].notes_in(1).to_vec();
+    assert!(
+        notes.contains(&moved) && !notes.contains(&drawn),
+        "{notes:?}"
+    );
+    // The moved note is selected: Backspace deletes it and nothing else.
+    h.key_press(egui::Key::Backspace);
+    h.run();
+    let after = h.state().history.project().tracks[0].notes_in(1).to_vec();
+    assert_eq!(after.len(), notes.len() - 1);
+    assert!(!after.contains(&moved));
+    assert_eq!(
+        h.state().history.project().tracks.len(),
+        3,
+        "no track deleted"
+    );
+}
+
+#[test]
+fn double_click_places_the_pattern_and_delete_removes_it() {
+    let mut h = rig();
+    h.run();
+    // Row 2 (y 188..252) is empty at x 900 = sample 200 000 = tick 8 000.
+    let at = egui::Pos2::new(900.0, 220.0);
+    click(&mut h, at);
+    click(&mut h, at);
+    let clips = h.state().history.project().tracks[1].pattern_clips.clone();
+    assert_eq!(
+        clips,
+        [PatternClip {
+            pattern: 1,
+            start: 7_920,
+            length: 4 * PPQ,
+            offset: 0
+        }]
+    );
+    h.key_press(egui::Key::Backspace);
+    h.run();
+    let project = h.state().history.project();
+    assert!(project.tracks[1].pattern_clips.is_empty());
+    assert_eq!(project.tracks[1].clips.len(), 1, "the audio clip stays");
 }

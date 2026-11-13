@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use daw_core::{Clip, SampleData};
 use daw_dsp::MinMax;
-use daw_project::{Action, ClipRef, Track};
+use daw_project::{Action, ClipRef, PatternClip, Project, Track};
 use egui::{Align2, Pos2, Rect, Sense, StrokeKind};
 
 use crate::theme::Metrics;
@@ -21,6 +21,7 @@ pub(crate) struct View {
     /// Lanes scrolled up by this many points.
     scroll_y: f32,
     drag: Option<Drag>,
+    pattern_drag: Option<PatternDrag>,
     /// Playhead last frame, to page only when it crosses the right edge.
     last_playhead: u64,
 }
@@ -32,6 +33,7 @@ impl Default for View {
             zoom: 400.0,
             scroll_y: 0.0,
             drag: None,
+            pattern_drag: None,
             last_playhead: 0,
         }
     }
@@ -58,6 +60,41 @@ struct Drag {
     revision: u64,
 }
 
+/// A pattern clip being moved or trimmed; positions in ticks.
+struct PatternDrag {
+    track: usize,
+    index: usize,
+    grab: Grab,
+    /// Ticks between the pointer and the clip start when the drag began.
+    offset: f64,
+    preview: PatternClip,
+    to_track: usize,
+    revision: u64,
+}
+
+/// Where a pattern clip's edge lands when dragged to tick `at`: the start edge
+/// trims into the pattern (moving `offset`), the end edge sets the length.
+/// Both keep at least one grid step.
+fn trim_pattern(clip: &PatternClip, grab: Grab, at: u64, grid: u64) -> PatternClip {
+    let min = grid.max(1);
+    match grab {
+        Grab::Start => {
+            let earliest = clip.start.saturating_sub(clip.offset);
+            let at = at.clamp(earliest, clip.end().saturating_sub(min).max(earliest));
+            PatternClip {
+                start: at,
+                length: clip.end() - at,
+                offset: clip.offset + at - clip.start,
+                ..*clip
+            }
+        }
+        _ => PatternClip {
+            length: at.max(clip.start + min) - clip.start,
+            ..*clip
+        },
+    }
+}
+
 /// Snap grid length in samples, or `None` for no snapping.
 fn grid(snap: Snap, bpm: f64, sample_rate: u32) -> Option<f64> {
     let beat = 60.0 / bpm * f64::from(sample_rate);
@@ -71,7 +108,7 @@ fn grid(snap: Snap, bpm: f64, sample_rate: u32) -> Option<f64> {
 
 impl View {
     pub(crate) fn is_dragging(&self) -> bool {
-        self.drag.is_some()
+        self.drag.is_some() || self.pattern_drag.is_some()
     }
 
     fn x_of(&self, lanes: Rect, sample: f64) -> f32 {
@@ -336,6 +373,169 @@ pub(crate) fn show(
         }
     }
 
+    // Pattern clips draw over audio and take the pointer first.
+    let stale = ws.timeline.pattern_drag.as_ref().is_some_and(|d| {
+        d.revision != inputs.history.revision()
+            || project
+                .tracks
+                .get(d.track)
+                .and_then(|t| t.pattern_clips.get(d.index))
+                .is_none()
+    });
+    if stale {
+        ws.timeline.pattern_drag = None;
+    }
+    let mut phit = None;
+    for (ti, track) in project.tracks.iter().enumerate() {
+        for (ci, clip) in track.pattern_clips.iter().enumerate() {
+            let dragging = ws
+                .timeline
+                .pattern_drag
+                .as_ref()
+                .is_some_and(|d| (d.track, d.index) == (ti, ci));
+            let (shown, lane_i) = match &ws.timeline.pattern_drag {
+                Some(d) if dragging => (&d.preview, d.to_track),
+                _ => (clip, ti),
+            };
+            let lane = lane_rect(lane_i, &ws.timeline);
+            let x0 = ws
+                .timeline
+                .x_of(lanes, project.samples_at(shown.start) as f64);
+            let x1 = ws
+                .timeline
+                .x_of(lanes, project.samples_at(shown.end()) as f64);
+            let rect = m.snap_rect(Rect::from_x_y_ranges(
+                x0..=x1.max(x0 + m.px),
+                lane.min.y + m.px..=lane.max.y - m.px,
+            ));
+            if probe.is_some_and(|p| rect.contains(p)) && !dragging {
+                let grab = match probe {
+                    Some(p) if p.x - rect.min.x < edge => Grab::Start,
+                    Some(p) if rect.max.x - p.x < edge => Grab::End,
+                    _ => Grab::Body,
+                };
+                phit = Some((ti, ci, grab));
+            }
+            if !rect.intersects(lanes) {
+                continue;
+            }
+            draw_pattern_clip(ws, &clip_p, m, rect, shown, project);
+            if ws.selected_pattern_clip == Some((ti, ci)) {
+                clip_p.rect_stroke(rect, 0.0, m.hair(t.accent_amber), StrokeKind::Inside);
+            }
+        }
+    }
+    if phit.is_some() {
+        hit = None;
+    }
+    let grid_ticks = crate::piano::snap_ticks(ws.snap);
+    let snap_tick = |sample: f64| {
+        let tick = project.ticks_at(sample.max(0.0) as u64);
+        (tick + grid_ticks / 2) / grid_ticks * grid_ticks
+    };
+    if let (Some((_, _, grab)), true) = (phit, lanes_resp.hovered()) {
+        ui.ctx().set_cursor_icon(match grab {
+            Grab::Body => egui::CursorIcon::Grab,
+            _ => egui::CursorIcon::ResizeHorizontal,
+        });
+    }
+    if lanes_resp.drag_started() && ws.tool == Tool::Draw {
+        let at = probe.map(|p| ws.timeline.sample_at(lanes, p.x));
+        if let (Some((ti, ci, grab)), Some(at)) = (phit, at) {
+            let clip = project.tracks[ti].pattern_clips[ci];
+            ws.selected_pattern_clip = Some((ti, ci));
+            ws.selected_clip = None;
+            ws.selected_track = Some(ti);
+            ws.timeline.pattern_drag = Some(PatternDrag {
+                track: ti,
+                index: ci,
+                grab,
+                offset: project.ticks_at(at as u64) as f64 - clip.start as f64,
+                preview: clip,
+                to_track: ti,
+                revision: inputs.history.revision(),
+            });
+        }
+    }
+    let scroll_y = ws.timeline.scroll_y;
+    let pointer_at = pointer.map(|p| (p, ws.timeline.sample_at(lanes, p.x)));
+    if let (Some((pos, at)), Some(d)) = (pointer_at, ws.timeline.pattern_drag.as_mut()) {
+        let original = project.tracks[d.track].pattern_clips[d.index];
+        match d.grab {
+            Grab::Body => {
+                let tick = project.ticks_at(at as u64) as f64 - d.offset;
+                let start = project.samples_at(tick.max(0.0) as u64) as f64;
+                d.preview.start = snap_tick(start);
+                let lane = ((pos.y - lanes.min.y + scroll_y) / lane_h).floor();
+                d.to_track = (lane.max(0.0) as usize).min(project.tracks.len() - 1);
+            }
+            grab => d.preview = trim_pattern(&original, grab, snap_tick(at), grid_ticks),
+        }
+    }
+    if lanes_resp.drag_stopped() {
+        if let Some(d) = ws.timeline.pattern_drag.take() {
+            let action = if d.to_track == d.track {
+                Action::SetPatternClip {
+                    track: d.track,
+                    index: d.index,
+                    clip: d.preview,
+                }
+            } else {
+                let index = project.tracks[d.to_track].pattern_clips.len();
+                ws.selected_pattern_clip = Some((d.to_track, index));
+                ws.selected_track = Some(d.to_track);
+                Action::Batch(vec![
+                    Action::RemovePatternClip {
+                        track: d.track,
+                        index: d.index,
+                    },
+                    Action::InsertPatternClip {
+                        track: d.to_track,
+                        index,
+                        clip: d.preview,
+                    },
+                ])
+            };
+            ws.edit(action);
+        }
+    }
+    if lanes_resp.clicked() {
+        if let Some((ti, ci, _)) = phit {
+            ws.selected_pattern_clip = Some((ti, ci));
+            ws.selected_clip = None;
+            ws.selected_track = Some(ti);
+        } else {
+            ws.selected_pattern_clip = None;
+        }
+    }
+    // Double-click empty lane space to place the current pattern there.
+    if lanes_resp.double_clicked() && hit.is_none() && phit.is_none() {
+        let pattern = ws
+            .current_pattern(project)
+            .and_then(|id| project.pattern(id));
+        if let (Some(pat), Some(pos)) = (pattern, pointer) {
+            let lane = ((pos.y - lanes.min.y + ws.timeline.scroll_y) / lane_h).floor();
+            let row = lane.max(0.0) as usize;
+            if row < project.tracks.len() {
+                let at = ws.timeline.sample_at(lanes, pos.x);
+                let start = project.ticks_at(at as u64) / grid_ticks * grid_ticks;
+                let index = project.tracks[row].pattern_clips.len();
+                ws.selected_pattern_clip = Some((row, index));
+                ws.selected_clip = None;
+                ws.edit(Action::InsertPatternClip {
+                    track: row,
+                    index,
+                    clip: PatternClip {
+                        pattern: pat.id,
+                        start,
+                        length: pat.length,
+                        offset: 0,
+                    },
+                });
+            }
+        }
+    }
+
     // Gestures.
     if let (Some((_, _, grab)), true) = (hit, lanes_resp.hovered()) {
         let icon = match grab {
@@ -478,6 +678,73 @@ pub(crate) fn show(
         v.start = ph as f64;
     }
     v.last_playhead = ph;
+}
+
+/// A pattern clip: its name, a marker at each repeat, and a sketch of every
+/// track's notes in it.
+fn draw_pattern_clip(
+    ws: &Workspace,
+    p: &egui::Painter,
+    m: &Metrics,
+    rect: Rect,
+    clip: &PatternClip,
+    project: &Project,
+) {
+    let (t, u) = (ws.theme, m.u);
+    p.rect_filled(rect, 0.0, t.sel);
+    p.rect_stroke(rect, 0.0, m.hair(t.line_2), StrokeKind::Inside);
+    let title_h = 1.125 * u;
+    let title = Rect::from_x_y_ranges(rect.x_range(), rect.min.y..=m.snap(rect.min.y + title_h));
+    p.hline(rect.x_range(), title.max.y, m.hair(t.line_2));
+    let Some(pattern) = project.pattern(clip.pattern) else {
+        return;
+    };
+    let cp = p.with_clip_rect(rect.intersect(p.clip_rect()));
+    cp.text(
+        Pos2::new(rect.min.x + 0.375 * u, title.center().y),
+        Align2::LEFT_CENTER,
+        pattern.name.to_uppercase(),
+        m.mono(0.5625),
+        t.text,
+    );
+    let body = Rect::from_x_y_ranges(rect.x_range(), title.max.y + m.px..=rect.max.y - m.px);
+    let notes: Vec<_> = project
+        .tracks
+        .iter()
+        .flat_map(|tr| tr.notes_in(clip.pattern))
+        .collect();
+    let (lo, hi) = notes
+        .iter()
+        .fold((127u8, 0u8), |(lo, hi), n| (lo.min(n.key), hi.max(n.key)));
+    let span = f32::from(hi.saturating_sub(lo)).max(11.0);
+    let zoom = ws.timeline.zoom;
+    let x_of = |tick: u64| {
+        let s = project.samples_at(tick) as f64 - project.samples_at(clip.start) as f64;
+        rect.min.x + (s / zoom) as f32
+    };
+    // Repeat k of the pattern starts at clip tick k * length - offset % length.
+    let first = clip.offset % pattern.length;
+    let mut rep = clip.start as i128 - first as i128;
+    while rep < clip.end() as i128 {
+        if rep > clip.start as i128 {
+            cp.vline(m.snap(x_of(rep as u64)), body.y_range(), m.hair(t.line_2));
+        }
+        for n in &notes {
+            let on = rep + n.start as i128;
+            let off = (rep + n.end().min(pattern.length) as i128).min(clip.end() as i128);
+            if on < clip.start as i128 || on >= off {
+                continue;
+            }
+            let y =
+                body.max.y - 0.25 * u - (body.height() - 0.5 * u) * f32::from(n.key - lo) / span;
+            let (x0, x1) = (x_of(on as u64), x_of(off as u64));
+            if x0 > p.clip_rect().max.x {
+                break;
+            }
+            cp.hline(x0..=x1.max(x0 + 2.0 * m.px), m.snap(y), m.hair(t.muted));
+        }
+        rep += pattern.length as i128;
+    }
 }
 
 fn draw_clip(

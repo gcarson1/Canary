@@ -3,7 +3,9 @@
 //! dock), drawn with egui. Edits go into `daw_project::History`; anything the
 //! engine must do comes back as `Request`s. This crate never touches audio.
 
+mod piano;
 mod rack;
+mod sequencer;
 pub mod theme;
 mod timeline;
 
@@ -11,7 +13,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use daw_dsp::WaveformPyramid;
-use daw_project::{Action, History, Track, TrackProps};
+use daw_project::{Action, History, Pattern, Playback, Project, Track, TrackProps, PPQ};
 use egui::{Align2, Color32, Key, Pos2, Rect, Sense, Shape, StrokeKind, Vec2};
 
 pub use rack::{DeviceView, ParamView, PluginChoice, SampleDrop, SamplerView};
@@ -145,6 +147,14 @@ pub enum Tool {
     Slice,
 }
 
+/// The center view, picked by the top bar's tabs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Page {
+    Sequencer,
+    Playlist,
+    PianoRoll,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Snap {
     Sixteenth,
@@ -175,7 +185,16 @@ pub struct Workspace {
     pub snap: Snap,
     pub selected_track: Option<usize>,
     pub selected_clip: Option<(usize, usize)>,
+    /// A pattern clip on the playlist: (row, index).
+    pub selected_pattern_clip: Option<(usize, usize)>,
     pub status: Option<Status>,
+    pub page: Page,
+    /// SONG plays the playlist; otherwise the current pattern loops (PAT).
+    pub song: bool,
+    /// The pattern the sequencer and piano roll edit; see `current_pattern`.
+    pub pattern: Option<u64>,
+    seq: sequencer::View,
+    roll: piano::View,
     timeline: timeline::View,
     /// Tempo while its readout is being dragged; applied on release.
     tempo_drag: Option<f64>,
@@ -200,7 +219,13 @@ impl Default for Workspace {
             snap: Snap::Sixteenth,
             selected_track: None,
             selected_clip: None,
+            selected_pattern_clip: None,
             status: None,
+            page: Page::Playlist,
+            song: true,
+            pattern: None,
+            seq: sequencer::View::default(),
+            roll: piano::View::default(),
             timeline: timeline::View::default(),
             tempo_drag: None,
             clip_latch: [false; 2],
@@ -324,7 +349,11 @@ impl Workspace {
             t.faint,
         );
         self.tool_strip(ui, &p, &m, z.tools);
-        timeline::show(self, ui, &p, &m, z.timeline, &inputs, &mut out);
+        match self.page {
+            Page::Sequencer => sequencer::show(self, ui, &p, &m, z.timeline, &inputs),
+            Page::Playlist => timeline::show(self, ui, &p, &m, z.timeline, &inputs, &mut out),
+            Page::PianoRoll => piano::show(self, ui, &p, &m, z.timeline, &inputs, &mut out),
+        }
         rack::show(self, ui, &p, &m, z.rack, &inputs, &mut out);
         // A module removed mid-drag never sees its drag stop.
         if !ui.input(|i| i.pointer.any_down()) {
@@ -377,7 +406,57 @@ impl Workspace {
 
     /// True while a clip is being dragged; the app holds back its own edits then.
     pub fn is_dragging(&self) -> bool {
-        self.timeline.is_dragging() || self.device_drag.is_some() || self.file_drag.is_some()
+        self.timeline.is_dragging()
+            || self.roll.is_dragging()
+            || self.device_drag.is_some()
+            || self.file_drag.is_some()
+    }
+
+    /// The pattern being edited: the chosen one if it still exists, else the first.
+    pub fn current_pattern(&self, project: &Project) -> Option<u64> {
+        self.pattern
+            .filter(|&id| project.pattern(id).is_some())
+            .or_else(|| project.patterns.first().map(|p| p.id))
+    }
+
+    /// What the engine should play.
+    pub fn playback(&self, project: &Project) -> Playback {
+        match self.current_pattern(project) {
+            Some(id) if !self.song => Playback::Pattern(id),
+            _ => Playback::Song,
+        }
+    }
+
+    /// The pattern to put notes in, and the edit that creates it first if the
+    /// project has none yet (one bar long).
+    fn pattern_for_edit(&mut self, project: &Project) -> (u64, Option<Action>) {
+        if let Some(id) = self.current_pattern(project) {
+            self.pattern = Some(id);
+            return (id, None);
+        }
+        let id = project.new_pattern_id();
+        self.pattern = Some(id);
+        let pattern = Pattern {
+            id,
+            name: format!("Pattern {}", project.patterns.len() + 1),
+            length: 4 * PPQ,
+        };
+        (id, Some(Action::InsertPattern { index: 0, pattern }))
+    }
+
+    /// Queues `notes` as `track`'s notes in the current pattern, creating the
+    /// pattern if there is none.
+    fn set_notes(&mut self, project: &Project, track: usize, notes: Vec<daw_project::Note>) {
+        let (pattern, create) = self.pattern_for_edit(project);
+        let set = Action::SetNotes {
+            track,
+            pattern,
+            notes,
+        };
+        self.edit(match create {
+            Some(create) => Action::Batch(vec![create, set]),
+            None => set,
+        });
     }
 
     /// Queues a project edit for the end of the frame.
@@ -422,16 +501,30 @@ impl Workspace {
         if redo {
             self.edits.push(Edit::Redo);
         }
-        if delete {
-            let action = match (self.selected_clip, self.selected_track) {
-                (Some((track, index)), _) => Some(Action::RemoveClip { track, index }),
-                (None, Some(index)) => Some(Action::RemoveTrack { index }),
+        // The piano roll deletes its own notes.
+        if delete && self.page != Page::PianoRoll {
+            let action = match (
+                self.selected_pattern_clip
+                    .filter(|_| self.page == Page::Playlist),
+                self.selected_clip,
+                self.selected_track,
+            ) {
+                (Some((track, index)), _, _) => {
+                    self.selected_pattern_clip = None;
+                    Some(Action::RemovePatternClip { track, index })
+                }
+                (None, Some((track, index)), _) => {
+                    self.selected_clip = None;
+                    Some(Action::RemoveClip { track, index })
+                }
+                (None, None, Some(index)) => {
+                    self.selected_track = None;
+                    Some(Action::RemoveTrack { index })
+                }
                 _ => None,
             };
             if let Some(action) = action {
                 self.edit(action);
-                self.selected_clip = None;
-                self.selected_track = None;
             }
         }
     }
@@ -447,6 +540,12 @@ impl Workspace {
             .is_some_and(|(t, c)| tracks.get(t).is_none_or(|t| c >= t.clips.len()))
         {
             self.selected_clip = None;
+        }
+        if self
+            .selected_pattern_clip
+            .is_some_and(|(t, c)| tracks.get(t).is_none_or(|t| c >= t.pattern_clips.len()))
+        {
+            self.selected_pattern_clip = None;
         }
     }
 
@@ -475,24 +574,47 @@ impl Workspace {
             t.text,
         );
         x = name.max.x + 1.5 * u;
-        // The only view built so far; its tab carries the 2pt active bar.
-        let tab = p.text(
-            Pos2::new(x, cy),
-            Align2::LEFT_CENTER,
-            "PLAYLIST",
-            m.sans_bold(0.75),
-            t.text,
-        );
-        p.rect_filled(
-            Rect::from_x_y_ranges(tab.x_range(), (r.max.y - 0.125 * u)..=r.max.y),
-            0.0,
-            t.accent_amber,
-        );
+        // View tabs; the active one carries the 2pt amber bar. The pattern views
+        // switch to PAT, the playlist to SONG, as most edits there expect.
+        for (page, label) in [
+            (Page::Sequencer, "SEQUENCER"),
+            (Page::Playlist, "PLAYLIST"),
+            (Page::PianoRoll, "PIANO ROLL"),
+        ] {
+            let active = self.page == page;
+            let tab = p.text(
+                Pos2::new(x, cy),
+                Align2::LEFT_CENTER,
+                label,
+                m.sans_bold(0.75),
+                if active { t.text } else { t.muted },
+            );
+            let resp = ui.interact(
+                Rect::from_x_y_ranges(tab.x_range(), r.y_range()),
+                ui.scope_id().with(("tab", label)),
+                Sense::click(),
+            );
+            if active {
+                p.rect_filled(
+                    Rect::from_x_y_ranges(tab.x_range(), (r.max.y - 0.125 * u)..=r.max.y),
+                    0.0,
+                    t.accent_amber,
+                );
+            } else if resp.hovered() {
+                p.hline(tab.x_range(), m.snap(tab.max.y), m.hair(t.muted));
+            }
+            if resp.clicked() && !active {
+                self.page = page;
+                self.song = page == Page::Playlist;
+            }
+            x = tab.max.x + u;
+        }
+        x = self.pattern_switch(ui, p, m, x + 0.5 * u, cy, inputs.history.project());
 
         // Center: tempo, clock, transport.
         let engine = inputs.engine;
         let bpm = self.tempo_drag.unwrap_or(inputs.history.project().bpm);
-        let mut x = r.center().x - 12.0 * u;
+        let mut x = (r.center().x - 12.0 * u).max(x + 1.5 * u);
         let bpm_rect = p.text(
             Pos2::new(x, cy),
             Align2::LEFT_CENTER,
@@ -621,6 +743,115 @@ impl Workspace {
                 color,
             );
         }
+    }
+
+    /// `◂ PAT 01 ▸` and the PAT/SONG switch, from `x`; returns where they end.
+    /// Stepping past the last pattern makes a new one; right-click on the number
+    /// removes the current pattern with its notes and clips.
+    fn pattern_switch(
+        &mut self,
+        ui: &egui::Ui,
+        p: &egui::Painter,
+        m: &Metrics,
+        x: f32,
+        cy: f32,
+        project: &Project,
+    ) -> f32 {
+        let (t, u) = (self.theme, m.u);
+        let current = self.current_pattern(project);
+        let index = current.and_then(|id| project.patterns.iter().position(|q| q.id == id));
+        let arrow = |x: f32, label: &str, id: &str| {
+            let g = p.text(
+                Pos2::new(x, cy),
+                Align2::LEFT_CENTER,
+                label,
+                m.mono(0.75),
+                t.muted,
+            );
+            let resp = ui.interact(g.expand(0.25 * u), ui.scope_id().with(id), Sense::click());
+            if resp.hovered() {
+                p.hline(g.x_range(), m.snap(g.max.y), m.hair(t.muted));
+            }
+            (g.max.x, resp.clicked())
+        };
+        let (end, prev) = arrow(x, "◂", "pat-prev");
+        let label = match index {
+            Some(i) => format!("PAT {:02}", i + 1),
+            None => "PAT --".into(),
+        };
+        let num = p.text(
+            Pos2::new(end + 0.375 * u, cy),
+            Align2::LEFT_CENTER,
+            label,
+            m.mono(0.8125),
+            t.text,
+        );
+        let num_resp = ui.interact(
+            num.expand(0.25 * u),
+            ui.scope_id().with("pat-num"),
+            Sense::click(),
+        );
+        let (end, next) = arrow(num.max.x + 0.375 * u, "▸", "pat-next");
+        if prev {
+            if let Some(i) = index.filter(|&i| i > 0) {
+                self.pattern = Some(project.patterns[i - 1].id);
+            }
+        }
+        if next {
+            match index {
+                Some(i) if i + 1 < project.patterns.len() => {
+                    self.pattern = Some(project.patterns[i + 1].id);
+                }
+                _ => {
+                    let id = project.new_pattern_id();
+                    let n = project.patterns.len();
+                    self.pattern = Some(id);
+                    self.edit(Action::InsertPattern {
+                        index: n,
+                        pattern: Pattern {
+                            id,
+                            name: format!("Pattern {}", n + 1),
+                            length: 4 * PPQ,
+                        },
+                    });
+                }
+            }
+        }
+        if num_resp.secondary_clicked() {
+            if let Some(action) = index.and_then(|i| project.remove_pattern(i)) {
+                self.pattern = None;
+                self.edit(action);
+            }
+        }
+        // PAT / SONG segmented switch.
+        let mut x = end + 0.75 * u;
+        for (song, label) in [(false, "PAT"), (true, "SONG")] {
+            let g = p.layout_no_wrap(label.into(), m.mono(0.6875), t.text);
+            let rect = m.snap_rect(Rect::from_min_size(
+                Pos2::new(x, cy - 0.75 * u),
+                Vec2::new(g.size().x + 0.75 * u, 1.5 * u),
+            ));
+            let resp = ui.interact(rect, ui.scope_id().with(("mode", label)), Sense::click());
+            let active = self.song == song;
+            if active {
+                p.rect_filled(rect, 0.0, t.ink);
+            } else {
+                let line = if resp.hovered() { t.text } else { t.line_2 };
+                p.rect_stroke(rect, 0.0, m.hair(line), StrokeKind::Inside);
+            }
+            p.text(
+                rect.center(),
+                Align2::CENTER_CENTER,
+                label,
+                m.mono(0.6875),
+                if active { t.ink_text } else { t.muted },
+            );
+            if resp.clicked() {
+                self.song = song;
+            }
+            x = rect.max.x;
+        }
+        x
     }
 
     fn browser(

@@ -74,13 +74,13 @@ The UI follows Styles.md whichever framework is chosen.
 - [x] Plugin GUIs drawn through Metal; SIMD where profiling shows a hot loop. EDIT on a rack module opens the plugin's own editor (AU, VST3, CLAP) in a layer-backed window composited on Metal; every Apple AU opens (`editor_check` example). VST3/CLAP editors are untested on real plugins (none installed); the CLAP editor call order is unit-tested. `daw-graph/examples/profile.rs` found the hot loops: true-peak FIR vectorized as 4 lanes, saturator transcendentals halved
 
 ### Phase 6: Patterns, Step Sequencer and Piano Roll
-- [ ] Note model in `daw-project`: notes in ticks (960 PPQ) with key, velocity and length; FL-style patterns (each track holds its own notes per pattern); pattern clips placed on playlist rows; undoable actions for all of it
-- [ ] Sequenced MIDI in the engine: a step's note sequence (timeline samples) merges with live MIDI, sample-accurate, no allocation; held notes are released on stop, seek, loop wrap and sequence changes
-- [ ] Transport loop (`Command::SetLoop`): blocks split exactly at the loop end. PAT mode loops the current pattern; SONG mode plays the playlist
-- [ ] View router in the top bar (SEQUENCER, PLAYLIST, PIANO ROLL) with pattern selector (`PAT 01`) and PAT/SONG switch
-- [ ] Step sequencer: 16-step matrix per track with velocity lane, pattern length in steps
-- [ ] Piano roll: draw, move, resize, delete, select (box and shift), velocity lane, snap, keyboard preview, zoom/scroll
-- [ ] MIDI editing: quantize, transpose, duplicate, legato, velocity scale and humanize
+- [x] Note model in `daw-project`: notes in ticks (960 PPQ) with key, velocity and length; FL-style patterns (each track holds its own notes per pattern); pattern clips placed on playlist rows; undoable actions for all of it
+- [x] Sequenced MIDI in the engine: a step's note sequence (timeline samples) merges with live MIDI, sample-accurate, no allocation; held notes are released on stop, seek, loop wrap and sequence changes
+- [x] Transport loop (`Command::SetLoop`): blocks split exactly at the loop end. PAT mode loops the current pattern; SONG mode plays the playlist
+- [x] View router in the top bar (SEQUENCER, PLAYLIST, PIANO ROLL) with pattern selector (`◂ PAT 01 ▸`, stepping past the last makes a new pattern, right-click removes) and PAT/SONG switch. Pattern clips: double-click a playlist row to place the current pattern, drag to move or trim, Delete removes
+- [x] Step sequencer: 16-step matrix per track with velocity lane, pattern length in steps
+- [x] Piano roll: draw, move, resize, delete, select (box and shift), velocity lane, snap, keyboard preview, zoom/scroll
+- [x] MIDI editing: quantize, transpose, duplicate, legato, velocity scale and humanize (`daw_project::edit`; piano roll keys Q, arrows, Cmd+D, L, [ ], H)
 - [ ] Standard MIDI file import and export (`.mid`, format 0/1)
 - [ ] MIDI recording into the current pattern (quantize optional)
 

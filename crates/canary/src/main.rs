@@ -15,13 +15,13 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{env, fs, thread};
 
-use daw_core::{Clip, Command, NodeId, SampleData, Telemetry, TrackParams};
+use daw_core::{Clip, Command, NodeId, SampleData, SeqEvent, Telemetry, TrackParams};
 use daw_dsp::WaveformPyramid;
 use daw_dsp::{integrated_loudness, TruePeak};
 use daw_engine::{EngineHandle, MidiConnection, MidiSender, Recorder};
 use daw_graph::{ExecutionPlan, MasterNode, Monitor, MonitorMode, Source, TrackNode};
 use daw_host::LayerKind;
-use daw_project::{Action, ClipRef, History, Track};
+use daw_project::{Action, ClipRef, History, Playback, Track};
 use daw_ui::{theme, EngineView, Inputs, Listen, Request, SampleDrop, Status, Workspace};
 use devices::Devices;
 
@@ -66,6 +66,10 @@ struct App {
     built_devices: Vec<Vec<u64>>,
     /// The track whose instrument took live MIDI in the last plan.
     built_selected: Option<usize>,
+    /// What the last plan plays (PAT or SONG), and each track's notes for it.
+    built_playback: Option<Playback>,
+    built_sequences: Vec<Vec<SeqEvent>>,
+    built_loop: Option<(u64, u64)>,
     /// Live MIDI to the selected track's instrument: pads and the keyboard.
     midi: Option<Arc<Mutex<MidiSender>>>,
     _midi_in: Option<MidiConnection>,
@@ -176,6 +180,9 @@ impl App {
             built_clips: Vec::new(),
             built_devices: Vec::new(),
             built_selected: None,
+            built_playback: None,
+            built_sequences: Vec::new(),
+            built_loop: None,
             midi,
             _midi_in: midi_in,
             queued: None,
@@ -362,12 +369,18 @@ impl App {
             return;
         }
         let revision = self.history.revision();
+        let playback = self.ws.playback(self.history.project());
         if self.built == Some(revision)
             && !self.devices.changed()
             && self.built_selected == self.ws.selected_track
+            && self.built_playback == Some(playback)
         {
             return;
         }
+        let project = self.history.project();
+        let sequences: Vec<Vec<SeqEvent>> = (0..project.tracks.len())
+            .map(|i| project.sequence(i, playback))
+            .collect();
         let rate = self.view.sample_rate as f32;
         for e in self.devices.sync(self.history.project(), rate, MAX_BLOCK) {
             self.error(e);
@@ -378,6 +391,9 @@ impl App {
             && !self.devices.changed()
             && self.built_reference == self.history.project().reference
             && self.built_selected == self.ws.selected_track
+            && self.built_playback == Some(playback)
+            && sequences == self.built_sequences
+            && loop_range(self.history.project(), playback) == self.built_loop
             && tracks.len() == self.built_clips.len()
             && tracks
                 .iter()
@@ -391,7 +407,7 @@ impl App {
             self.set_params();
             self.built = Some(revision);
         } else {
-            self.rebuild();
+            self.rebuild(playback, sequences);
         }
     }
 
@@ -407,7 +423,7 @@ impl App {
     /// Sends the engine a plan for the current project: per track, its instrument
     /// (if any) into a track node into its effects, all summed into a master.
     /// Track nodes are rebuilt; plugin nodes persist and keep their state.
-    fn rebuild(&mut self) {
+    fn rebuild(&mut self, playback: Playback, sequences: Vec<Vec<SeqEvent>>) {
         let count = self
             .history
             .project()
@@ -430,10 +446,12 @@ impl App {
         for (i, track) in tracks.iter().enumerate() {
             // An ARA plug-in on the track renders its clips itself.
             let ara = self.devices.ara_track(track);
+            // A looping pattern plays on its own, as in FL's PAT mode.
+            let pattern_mode = matches!(playback, Playback::Pattern(_));
             let clips = track
                 .clips
                 .iter()
-                .filter(|_| !ara)
+                .filter(|_| !ara && !pattern_mode)
                 .filter_map(|c| {
                     let audio = self.audio.get(&c.source)?.clone();
                     Clip::with_window(c.start, audio, c.offset, c.length, c.fade_in, c.fade_out)
@@ -445,9 +463,14 @@ impl App {
             // played again; a real fix sends note-offs to the old instrument.
             let selected = self.ws.selected_track == Some(i);
             let inputs = match self.devices.instrument_step(&mut plan, track, selected) {
-                Some(step) => (0..2)
-                    .map(|channel| vec![Source { step, channel }])
-                    .collect(),
+                Some(step) => {
+                    if let Some(seq) = sequences.get(i).filter(|s| !s.is_empty()) {
+                        plan.sequence(step, seq.clone());
+                    }
+                    (0..2)
+                        .map(|channel| vec![Source { step, channel }])
+                        .collect()
+                }
                 None => vec![],
             };
             let track_step = plan.add(id, inputs, 2).expect("inputs are earlier steps");
@@ -482,6 +505,19 @@ impl App {
             .collect();
         self.built = Some(self.history.revision());
         self.built_selected = self.ws.selected_track;
+        // PAT mode loops the pattern; jump into it if the playhead is past its end.
+        let looping = loop_range(self.history.project(), playback);
+        if self.built_playback != Some(playback) {
+            if let Some((start, _)) = looping.filter(|&(_, end)| self.view.playhead >= end) {
+                let _ = self.engine.commands.push(Command::Seek(start));
+            }
+        }
+        if let Err(e) = self.engine.commands.push(Command::SetLoop(looping)) {
+            eprintln!("engine busy, dropped {e:?}");
+        }
+        self.built_playback = Some(playback);
+        self.built_sequences = sequences;
+        self.built_loop = looping;
         let pending = &self.pending;
         let errors = self
             .devices
@@ -797,6 +833,16 @@ impl eframe::App for App {
         // repaint on their own, so a stopped app idles.
         let busy = self.view.playing || self.view.recording || !self.pending.is_empty();
         ctx.request_repaint_after(Duration::from_millis(if busy { 16 } else { 250 }));
+    }
+}
+
+/// The transport loop for `playback`: the whole pattern in PAT mode.
+fn loop_range(project: &daw_project::Project, playback: Playback) -> Option<(u64, u64)> {
+    match playback {
+        Playback::Pattern(id) => project
+            .pattern(id)
+            .map(|p| (0, project.samples_at(p.length).max(1))),
+        Playback::Song => None,
     }
 }
 

@@ -118,11 +118,18 @@ pub(crate) fn show(
             module_w
         }
     };
+    // Wheel or trackpad scrolls the modules sideways when they do not fit.
+    let total: f32 = inputs.devices.iter().map(width).sum::<f32>() + 8.0 * u;
+    if ui.rect_contains_pointer(body) && ws.picker.is_none() {
+        let d = ui.input(|i| i.smooth_scroll_delta);
+        ws.rack_scroll -= if d.x != 0.0 { d.x } else { d.y };
+    }
+    ws.rack_scroll = ws.rack_scroll.clamp(0.0, (total - body.width()).max(0.0));
     // Module left edges, in order.
     let starts: Vec<f32> = inputs
         .devices
         .iter()
-        .scan(body.min.x, |x, d| {
+        .scan(body.min.x - ws.rack_scroll, |x, d| {
             let at = *x;
             *x += width(d);
             Some(at)
@@ -137,7 +144,7 @@ pub(crate) fn show(
         .zip(pointer)
         .filter(|(_, at)| body.contains(*at))
         .map(|(_, at)| slot(at.x));
-    let mut x = body.min.x;
+    let mut x = body.min.x - ws.rack_scroll;
     for (di, device) in inputs.devices.iter().enumerate() {
         let module = Rect::from_x_y_ranges(x..=m.snap(x + width(device)), body.y_range());
         let p = p.with_clip_rect(module.intersect(p.clip_rect()));

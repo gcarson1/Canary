@@ -220,6 +220,8 @@ pub struct Workspace {
     edits: Vec<Edit>,
     /// The device picker's scroll offset while it is open.
     picker: Option<f32>,
+    /// Points the rack is scrolled to the left.
+    rack_scroll: f32,
     /// The rack device being dragged to a new slot.
     device_drag: Option<usize>,
     /// An asset browser file being dragged (onto a sampler).
@@ -254,6 +256,7 @@ impl Default for Workspace {
             edits: Vec::new(),
             picker: None,
             device_drag: None,
+            rack_scroll: 0.0,
             file_drag: None,
             held_note: None,
         }
@@ -376,7 +379,12 @@ impl Workspace {
             Page::Playlist => timeline::show(self, ui, &p, &m, z.timeline, &inputs, &mut out),
             Page::PianoRoll => piano::show(self, ui, &p, &m, z.timeline, &inputs, &mut out),
         }
-        rack::show(self, ui, &p, &m, z.rack, &inputs, &mut out);
+        // The rack scrolls sideways; nothing in it may draw or react outside it.
+        ui.scope_builder(egui::UiBuilder::new().max_rect(z.rack), |ui| {
+            ui.set_clip_rect(z.rack.intersect(ui.clip_rect()));
+            let p = p.with_clip_rect(z.rack.intersect(p.clip_rect()));
+            rack::show(self, ui, &p, &m, z.rack, &inputs, &mut out);
+        });
         // A module removed mid-drag never sees its drag stop.
         if !ui.input(|i| i.pointer.any_down()) {
             self.device_drag = None;

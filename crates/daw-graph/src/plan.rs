@@ -2,8 +2,9 @@ use std::any::Any;
 use std::fmt;
 use std::mem;
 
-use daw_core::{MidiEvent, NodeId, ProcessContext};
+use daw_core::{MidiEvent, NodeId, ProcessContext, SeqEvent};
 
+use crate::sequence::NoteState;
 use crate::AudioNode;
 
 /// Most input or output channels one node can have. The executor builds its
@@ -68,6 +69,9 @@ struct Step {
     outputs: Vec<Box<[f32]>>,
     /// Receives the live MIDI input (an instrument); other steps get none.
     takes_midi: bool,
+    /// Notes the node plays with the transport, sorted by `at` (see `sequence`).
+    sequence: Box<[SeqEvent]>,
+    notes: NoteState,
     /// Set by `set_latency`; otherwise read from this plan's inserted node, else 0.
     latency: Option<u32>,
     /// Compensation delays on this step's sources, in (input, source) order.
@@ -113,6 +117,8 @@ pub struct ExecutionPlan {
     steps: Vec<Step>,
     max_block: usize,
     midi_out: Vec<MidiEvent>,
+    /// A sequenced step's MIDI for the block: its notes merged with live input.
+    midi_in: Vec<MidiEvent>,
     inserts: Vec<(NodeId, Option<Box<dyn AudioNode>>)>,
     removals: Vec<NodeId>,
     /// Receives removed nodes on the audio thread; capacity reserved in `remove`.
@@ -132,6 +138,7 @@ impl ExecutionPlan {
             steps: Vec::new(),
             max_block,
             midi_out: Vec::with_capacity(MIDI_CAPACITY),
+            midi_in: Vec::with_capacity(MIDI_CAPACITY),
             inserts: Vec::new(),
             removals: Vec::new(),
             retired: Vec::new(),
@@ -191,6 +198,8 @@ impl ExecutionPlan {
             outputs: (0..num_outputs).map(|_| buffer()).collect(),
             sources: inputs,
             takes_midi: false,
+            sequence: Box::default(),
+            notes: NoteState::default(),
             latency: None,
             delays: Vec::new(),
         });
@@ -204,6 +213,37 @@ impl ExecutionPlan {
             .get_mut(step.0)
             .map(|s| s.takes_midi = true)
             .is_some()
+    }
+
+    /// Gives `step` notes to play with the transport: `events` at timeline sample
+    /// positions, merged with any live MIDI. Sorted here (stable, so the order of
+    /// events at the same sample is kept: put note-offs first). When the playhead
+    /// stops or jumps (a seek or loop wrap), the step's held notes are released.
+    /// Returns false if there is no such step.
+    pub fn sequence(&mut self, step: StepId, mut events: Vec<SeqEvent>) -> bool {
+        let Some(s) = self.steps.get_mut(step.0) else {
+            return false;
+        };
+        events.sort_by_key(|e| e.at);
+        s.sequence = events.into_boxed_slice();
+        true
+    }
+
+    /// Hands each step the held-note state of the step running the same node in
+    /// `old`, so notes playing across a plan swap end cleanly: they play on if the
+    /// step's sequence is unchanged, else they are released. Allocation-free; call
+    /// it on the audio thread when this plan replaces `old`.
+    pub fn adopt_notes(&mut self, old: &ExecutionPlan) {
+        for step in &mut self.steps {
+            let prev = old
+                .steps
+                .iter()
+                .find(|o| o.node == step.node && !(o.sequence.is_empty() && o.notes.is_idle()));
+            if let Some(prev) = prev {
+                step.notes
+                    .adopt(&prev.notes, prev.sequence == step.sequence);
+            }
+        }
     }
 
     /// Whether `step` takes the live MIDI input (see `route_midi`).
@@ -329,6 +369,8 @@ impl ExecutionPlan {
                 outputs,
                 takes_midi,
                 delays,
+                sequence,
+                notes,
                 ..
             } = &mut rest[0];
 
@@ -368,10 +410,17 @@ impl ExecutionPlan {
                 continue;
             };
             self.midi_out.clear();
+            let live = if *takes_midi { midi } else { &[] };
+            let midi_in = if sequence.is_empty() && notes.is_idle() {
+                live
+            } else {
+                notes.render(sequence, context, live, &mut self.midi_in);
+                &self.midi_in
+            };
             node.process(
                 &ins[..num_inputs],
                 &mut outs[..num_outputs],
-                if *takes_midi { midi } else { &[] },
+                midi_in,
                 &mut self.midi_out,
                 context,
             );

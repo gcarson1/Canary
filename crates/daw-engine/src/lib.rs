@@ -171,6 +171,7 @@ impl AudioEngine {
             if let Some(old) = self.plan.as_deref_mut() {
                 plan.hand_retired_to(old);
                 plan.adopt_delays(old);
+                plan.adopt_notes(old);
             }
             if let Some(old) = self.plan.replace(plan) {
                 let _ = self.garbage.push(old); // cannot fail: checked not full
@@ -187,11 +188,18 @@ impl AudioEngine {
                 self.transport.advance((output.len() / channels) as u64);
             }
             Some(plan) => {
-                // The device may hand us more frames than the plan's buffers hold.
-                for (i, chunk) in output.chunks_mut(plan.max_block() * channels).enumerate() {
-                    let frames = chunk.len() / channels;
+                // The device may hand us more frames than the plan's buffers hold,
+                // and a loop wrap must fall between chunks.
+                let total = output.len() / channels;
+                let mut done = 0;
+                while done < total {
+                    let mut frames = (total - done).min(plan.max_block());
+                    if let Some(wrap) = self.transport.frames_until_wrap() {
+                        frames = frames.min(wrap as usize);
+                    }
+                    let chunk = &mut output[done * channels..(done + frames) * channels];
                     // Events are in offset order: take this chunk's, made chunk-relative.
-                    let first = (i * plan.max_block()) as u32;
+                    let first = done as u32;
                     let end = first + frames as u32;
                     let count = midi.iter().take_while(|e| e.sample_offset < end).count();
                     let (now, later) = mem::take(&mut midi).split_at_mut(count);
@@ -216,6 +224,7 @@ impl AudioEngine {
                         }
                     }
                     self.transport.advance(frames as u64);
+                    done += frames;
                 }
             }
         }
@@ -839,6 +848,80 @@ mod tests {
         handle.send_plan(midi_probe_plan(&seen)).unwrap();
         audio.process(&mut block, 1);
         assert!(seen.list().is_empty());
+    }
+
+    /// Writes +key at each note-on's offset and -key at each note-off's.
+    struct NoteProbe;
+
+    impl AudioNode for NoteProbe {
+        fn process(
+            &mut self,
+            _inputs: &[&[f32]],
+            outputs: &mut [&mut [f32]],
+            midi_in: &[daw_core::MidiEvent],
+            _midi_out: &mut Vec<daw_core::MidiEvent>,
+            _context: &ProcessContext,
+        ) {
+            outputs[0].fill(0.0);
+            for e in midi_in {
+                let sign = if e.data[0] & 0xf0 == 0x90 { 1.0 } else { -1.0 };
+                outputs[0][e.sample_offset as usize] += sign * f32::from(e.data[1]);
+            }
+        }
+
+        fn reset(&mut self) {}
+    }
+
+    #[test]
+    fn sequenced_notes_loop_sample_exactly_without_allocating() {
+        use daw_core::SeqEvent;
+        let (mut handle, mut audio) = engine(16, 48_000.0);
+        let mut plan = ExecutionPlan::new(64);
+        plan.insert(NodeId(1), Box::new(NoteProbe));
+        let step = plan.add(NodeId(1), vec![], 1).unwrap();
+        let ev = |at, status, key| SeqEvent {
+            at,
+            data: [status, key, 100],
+        };
+        // A 100-sample loop with a note from 10 to 90 and one held over the end.
+        plan.sequence(
+            step,
+            vec![ev(10, 0x90, 60), ev(90, 0x80, 60), ev(95, 0x90, 62)],
+        );
+        handle.send_plan(Box::new(plan)).unwrap();
+        handle
+            .commands
+            .push(Command::SetLoop(Some((0, 100))))
+            .unwrap();
+        handle.commands.push(Command::Play).unwrap();
+        let mut block = vec![0.0; 250];
+        assert_no_alloc(|| audio.process(&mut block, 1));
+        let hits: Vec<(usize, f32)> = block
+            .iter()
+            .enumerate()
+            .filter(|(_, &v)| v != 0.0)
+            .map(|(i, &v)| (i, v))
+            .collect();
+        // Each wrap releases the held 62 at the loop start, then the loop replays.
+        assert_eq!(
+            hits,
+            [
+                (10, 60.0),
+                (90, -60.0),
+                (95, 62.0),
+                (100, -62.0),
+                (110, 60.0),
+                (190, -60.0),
+                (195, 62.0),
+                (200, -62.0),
+                (210, 60.0)
+            ]
+        );
+        assert_eq!(audio.transport().playhead(), 50);
+        // Stopping releases the note still held.
+        handle.commands.push(Command::Stop).unwrap();
+        audio.process(&mut block[..10], 1);
+        assert_eq!(block[0], -60.0);
     }
 
     #[test]

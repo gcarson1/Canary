@@ -16,6 +16,15 @@ pub struct MidiEvent {
     pub data: [u8; 3],
 }
 
+/// A MIDI message at an absolute timeline position, for sequenced notes. A plan
+/// step's sequence is sorted by `at`, note-offs before note-ons at the same sample.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SeqEvent {
+    /// Timeline position in samples.
+    pub at: u64,
+    pub data: [u8; 3],
+}
+
 /// Per-block information passed to every `AudioNode::process` call.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ProcessContext {
@@ -52,6 +61,10 @@ pub enum Command {
     Seek(u64),
     SetTempo(f64),
     SetTimeSignature(TimeSignature),
+    /// Play `start..end` (samples) over and over, or `None` to stop looping. A loop
+    /// with `end <= start` is ignored. The playhead wraps when it reaches `end`;
+    /// starting play past `end` plays on without wrapping.
+    SetLoop(Option<(u64, u64)>),
 }
 
 /// Audio thread → main thread. Each variant is sent once per block; dropped if the

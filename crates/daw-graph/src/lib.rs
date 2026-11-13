@@ -5,6 +5,7 @@ mod effect;
 mod monitor;
 mod plan;
 mod sampler;
+mod sequence;
 mod synth;
 mod track;
 

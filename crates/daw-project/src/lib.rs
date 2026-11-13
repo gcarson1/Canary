@@ -9,6 +9,9 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+mod notes;
+pub use notes::{sorted, Note, Pattern, PatternClip, PatternNotes, Playback, PPQ, STEP};
+
 /// Bumped when the file format changes incompatibly.
 const FORMAT_VERSION: u32 = 1;
 
@@ -25,6 +28,9 @@ pub struct Project {
     /// with the project. Not undoable: the plug-in keeps its own undo.
     #[serde(default)]
     pub ara: Vec<AraArchive>,
+    /// FL-style patterns; each track keeps its own notes for each.
+    #[serde(default)]
+    pub patterns: Vec<Pattern>,
 }
 
 /// An ARA plug-in's document state as it wrote it.
@@ -46,6 +52,7 @@ impl Default for Project {
             tracks: Vec::new(),
             reference: None,
             ara: Vec::new(),
+            patterns: Vec::new(),
         }
     }
 }
@@ -62,6 +69,12 @@ pub struct Track {
     /// audio input) plays before the clips are mixed in; effects follow.
     #[serde(default)]
     pub devices: Vec<Device>,
+    /// This track's notes, per pattern; no entry means no notes.
+    #[serde(default)]
+    pub notes: Vec<PatternNotes>,
+    /// Patterns placed on this playlist row. Each plays on every track.
+    #[serde(default)]
+    pub pattern_clips: Vec<PatternClip>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -149,7 +162,17 @@ impl Track {
             solo: false,
             clips: Vec::new(),
             devices: Vec::new(),
+            notes: Vec::new(),
+            pattern_clips: Vec::new(),
         }
+    }
+
+    /// This track's notes in `pattern`.
+    pub fn notes_in(&self, pattern: u64) -> &[Note] {
+        self.notes
+            .iter()
+            .find(|n| n.pattern == pattern)
+            .map_or(&[], |n| &n.notes)
     }
 }
 
@@ -214,6 +237,39 @@ pub enum Action {
         from: usize,
         to: usize,
     },
+    InsertPattern {
+        index: usize,
+        pattern: Pattern,
+    },
+    /// Removes the pattern only; see `Project::remove_pattern` for the edit that
+    /// also removes its notes and clips.
+    RemovePattern {
+        index: usize,
+    },
+    SetPattern {
+        index: usize,
+        pattern: Pattern,
+    },
+    /// Replaces `track`'s notes in `pattern` (stored sorted).
+    SetNotes {
+        track: usize,
+        pattern: u64,
+        notes: Vec<Note>,
+    },
+    InsertPatternClip {
+        track: usize,
+        index: usize,
+        clip: PatternClip,
+    },
+    RemovePatternClip {
+        track: usize,
+        index: usize,
+    },
+    SetPatternClip {
+        track: usize,
+        index: usize,
+        clip: PatternClip,
+    },
     /// Several edits that undo as one step (a split, say). All or nothing.
     Batch(Vec<Action>),
 }
@@ -245,8 +301,11 @@ pub enum ActionError {
     OutOfRange,
     /// A tempo that is not finite and positive.
     BadTempo,
-    /// A gain or pan that is not finite, which a project file cannot store.
+    /// A gain or pan that is not finite, which a project file cannot store, or a
+    /// note, pattern or clip with no length or an out-of-range key or velocity.
     BadValue,
+    /// A pattern id already in the project.
+    DuplicateId,
 }
 
 impl fmt::Display for ActionError {
@@ -254,12 +313,47 @@ impl fmt::Display for ActionError {
         match self {
             Self::OutOfRange => write!(f, "no such track or clip"),
             Self::BadTempo => write!(f, "tempo must be a positive number"),
-            Self::BadValue => write!(f, "gain and pan must be finite numbers"),
+            Self::BadValue => write!(f, "value out of range"),
+            Self::DuplicateId => write!(f, "pattern id already in use"),
         }
     }
 }
 
 impl std::error::Error for ActionError {}
+
+impl Project {
+    /// The edit that removes pattern `index` with every track's notes in it and
+    /// every clip of it, as one undo step. `None` if there is no such pattern.
+    pub fn remove_pattern(&self, index: usize) -> Option<Action> {
+        let id = self.patterns.get(index)?.id;
+        let mut batch = Vec::new();
+        for (ti, t) in self.tracks.iter().enumerate() {
+            if !t.notes_in(id).is_empty() {
+                batch.push(Action::SetNotes {
+                    track: ti,
+                    pattern: id,
+                    notes: Vec::new(),
+                });
+            }
+            // Back to front, so earlier indices stay put.
+            for (ci, _) in t.pattern_clips.iter().enumerate().rev() {
+                if t.pattern_clips[ci].pattern == id {
+                    batch.push(Action::RemovePatternClip {
+                        track: ti,
+                        index: ci,
+                    });
+                }
+            }
+        }
+        batch.push(Action::RemovePattern { index });
+        Some(Action::Batch(batch))
+    }
+
+    /// A pattern id not used in the project.
+    pub fn new_pattern_id(&self) -> u64 {
+        self.patterns.iter().map(|p| p.id + 1).max().unwrap_or(1)
+    }
+}
 
 fn track(p: &mut Project, i: usize) -> Result<&mut Track, ActionError> {
     p.tracks.get_mut(i).ok_or(ActionError::OutOfRange)
@@ -379,6 +473,118 @@ impl Action {
                     track: ti,
                     from: to,
                     to: from,
+                }
+            }
+            InsertPattern { index, pattern } => {
+                if pattern.length == 0 {
+                    return Err(ActionError::BadValue);
+                }
+                if index > p.patterns.len() {
+                    return Err(ActionError::OutOfRange);
+                }
+                if p.pattern(pattern.id).is_some() {
+                    return Err(ActionError::DuplicateId);
+                }
+                p.patterns.insert(index, pattern);
+                RemovePattern { index }
+            }
+            RemovePattern { index } => {
+                if index >= p.patterns.len() {
+                    return Err(ActionError::OutOfRange);
+                }
+                InsertPattern {
+                    index,
+                    pattern: p.patterns.remove(index),
+                }
+            }
+            SetPattern { index, pattern } => {
+                if pattern.length == 0 {
+                    return Err(ActionError::BadValue);
+                }
+                let clash = p
+                    .patterns
+                    .iter()
+                    .enumerate()
+                    .any(|(i, q)| i != index && q.id == pattern.id);
+                if clash {
+                    return Err(ActionError::DuplicateId);
+                }
+                let slot = p.patterns.get_mut(index).ok_or(ActionError::OutOfRange)?;
+                SetPattern {
+                    index,
+                    pattern: std::mem::replace(slot, pattern),
+                }
+            }
+            SetNotes {
+                track: ti,
+                pattern,
+                notes,
+            } => {
+                if !notes.iter().all(Note::is_valid) {
+                    return Err(ActionError::BadValue);
+                }
+                let t = track(p, ti)?;
+                let at = t.notes.iter().position(|n| n.pattern == pattern);
+                let old = match at {
+                    Some(i) if notes.is_empty() => t.notes.remove(i).notes,
+                    Some(i) => std::mem::replace(&mut t.notes[i].notes, sorted(notes)),
+                    None if notes.is_empty() => Vec::new(),
+                    None => {
+                        t.notes.push(PatternNotes {
+                            pattern,
+                            notes: sorted(notes),
+                        });
+                        Vec::new()
+                    }
+                };
+                SetNotes {
+                    track: ti,
+                    pattern,
+                    notes: old,
+                }
+            }
+            InsertPatternClip {
+                track: ti,
+                index,
+                clip,
+            } => {
+                if clip.length == 0 {
+                    return Err(ActionError::BadValue);
+                }
+                let t = track(p, ti)?;
+                if index > t.pattern_clips.len() {
+                    return Err(ActionError::OutOfRange);
+                }
+                t.pattern_clips.insert(index, clip);
+                RemovePatternClip { track: ti, index }
+            }
+            RemovePatternClip { track: ti, index } => {
+                let t = track(p, ti)?;
+                if index >= t.pattern_clips.len() {
+                    return Err(ActionError::OutOfRange);
+                }
+                InsertPatternClip {
+                    track: ti,
+                    index,
+                    clip: t.pattern_clips.remove(index),
+                }
+            }
+            SetPatternClip {
+                track: ti,
+                index,
+                clip,
+            } => {
+                if clip.length == 0 {
+                    return Err(ActionError::BadValue);
+                }
+                let slot = track(p, ti)?
+                    .pattern_clips
+                    .get_mut(index)
+                    .ok_or(ActionError::OutOfRange)?;
+                SetPatternClip {
+                    track: ti,
+                    index,
+                    clip: std::mem::replace(slot, clip),
                 }
             }
             Batch(actions) => {
@@ -550,8 +756,21 @@ impl History {
             .map(|d| d.uid)
             .collect();
         uids.sort_unstable();
-        let unique = uids.windows(2).all(|w| w[0] != w[1]);
-        if !(p.bpm.is_finite() && p.bpm > 0.0) || p.sample_rate == 0 || !finite || !unique {
+        let mut unique = uids.windows(2).all(|w| w[0] != w[1]);
+        let mut ids: Vec<u64> = p.patterns.iter().map(|q| q.id).collect();
+        ids.sort_unstable();
+        unique &= ids.windows(2).all(|w| w[0] != w[1]);
+        let musical = p.patterns.iter().all(|q| q.length > 0)
+            && p.tracks.iter().all(|t| {
+                t.notes.iter().flat_map(|n| &n.notes).all(Note::is_valid)
+                    && t.pattern_clips.iter().all(|c| c.length > 0)
+            });
+        if !(p.bpm.is_finite() && p.bpm > 0.0)
+            || p.sample_rate == 0
+            || !finite
+            || !unique
+            || !musical
+        {
             return Err(ProjectError::Invalid);
         }
         Ok(Self::new(file.project))
@@ -876,6 +1095,132 @@ mod tests {
         };
         assert_eq!(h.apply(bad), Err(ActionError::OutOfRange));
         assert_eq!(order(&h), before);
+    }
+
+    #[test]
+    fn pattern_edits_undo_validate_and_remove_cleanly() {
+        let mut h = History::default();
+        let mut snapshots = vec![h.project().clone()];
+        let pattern = |id, length| Pattern {
+            id,
+            name: format!("P{id}"),
+            length,
+        };
+        let note = |start, key| Note {
+            start,
+            length: STEP,
+            key,
+            velocity: 100,
+        };
+        let clip = |start| PatternClip {
+            pattern: 1,
+            start,
+            length: 4 * PPQ,
+            offset: 0,
+        };
+        for action in [
+            Action::InsertTrack {
+                index: 0,
+                track: Track::new("Kick"),
+            },
+            Action::InsertPattern {
+                index: 0,
+                pattern: pattern(1, 4 * PPQ),
+            },
+            Action::InsertPattern {
+                index: 1,
+                pattern: pattern(2, 8 * PPQ),
+            },
+            Action::SetPattern {
+                index: 0,
+                pattern: pattern(1, 2 * PPQ),
+            },
+            Action::SetNotes {
+                track: 0,
+                pattern: 1,
+                notes: vec![note(STEP * 4, 36), note(0, 36)],
+            },
+            Action::InsertPatternClip {
+                track: 0,
+                index: 0,
+                clip: clip(0),
+            },
+            Action::SetPatternClip {
+                track: 0,
+                index: 0,
+                clip: clip(PPQ),
+            },
+            Action::InsertPatternClip {
+                track: 0,
+                index: 1,
+                clip: clip(8 * PPQ),
+            },
+            Action::RemovePatternClip { track: 0, index: 1 },
+        ] {
+            h.apply(action).unwrap();
+            snapshots.push(h.project().clone());
+        }
+        let t = &h.project().tracks[0];
+        assert_eq!(t.notes_in(1), [note(0, 36), note(STEP * 4, 36)], "sorted");
+        assert!(t.notes_in(2).is_empty());
+
+        for bad in [
+            Action::InsertPattern {
+                index: 0,
+                pattern: pattern(2, PPQ),
+            },
+            Action::InsertPattern {
+                index: 0,
+                pattern: pattern(3, 0),
+            },
+            Action::SetPattern {
+                index: 1,
+                pattern: pattern(1, PPQ),
+            },
+            Action::SetNotes {
+                track: 0,
+                pattern: 1,
+                notes: vec![Note {
+                    velocity: 0,
+                    ..note(0, 1)
+                }],
+            },
+            Action::SetNotes {
+                track: 0,
+                pattern: 1,
+                notes: vec![note(0, 128)],
+            },
+            Action::InsertPatternClip {
+                track: 0,
+                index: 0,
+                clip: PatternClip {
+                    length: 0,
+                    ..clip(0)
+                },
+            },
+        ] {
+            assert!(h.apply(bad).is_err());
+        }
+        assert_eq!(h.project(), snapshots.last().unwrap());
+
+        // Removing a pattern takes its notes and clips with it, in one undo step.
+        let remove = h.project().remove_pattern(0).unwrap();
+        h.apply(remove).unwrap();
+        let p = h.project();
+        assert_eq!(p.patterns, [pattern(2, 8 * PPQ)]);
+        assert!(p.tracks[0].notes.is_empty() && p.tracks[0].pattern_clips.is_empty());
+        assert_eq!(p.new_pattern_id(), 3);
+        assert!(h.undo());
+        assert_eq!(h.project(), snapshots.last().unwrap());
+
+        for want in snapshots.iter().rev().skip(1) {
+            assert!(h.undo());
+            assert_eq!(h.project(), want);
+        }
+        for want in snapshots.iter().skip(1) {
+            assert!(h.redo());
+            assert_eq!(h.project(), want);
+        }
     }
 
     #[test]

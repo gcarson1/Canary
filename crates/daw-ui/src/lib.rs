@@ -222,6 +222,13 @@ pub enum Snap {
     Off,
 }
 
+/// A copied playlist clip.
+#[derive(Debug, Clone, PartialEq)]
+enum Clipboard {
+    Audio(daw_project::ClipRef),
+    Pattern(daw_project::PatternClip),
+}
+
 /// A project change made while drawing, applied once the frame is drawn.
 enum Edit {
     Apply(Action),
@@ -277,6 +284,8 @@ pub struct Workspace {
     picker: Option<f32>,
     /// Points the rack is scrolled to the left.
     rack_scroll: f32,
+    /// What Cmd+C or Cmd+X took, for Cmd+V.
+    clipboard: Option<Clipboard>,
     /// Points the mixer is scrolled to the left.
     mixer_scroll: f32,
     /// The rack device being dragged to a new slot.
@@ -315,6 +324,7 @@ impl Default for Workspace {
             picker: None,
             device_drag: None,
             rack_scroll: 0.0,
+            clipboard: None,
             mixer_scroll: 0.0,
             file_drag: None,
             held_note: None,
@@ -567,6 +577,7 @@ impl Workspace {
         // Space on a focused button presses that button; it must not also toggle
         // the transport.
         let button_focused = ui.ctx().memory(|mem| mem.focused().is_some());
+        self.shortcuts(ui, inputs);
         let (space, undo, redo, delete) = ui.input(|i| {
             let cmd = i.modifiers.command;
             // Space and Delete act once per press: a held key must not toggle the
@@ -699,6 +710,116 @@ impl Workspace {
                 self.edit(action);
             }
         }
+    }
+
+    /// FL-style view keys (F5 playlist, F6 step sequencer, F7 piano roll, F9
+    /// mixer), tools (P draw, C slice), Cmd+Shift+L for the daylight theme, and
+    /// Cmd+C / Cmd+X / Cmd+V for clips on the playlist.
+    fn shortcuts(&mut self, ui: &egui::Ui, inputs: &Inputs<'_>) {
+        let keys: Vec<(Key, egui::Modifiers)> = ui.input(|i| {
+            i.events
+                .iter()
+                .filter_map(|e| match e {
+                    egui::Event::Key {
+                        key,
+                        pressed: true,
+                        repeat: false,
+                        modifiers,
+                        ..
+                    } => Some((*key, *modifiers)),
+                    _ => None,
+                })
+                .collect()
+        });
+        for (key, mods) in keys {
+            let page = |p: Page| (p, p == Page::Playlist);
+            let goto = match key {
+                Key::F5 => Some(page(Page::Playlist)),
+                Key::F6 => Some(page(Page::Sequencer)),
+                Key::F7 => Some(page(Page::PianoRoll)),
+                Key::F9 => Some((Page::Mixer, self.song)),
+                _ => None,
+            };
+            if let Some((p, song)) = goto {
+                self.page = p;
+                self.song = song;
+                continue;
+            }
+            match (key, mods.command, mods.shift) {
+                (Key::P, false, _) => self.tool = Tool::Draw,
+                (Key::C, false, _) if self.page != Page::PianoRoll => self.tool = Tool::Slice,
+                (Key::L, true, true) => {
+                    self.theme = if self.theme == Theme::DARK {
+                        Theme::LIGHT
+                    } else {
+                        Theme::DARK
+                    };
+                }
+                (Key::C | Key::X, true, false) if self.page == Page::Playlist => {
+                    let project = inputs.history.project();
+                    let copied = match (self.selected_pattern_clip, self.selected_clip) {
+                        (Some((t, i)), _) => project
+                            .tracks
+                            .get(t)
+                            .and_then(|tr| tr.pattern_clips.get(i))
+                            .map(|c| {
+                                let remove = Action::RemovePatternClip { track: t, index: i };
+                                (Clipboard::Pattern(*c), remove)
+                            }),
+                        (None, Some((t, i))) => project
+                            .tracks
+                            .get(t)
+                            .and_then(|tr| tr.clips.get(i))
+                            .map(|c| {
+                                let remove = Action::RemoveClip { track: t, index: i };
+                                (Clipboard::Audio(c.clone()), remove)
+                            }),
+                        _ => None,
+                    };
+                    if let Some((clip, remove)) = copied {
+                        self.clipboard = Some(clip);
+                        if key == Key::X {
+                            self.selected_clip = None;
+                            self.selected_pattern_clip = None;
+                            self.edit(remove);
+                        }
+                    }
+                }
+                (Key::V, true, false) if self.page == Page::Playlist => {
+                    self.paste(inputs);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Pastes the copied clip on the selected track at the playhead (snapped).
+    fn paste(&mut self, inputs: &Inputs<'_>) {
+        let project = inputs.history.project();
+        let Some(track) = self.selected_track.filter(|&t| t < project.tracks.len()) else {
+            return;
+        };
+        let at = timeline::snap_f(inputs.engine.playhead as f64, self.snap, project);
+        let action = match self.clipboard.clone() {
+            Some(Clipboard::Audio(mut c)) => {
+                c.start = at as u64;
+                Action::InsertClip {
+                    track,
+                    index: project.tracks[track].clips.len(),
+                    clip: c,
+                }
+            }
+            Some(Clipboard::Pattern(mut c)) => {
+                c.start = project.ticks_at(at as u64);
+                Action::InsertPatternClip {
+                    track,
+                    index: project.tracks[track].pattern_clips.len(),
+                    clip: c,
+                }
+            }
+            None => return,
+        };
+        self.edit(action);
     }
 
     /// Drops selections that no longer point at anything.

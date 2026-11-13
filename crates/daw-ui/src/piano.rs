@@ -50,6 +50,8 @@ pub(crate) struct View {
     length: u64,
     /// Scrolled to the middle of the keyboard once.
     placed: bool,
+    /// Notes Cmd+C or Cmd+X took, for Cmd+V.
+    copied: Vec<Note>,
 }
 
 impl Default for View {
@@ -62,6 +64,7 @@ impl Default for View {
             gesture: None,
             length: STEP,
             placed: false,
+            copied: Vec::new(),
         }
     }
 }
@@ -562,10 +565,14 @@ pub(crate) fn show(
         }
     }
 
-    keys_pressed(ws, ui, project, ti, stored, grid_ticks, out);
+    let at = pattern.filter(|_| inputs.engine.playing).map_or(0, |p| {
+        project.ticks_at(inputs.engine.playhead) % p.length.max(1)
+    });
+    keys_pressed(ws, ui, project, ti, stored, grid_ticks, at, out);
 }
 
 /// Keyboard edits on the selection (or every note when nothing is selected).
+#[allow(clippy::too_many_arguments)]
 fn keys_pressed(
     ws: &mut Workspace,
     ui: &egui::Ui,
@@ -573,6 +580,8 @@ fn keys_pressed(
     ti: usize,
     stored: &[Note],
     grid: u64,
+    // Where pasted notes go: the playhead's tick in the pattern (0 when stopped).
+    paste_at: u64,
     out: &mut Vec<Request>,
 ) {
     if ui.ctx().text_edit_focused() || ws.roll.gesture.is_some() {
@@ -602,6 +611,34 @@ fn keys_pressed(
                     .collect(),
                 Vec::new(),
             )),
+            Key::C | Key::X if mods.command && !sel.is_empty() => {
+                ws.roll.copied = sel.clone();
+                (key == Key::X).then(|| {
+                    let rest = stored
+                        .iter()
+                        .filter(|n| !sel.contains(n))
+                        .copied()
+                        .collect();
+                    (rest, Vec::new())
+                })
+            }
+            Key::V if mods.command && !ws.roll.copied.is_empty() => {
+                // The copy's first note lands on the grid at the paste point.
+                let first = ws.roll.copied.iter().map(|n| n.start).min().unwrap_or(0);
+                let to = paste_at / grid.max(1) * grid.max(1);
+                let pasted: Vec<Note> = ws
+                    .roll
+                    .copied
+                    .iter()
+                    .map(|n| Note {
+                        start: n.start - first + to,
+                        ..*n
+                    })
+                    .collect();
+                let mut notes = stored.to_vec();
+                notes.extend(&pasted);
+                Some((notes, pasted))
+            }
             Key::E if mods.command => {
                 out.push(Request::ExportMidi { track: ti });
                 None

@@ -959,6 +959,14 @@ impl History {
 
     /// Writes the project as JSON and marks it clean.
     pub fn save(&mut self, path: &Path) -> Result<(), ProjectError> {
+        self.save_copy(path)?;
+        self.dirty = false;
+        Ok(())
+    }
+
+    /// Writes the project to `path` without marking it saved: an autosave or a
+    /// template.
+    pub fn save_copy(&self, path: &Path) -> Result<(), ProjectError> {
         let file = ProjectFile {
             version: FORMAT_VERSION,
             project: self.project.clone(),
@@ -969,7 +977,6 @@ impl History {
         fs::write(&tmp, json)
             .and_then(|()| fs::rename(&tmp, path))
             .map_err(ProjectError::Io)?;
-        self.dirty = false;
         Ok(())
     }
 

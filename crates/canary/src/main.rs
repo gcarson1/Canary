@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{env, fs, thread};
 
 use daw_core::{Clip, Command, NodeId, SampleData, SeqEvent, Telemetry, TrackParams};
@@ -39,6 +39,9 @@ const MAX_TRACKS: usize = 1023;
 const SEND_NODES: std::ops::Range<u32> = MAX_TRACKS as u32 + 1..REFERENCE_NODE.0;
 const AUDIO_EXTENSIONS: [&str; 7] = ["wav", "flac", "mp3", "m4a", "aac", "aif", "aiff"];
 const MIDI_EXTENSIONS: [&str; 2] = ["mid", "midi"];
+/// New projects start from this, under the samples folder.
+const TEMPLATE: &str = "Templates/Default.daw";
+const AUTOSAVE_EVERY: Duration = Duration::from_secs(60);
 
 fn has_extension(path: &Path, list: &[&str]) -> bool {
     path.extension()
@@ -120,6 +123,7 @@ struct App {
     midi_take: Option<take::MidiTake>,
     /// A mix export in progress.
     export: Option<export::Export>,
+    last_autosave: Instant,
     /// The monitor mode and A/B reference to put back after an export.
     export_restore: Option<(MonitorMode, bool)>,
     /// The last export's format conversion, still running.
@@ -177,8 +181,12 @@ impl App {
                 .inspect_err(|e| eprintln!("MIDI input: {e}"))
                 .ok()
         });
+        let template = samples_dir.join(TEMPLATE);
         let mut history = if project_path.exists() {
             History::load(&project_path).map_err(|e| format!("{}: {e}", project_path.display()))?
+        } else if template.exists() {
+            // A new project starts from the saved template (Cmd+Shift+T).
+            History::load(&template).unwrap_or_default()
         } else {
             History::default()
         };
@@ -242,6 +250,7 @@ impl App {
             recorder: None,
             midi_take: None,
             export: None,
+            last_autosave: Instant::now(),
             export_restore: None,
             converting: None,
             stretch_tx,
@@ -263,6 +272,16 @@ impl App {
             app.load(source, None);
         }
         app.devices.restore_ara(app.history.project().ara.clone());
+        // Work from a session that ended without saving.
+        let modified = |p: &Path| fs::metadata(p).and_then(|m| m.modified()).ok();
+        if let Some(auto) = modified(&app.autosave_path()) {
+            if modified(&app.project_path).is_none_or(|saved| auto > saved) {
+                app.ws.status = Some(Status {
+                    text: "AUTOSAVE FOUND · CMD+SHIFT+R RECOVERS IT".into(),
+                    error: false,
+                });
+            }
+        }
         Ok(app)
     }
 
@@ -1402,14 +1421,90 @@ impl App {
     }
 
     /// Saves the project; true on success.
-    fn save(&mut self) -> bool {
+    /// Records every plugin's and ARA document's state in the project; returns
+    /// the ARA errors to show.
+    fn gather_state(&mut self) -> Vec<String> {
         for (uid, state) in self.devices.states() {
             self.history.store_device_state(uid, state);
         }
         let (archives, errors) = self.devices.ara_archives(&self.history.project().ara);
         self.history.store_ara(archives);
+        errors
+    }
+
+    /// Where unsaved work is written every minute.
+    fn autosave_path(&self) -> PathBuf {
+        self.project_path.with_extension("autosave.daw")
+    }
+
+    /// Writes unsaved edits to the autosave file once a minute.
+    fn autosave(&mut self) {
+        if !self.history.is_dirty()
+            || self.export.is_some()
+            || self.last_autosave.elapsed() < AUTOSAVE_EVERY
+        {
+            return;
+        }
+        self.last_autosave = Instant::now();
+        let _ = self.gather_state();
+        if let Err(e) = self.history.save_copy(&self.autosave_path()) {
+            self.error(format!("autosave failed: {e}"));
+        }
+    }
+
+    /// Replaces the project with its autosave (Cmd+Shift+R), as an edit away from
+    /// the saved file.
+    fn recover(&mut self) {
+        let path = self.autosave_path();
+        match History::load(&path) {
+            Ok(h) if h.project().sample_rate == self.view.sample_rate => {
+                self.history = h;
+                self.history.mark_dirty();
+                let sources: Vec<PathBuf> = self
+                    .history
+                    .project()
+                    .tracks
+                    .iter()
+                    .flat_map(|t| t.clips.iter().map(|c| c.source.clone()))
+                    .collect();
+                for source in sources {
+                    self.load(source, None);
+                }
+                self.built = None;
+                self.ws.status = Some(Status {
+                    text: "RECOVERED FROM AUTOSAVE".into(),
+                    error: false,
+                });
+            }
+            Ok(_) => self.error("autosave is at another sample rate".into()),
+            Err(e) => self.error(format!("no autosave to recover: {e}")),
+        }
+    }
+
+    /// Saves the project as the template new projects start from (Cmd+Shift+T).
+    fn save_template(&mut self) {
+        let _ = self.gather_state();
+        let path = self.samples_dir.join(TEMPLATE);
+        let made = path.parent().map_or(Ok(()), fs::create_dir_all);
+        match made
+            .map_err(|e| e.to_string())
+            .and_then(|()| self.history.save_copy(&path).map_err(|e| e.to_string()))
+        {
+            Ok(()) => {
+                self.ws.status = Some(Status {
+                    text: "SAVED AS TEMPLATE".into(),
+                    error: false,
+                })
+            }
+            Err(e) => self.error(format!("template not saved: {e}")),
+        }
+    }
+
+    fn save(&mut self) -> bool {
+        let errors = self.gather_state();
         match self.history.save(&self.project_path) {
             Ok(()) => {
+                let _ = fs::remove_file(self.autosave_path());
                 self.ws.status = Some(Status {
                     text: "SAVED".into(),
                     error: false,
@@ -1439,6 +1534,20 @@ impl eframe::App for App {
         if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::S)) {
             self.save();
         }
+        let (recover, template) = ctx.input(|i| {
+            let cs = i.modifiers.command && i.modifiers.shift;
+            (
+                cs && i.key_pressed(egui::Key::R),
+                cs && i.key_pressed(egui::Key::T),
+            )
+        });
+        if recover {
+            self.recover();
+        }
+        if template {
+            self.save_template();
+        }
+        self.autosave();
         // Quitting saves edits; if that fails the window stays open with the error.
         if ctx.input(|i| i.viewport().close_requested()) && self.history.is_dirty() && !self.save()
         {

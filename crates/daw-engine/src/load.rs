@@ -167,7 +167,10 @@ pub fn write_wav(path: &Path, channels: &[Vec<f32>], sample_rate: u32) -> Result
         bits_per_sample: 32,
         sample_format: hound::SampleFormat::Float,
     };
-    let tmp = path.with_extension("wav.tmp");
+    // A name of its own per writer, so two renders never share a temp file.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("{}-{n}.wav.tmp", std::process::id()));
     let write = || -> Result<(), hound::Error> {
         let mut w = hound::WavWriter::create(&tmp, spec)?;
         let frames = channels.first().map_or(0, Vec::len);
@@ -178,8 +181,13 @@ pub fn write_wav(path: &Path, channels: &[Vec<f32>], sample_rate: u32) -> Result
         }
         w.finalize()
     };
-    write().map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, path).map_err(|e| e.to_string())
+    let done = write()
+        .map_err(|e| e.to_string())
+        .and_then(|()| std::fs::rename(&tmp, path).map_err(|e| e.to_string()));
+    if done.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    done
 }
 
 #[cfg(test)]

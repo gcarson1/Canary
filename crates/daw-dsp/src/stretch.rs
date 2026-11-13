@@ -15,7 +15,13 @@ const DECIMATE: usize = 4;
 /// pitch. All channels use the same frame placements, so the stereo image holds.
 /// `ratio` is clamped to 0.25..=4.
 pub fn time_stretch(channels: &[Vec<f32>], ratio: f64) -> Vec<Vec<f32>> {
-    let ratio = ratio.clamp(0.25, 4.0);
+    stretch_by(channels, ratio.clamp(0.25, 4.0))
+}
+
+/// `time_stretch` without the user-facing limits (pitch shifting stretches
+/// past them before resampling back).
+fn stretch_by(channels: &[Vec<f32>], ratio: f64) -> Vec<Vec<f32>> {
+    let ratio = ratio.clamp(0.1, 10.0);
     let len = channels.first().map_or(0, Vec::len);
     let out_len = (len as f64 * ratio).round() as usize;
     if len == 0 || (ratio - 1.0).abs() < 1e-9 {
@@ -115,7 +121,7 @@ pub fn stretch_and_pitch(channels: &[Vec<f32>], ratio: f64, semitones: f64) -> V
         return time_stretch(channels, ratio);
     }
     // Stretch further by the shift, then read it faster by the same factor.
-    let long = time_stretch(channels, (ratio * shift).clamp(0.25, 4.0));
+    let long = stretch_by(channels, ratio.clamp(0.25, 4.0) * shift);
     let step = long
         .first()
         .map_or(1.0, |l| l.len() as f64 / out_len.max(1) as f64);

@@ -116,11 +116,12 @@ impl Export {
         std::iter::once(&mut self.master).chain(self.stems.iter_mut().map(|s| &mut s.1))
     }
 
-    /// Stops every writer, trims each file's plugin delay, and starts converting
-    /// to the chosen format. Returns the master's final path and the conversion
-    /// job (which reports failures), or the first error.
-    pub fn finish(mut self) -> Result<(PathBuf, Option<Conversion>), String> {
-        let mut paths = Vec::new();
+    /// Stops every writer, then on a worker thread trims each file's plugin
+    /// delay and converts it to the chosen format. Returns the master's final
+    /// path and that job (which reports failures). If a writer failed, every
+    /// file is deleted and the error returned.
+    pub fn finish(mut self) -> Result<(PathBuf, Conversion), String> {
+        let mut files = Vec::new();
         let mut error = None;
         for out in self.outputs_mut() {
             match out.recorder.stop() {
@@ -136,23 +137,31 @@ impl Export {
                     error.get_or_insert(format!("{}: {e}", out.path.display()));
                 }
             }
-            if out.skip > 0 && error.is_none() {
-                if let Err(e) = trim_front(&out.path, out.skip) {
-                    error.get_or_insert(format!("{}: {e}", out.path.display()));
-                }
-            }
-            paths.push(out.path.clone());
+            files.push((out.path.clone(), out.skip));
         }
         if let Some(e) = error {
+            for (path, _) in &files {
+                let _ = std::fs::remove_file(path);
+            }
             return Err(e);
         }
-        let master = self.master.path.clone();
-        let Some((args, ext)) = afconvert_args(self.format) else {
-            return Ok((master, None));
+        let convert = afconvert_args(self.format);
+        let master = match convert {
+            Some((_, ext)) => self.master.path.with_extension(ext),
+            None => self.master.path.clone(),
         };
         let job = thread::spawn(move || {
             let mut failures = Vec::new();
-            for wav in paths {
+            for (wav, skip) in files {
+                if skip > 0 {
+                    if let Err(e) = trim_front(&wav, skip) {
+                        failures.push(format!("could not trim {}: {e}", wav.display()));
+                        continue;
+                    }
+                }
+                let Some((args, ext)) = convert else {
+                    continue;
+                };
                 let out = wav.with_extension(ext);
                 let status = Process::new("/usr/bin/afconvert")
                     .args(args)
@@ -168,7 +177,7 @@ impl Export {
             }
             failures
         });
-        Ok((master.with_extension(ext), Some(job)))
+        Ok((master, job))
     }
 
     /// Stops the writers and deletes the partial files.

@@ -128,6 +128,8 @@ struct App {
     export_restore: Option<(MonitorMode, bool)>,
     /// The last export's format conversion, still running.
     converting: Option<thread::JoinHandle<Vec<String>>>,
+    /// Clips (track, index) with a stretch render running.
+    stretching: HashSet<(usize, usize)>,
     /// Stretched or pitched clip renders coming back from worker threads.
     stretch_tx: mpsc::Sender<Stretched>,
     stretch_rx: mpsc::Receiver<Stretched>,
@@ -253,6 +255,7 @@ impl App {
             last_autosave: Instant::now(),
             export_restore: None,
             converting: None,
+            stretching: HashSet::new(),
             stretch_tx,
             stretch_rx,
             title: String::new(),
@@ -837,7 +840,9 @@ impl App {
             Request::Stop if self.export.is_some() => {
                 self.abort_export("EXPORT ABORTED".into(), false)
             }
-            Request::Play | Request::Seek(_) if self.export.is_some() => {}
+            // So is the monitor section the master is recorded after.
+            Request::Play | Request::Seek(_) | Request::Listen(_) | Request::ToggleReference
+                if self.export.is_some() => {}
             Request::Play => command(self, Command::Play),
             Request::Stop => command(self, Command::Stop),
             Request::Seek(at) => {
@@ -980,8 +985,18 @@ impl App {
         let stem = original
             .file_stem()
             .map_or_else(|| "clip".into(), |s| s.to_string_lossy().into_owned());
+        if !self.stretching.insert((track, index)) {
+            return; // one render per clip at a time
+        }
         let dir = self.samples_dir.join("Stretched");
-        let path = dir.join(format!("{stem} x{ratio:.3} {semitones:+.0}st.wav"));
+        // The full original path and the rate in the name, so two files called
+        // Kick.wav never share a render.
+        let mut hash = std::hash::DefaultHasher::new();
+        std::hash::Hash::hash(&(&original, self.view.sample_rate), &mut hash);
+        let tag = std::hash::Hasher::finish(&hash) & 0xff_ffff;
+        let path = dir.join(format!(
+            "{stem} {tag:06x} x{ratio:.3} {semitones:+.0}st.wav"
+        ));
         let (tx, rate) = (self.stretch_tx.clone(), self.view.sample_rate);
         self.ws.status = Some(Status {
             text: "RENDERING STRETCH".into(),
@@ -1021,9 +1036,13 @@ impl App {
             return;
         }
         while let Ok(done) = self.stretch_rx.try_recv() {
+            self.stretching.remove(&(done.track, done.index));
             let frames = match done.result {
                 Ok(frames) if frames > 0 => frames,
-                Ok(_) => continue,
+                Ok(_) => {
+                    self.error("stretch made no audio; the clip is too short".into());
+                    continue;
+                }
                 Err(e) => {
                     self.error(format!("stretch failed: {e}"));
                     continue;
@@ -1171,7 +1190,8 @@ impl App {
             }
             return;
         }
-        if self.view.playing {
+        // A playhead from before the seek to 0 does not count as rolling.
+        if self.view.playing && self.view.playhead < e.end {
             e.started = true;
         }
         if !e.started {
@@ -1195,7 +1215,7 @@ impl App {
         self.restore_monitor();
         match e.finish() {
             Ok((path, job)) => {
-                self.converting = job;
+                self.converting = Some(job);
                 self.ws.status = Some(Status {
                     text: format!(
                         "EXPORTED {}",
@@ -1548,6 +1568,10 @@ impl eframe::App for App {
             self.save_template();
         }
         self.autosave();
+        // Quitting mid-export leaves no half-written files.
+        if ctx.input(|i| i.viewport().close_requested()) && self.export.is_some() {
+            self.abort_export("EXPORT ABORTED".into(), false);
+        }
         // Quitting saves edits; if that fails the window stays open with the error.
         if ctx.input(|i| i.viewport().close_requested()) && self.history.is_dirty() && !self.save()
         {

@@ -613,6 +613,7 @@ impl Workspace {
                 if let egui::Event::Key {
                     key,
                     pressed: true,
+                    repeat,
                     modifiers,
                     ..
                 } = e
@@ -623,9 +624,10 @@ impl Workspace {
                     match key {
                         Key::ArrowUp => db += step,
                         Key::ArrowDown => db -= step,
-                        Key::R => flip ^= true,
-                        Key::OpenBracket => semis -= 1.0,
-                        Key::CloseBracket => semis += 1.0,
+                        Key::R if !repeat => flip ^= true,
+                        // A render per press; a held key must not start dozens.
+                        Key::OpenBracket if !repeat => semis -= 1.0,
+                        Key::CloseBracket if !repeat => semis += 1.0,
                         _ => {}
                     }
                 }

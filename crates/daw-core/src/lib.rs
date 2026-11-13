@@ -260,15 +260,26 @@ impl Clip {
     /// on the timeline. Clamped to the start of the audio and to one frame before the
     /// right edge.
     pub fn trim_start(&mut self, at: u64) {
-        let earliest = self.start_sample - self.offset.min(self.start_sample);
+        // Reversed, the left edge plays the end of the window: trimming it keeps
+        // `offset` and widens or narrows into the audio after the window.
+        let room = if self.reversed {
+            self.audio.frames() as u64 - (self.offset + self.length)
+        } else {
+            self.offset
+        };
+        let earliest = self.start_sample - room.min(self.start_sample);
         let at = at.clamp(earliest, self.end_sample() - 1);
         if at >= self.start_sample {
             let d = at - self.start_sample;
-            self.offset += d;
+            if !self.reversed {
+                self.offset += d;
+            }
             self.length -= d;
         } else {
             let d = self.start_sample - at;
-            self.offset -= d;
+            if !self.reversed {
+                self.offset -= d;
+            }
             self.length += d;
         }
         self.start_sample = at;
@@ -278,8 +289,16 @@ impl Clip {
     /// Moves the right edge to timeline position `at`. Clamped to one frame after the
     /// left edge and to the end of the audio.
     pub fn trim_end(&mut self, at: u64) {
-        let latest = self.start_sample + (self.audio.frames() as u64 - self.offset);
-        self.length = at.clamp(self.start_sample + 1, latest) - self.start_sample;
+        if self.reversed {
+            // Reversed, the right edge plays the start of the window.
+            let latest = self.end_sample() + self.offset;
+            let length = at.clamp(self.start_sample + 1, latest) - self.start_sample;
+            self.offset = self.offset + self.length - length;
+            self.length = length;
+        } else {
+            let latest = self.start_sample + (self.audio.frames() as u64 - self.offset);
+            self.length = at.clamp(self.start_sample + 1, latest) - self.start_sample;
+        }
         self.set_fades(self.fade_in, self.fade_out);
     }
 
@@ -454,6 +473,34 @@ impl Drop for TrackParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trimming_and_splitting_a_reversed_clip_keeps_what_it_plays() {
+        let ramp: Vec<f32> = (0..10).map(|i| i as f32).collect();
+        let audio = Arc::new(SampleData::new(48_000, vec![ramp]).unwrap());
+        // Frames 2..8 reversed at timeline 100: plays 7, 6, 5, 4, 3, 2.
+        let mut c = Clip::with_window(100, audio, 2, 6, 0, 0).unwrap();
+        c.reversed = true;
+        let heard =
+            |c: &Clip| -> Vec<u64> { (0..c.length_samples()).map(|f| c.source_frame(f)).collect() };
+        assert_eq!(heard(&c), [7, 6, 5, 4, 3, 2]);
+        let (l, r) = c.split(103).unwrap();
+        assert_eq!((heard(&l), heard(&r)), (vec![7, 6, 5], vec![4, 3, 2]));
+        let mut t = c.clone();
+        t.trim_start(101);
+        assert_eq!(
+            heard(&t),
+            [6, 5, 4, 3, 2],
+            "the left edge cut the first heard"
+        );
+        t.trim_start(0); // widens back over frames 8 and 9 only
+        assert_eq!((t.start_sample, heard(&t)[0]), (98, 9));
+        let mut e = c.clone();
+        e.trim_end(104);
+        assert_eq!(heard(&e), [7, 6, 5, 4]);
+        e.trim_end(1_000); // out to frame 0
+        assert_eq!(heard(&e).last(), Some(&0));
+    }
 
     #[test]
     fn envelopes_hold_at_the_ends_and_bend_between_points() {

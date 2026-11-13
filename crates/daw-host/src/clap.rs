@@ -806,4 +806,39 @@ mod tests {
         drop(plugin);
         assert_eq!(test_plugin::LIVE.load(Ordering::SeqCst), before);
     }
+
+    #[test]
+    fn editor_lifecycle_follows_clap_order() {
+        let _serial = serial();
+        let entry = entry();
+        let (mut plugin, node) = ClapPlugin::new(&entry, test_plugin::ID, 48_000.0, 64).unwrap();
+        let take = || std::mem::take(&mut *test_plugin::GUI_LOG.lock().unwrap());
+        take();
+        // SAFETY: a null parent is refused before the plugin sees it.
+        assert!(matches!(
+            unsafe { plugin.open_editor(std::ptr::null_mut()) },
+            Err(HostError::NoEditor)
+        ));
+        assert!(take().is_empty());
+        // The test editor never touches its parent, so any non-null pointer will do.
+        let parent = std::ptr::NonNull::<c_void>::dangling().as_ptr();
+        let size = unsafe { plugin.open_editor(parent) }.unwrap();
+        assert_eq!(size, (320.0, 200.0));
+        assert_eq!(take(), ["create", "set_parent", "show", "get_size"]);
+        // Reopening destroys the old editor first.
+        unsafe { plugin.open_editor(parent) }.unwrap();
+        assert_eq!(
+            take(),
+            ["destroy", "create", "set_parent", "show", "get_size"]
+        );
+        plugin.close_editor();
+        plugin.close_editor();
+        assert_eq!(take(), ["destroy"]);
+        // Dropping an open editor's plugin destroys the editor first.
+        unsafe { plugin.open_editor(parent) }.unwrap();
+        take();
+        drop(node);
+        drop(plugin);
+        assert_eq!(take(), ["destroy"]);
+    }
 }

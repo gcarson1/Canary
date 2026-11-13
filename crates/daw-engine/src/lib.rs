@@ -8,7 +8,7 @@ mod record;
 mod transport;
 
 pub use load::{load_audio, resample, LoadError};
-pub use midi::{connect_midi, midi_input_ports, MidiError, MidiSender};
+pub use midi::{connect_midi, midi_input_ports, MidiConnection, MidiError, MidiSender};
 pub use output::{start_output, OutputError};
 pub use peaks::cached_waveform;
 pub use record::{recorder, start_input, InputError, RecordError, RecordInput, Recorder, Take};

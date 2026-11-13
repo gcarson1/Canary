@@ -108,6 +108,13 @@ pub enum Request {
     ToggleReference,
     /// Clear integrated loudness and the true-peak hold.
     ResetMeters,
+    /// A sampler pad pressed (`on`) or released: play or stop MIDI note `key` on
+    /// `track`'s instrument.
+    Note {
+        track: usize,
+        key: u8,
+        on: bool,
+    },
     /// Add a slice point at `at` (a fraction of the sample), or remove the nearest.
     SliceMarker {
         track: usize,
@@ -181,6 +188,8 @@ pub struct Workspace {
     device_drag: Option<usize>,
     /// An asset browser file being dragged (onto a sampler).
     file_drag: Option<PathBuf>,
+    /// The pad note sounding (track, key), released when the pointer is.
+    held_note: Option<(usize, u8)>,
 }
 
 impl Default for Workspace {
@@ -199,6 +208,7 @@ impl Default for Workspace {
             picker: None,
             device_drag: None,
             file_drag: None,
+            held_note: None,
         }
     }
 }
@@ -261,6 +271,15 @@ impl Workspace {
     /// app must do. Call [`theme::install_fonts`] once on the context first.
     pub fn show(&mut self, ui: &mut egui::Ui, inputs: Inputs<'_>) -> Vec<Request> {
         let mut out = Vec::new();
+        if !ui.input(|i| i.pointer.any_down()) {
+            if let Some((track, key)) = self.held_note.take() {
+                out.push(Request::Note {
+                    track,
+                    key,
+                    on: false,
+                });
+            }
+        }
         let full = ui.max_rect();
         let m = Metrics::new(full.width(), ui.ctx().pixels_per_point());
         let t = self.theme;
@@ -342,6 +361,17 @@ impl Workspace {
             }
         }
         self.clear_selection(inputs.history);
+        // A newly pressed pad's note sounds until the pointer comes up.
+        for r in &out {
+            if let Request::Note {
+                track,
+                key,
+                on: true,
+            } = *r
+            {
+                self.held_note = Some((track, key));
+            }
+        }
         out
     }
 

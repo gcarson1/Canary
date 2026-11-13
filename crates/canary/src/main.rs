@@ -11,14 +11,14 @@ mod editor;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{env, fs, thread};
 
 use daw_core::{Clip, Command, NodeId, SampleData, Telemetry, TrackParams};
 use daw_dsp::WaveformPyramid;
 use daw_dsp::{integrated_loudness, TruePeak};
-use daw_engine::{EngineHandle, Recorder};
+use daw_engine::{EngineHandle, MidiConnection, MidiSender, Recorder};
 use daw_graph::{ExecutionPlan, MasterNode, Monitor, MonitorMode, Source, TrackNode};
 use daw_host::LayerKind;
 use daw_project::{Action, ClipRef, History, Track};
@@ -64,6 +64,11 @@ struct App {
     /// Each track's clips and device uids as of the live plan.
     built_clips: Vec<Vec<ClipRef>>,
     built_devices: Vec<Vec<u64>>,
+    /// The track whose instrument took live MIDI in the last plan.
+    built_selected: Option<usize>,
+    /// Live MIDI to the selected track's instrument: pads and the keyboard.
+    midi: Option<Arc<Mutex<MidiSender>>>,
+    _midi_in: Option<MidiConnection>,
     /// A plan the engine's queue had no room for; sent before any new one.
     queued: Option<Box<ExecutionPlan>>,
     devices: Devices,
@@ -114,7 +119,15 @@ impl App {
         let ws = Workspace::default();
         theme::apply(&cc.egui_ctx, &ws.theme);
 
-        let (engine, output, config) = daw_engine::start_output(4096).map_err(|e| e.to_string())?;
+        let (mut engine, output, config) =
+            daw_engine::start_output(4096).map_err(|e| e.to_string())?;
+        let midi = engine.midi.take().map(|m| Arc::new(Mutex::new(m)));
+        // The first MIDI input, if any; a missing or busy port only loses the keyboard.
+        let midi_in = midi.clone().and_then(|m| {
+            daw_engine::connect_midi(m, 0)
+                .inspect_err(|e| eprintln!("MIDI input: {e}"))
+                .ok()
+        });
         let mut history = if project_path.exists() {
             History::load(&project_path).map_err(|e| format!("{}: {e}", project_path.display()))?
         } else {
@@ -162,6 +175,9 @@ impl App {
             solo: Arc::new(AtomicUsize::new(0)),
             built_clips: Vec::new(),
             built_devices: Vec::new(),
+            built_selected: None,
+            midi,
+            _midi_in: midi_in,
             queued: None,
             devices: Devices::scan(),
             recorder: None,
@@ -342,7 +358,10 @@ impl App {
             return;
         }
         let revision = self.history.revision();
-        if self.built == Some(revision) && !self.devices.changed() {
+        if self.built == Some(revision)
+            && !self.devices.changed()
+            && self.built_selected == self.ws.selected_track
+        {
             return;
         }
         let rate = self.view.sample_rate as f32;
@@ -354,6 +373,7 @@ impl App {
         let same_shape = self.built.is_some()
             && !self.devices.changed()
             && self.built_reference == self.history.project().reference
+            && self.built_selected == self.ws.selected_track
             && tracks.len() == self.built_clips.len()
             && tracks
                 .iter()
@@ -417,7 +437,10 @@ impl App {
                 .collect();
             let id = NodeId(i as u32 + 1);
             plan.insert(id, Box::new(TrackNode::new(clips, self.params[i].clone())));
-            let inputs = match self.devices.instrument_step(&mut plan, track) {
+            // shortcut: notes held while the selection moves keep sounding until
+            // played again; a real fix sends note-offs to the old instrument.
+            let selected = self.ws.selected_track == Some(i);
+            let inputs = match self.devices.instrument_step(&mut plan, track, selected) {
                 Some(step) => (0..2)
                     .map(|channel| vec![Source { step, channel }])
                     .collect(),
@@ -454,6 +477,7 @@ impl App {
             .map(|t| t.devices.iter().map(|d| d.uid).collect())
             .collect();
         self.built = Some(self.history.revision());
+        self.built_selected = self.ws.selected_track;
         self.devices.sync_ara(self.history.project(), &self.audio);
         self.send(Box::new(plan));
     }
@@ -597,6 +621,18 @@ impl App {
                     self.sample_requests.remove(&path);
                     s.add_layer(path, kind);
                     self.history.mark_dirty();
+                }
+            }
+            Request::Note { key, on, .. } => {
+                // The pad's track is the selected one, which takes live MIDI.
+                let message = if on { [0x90, key, 100] } else { [0x80, key, 0] };
+                let sent = self
+                    .midi
+                    .as_ref()
+                    .and_then(|m| m.lock().ok())
+                    .is_some_and(|mut m| m.send(&message));
+                if !sent {
+                    self.error("pad note dropped".into());
                 }
             }
             Request::SliceMarker {

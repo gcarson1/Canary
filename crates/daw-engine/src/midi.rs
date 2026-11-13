@@ -1,4 +1,5 @@
 use std::fmt;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use daw_core::MidiEvent;
@@ -136,12 +137,16 @@ pub fn midi_input_ports() -> Result<Vec<String>, MidiError> {
         .collect())
 }
 
+/// An open MIDI input; input stops when it is dropped.
+pub type MidiConnection = midir::MidiInputConnection<()>;
+
 /// Opens input port `index` and feeds its messages to the engine. Input stops when
-/// the returned connection is dropped.
+/// the returned connection is dropped. The sender is shared so other sources (UI
+/// pads) can play too; it is locked on MIDI and UI threads only, never on audio.
 pub fn connect_midi(
-    mut sender: MidiSender,
+    sender: Arc<Mutex<MidiSender>>,
     index: usize,
-) -> Result<midir::MidiInputConnection<()>, MidiError> {
+) -> Result<MidiConnection, MidiError> {
     let mut input = midir::MidiInput::new("Canary").map_err(MidiError::Init)?;
     input.ignore(midir::Ignore::All);
     let port = input
@@ -154,7 +159,9 @@ pub fn connect_midi(
             &port,
             "Canary input",
             move |_, bytes, _| {
-                sender.send(bytes);
+                if let Ok(mut sender) = sender.lock() {
+                    sender.send(bytes);
+                }
             },
             (),
         )

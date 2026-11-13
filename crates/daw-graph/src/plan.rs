@@ -206,6 +206,11 @@ impl ExecutionPlan {
             .is_some()
     }
 
+    /// Whether `step` takes the live MIDI input (see `route_midi`).
+    pub fn takes_midi(&self, step: StepId) -> bool {
+        self.steps.get(step.0).is_some_and(|s| s.takes_midi)
+    }
+
     /// Sets the latency `step`'s node reports. Needed for a node that went live in an
     /// earlier plan, or whose latency changed; nodes inserted by this plan are read
     /// directly. Returns false if there is no such step.

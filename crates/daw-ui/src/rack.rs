@@ -1,6 +1,7 @@
 //! 02B // HARDWARE_DSP_RACK: the selected track's plugin devices as modules with
 //! arc dials (Styles.md 4.3), and the picker that adds one. A sampler module is
-//! twice as wide: its waveform with slice points, and the pads they map to.
+//! twice as wide: its waveform with slice points, and the pads they map to
+//! (press one to hear it).
 
 use std::f32::consts::PI;
 use std::path::PathBuf;
@@ -462,6 +463,26 @@ fn sampler_panel(
             StrokeKind::Inside,
         );
         let key = if slicing { root + i } else { root };
+        if live && key <= 127 && !covered {
+            // Pressing a pad plays its key; `Workspace::show` sends the note-off
+            // on release, even if the pad is gone by then.
+            let resp = ui.interact(rect, ui.scope_id().with(("pad", di, i)), Sense::drag());
+            if resp.drag_started() {
+                out.push(Request::Note {
+                    track,
+                    key: key as u8,
+                    on: true,
+                });
+            }
+            if resp.dragged() {
+                p.rect_stroke(
+                    rect,
+                    0.0,
+                    Stroke::new(0.125 * u, t.accent_amber),
+                    StrokeKind::Inside,
+                );
+            }
+        }
         if live && key <= 127 {
             p.text(
                 rect.min + Vec2::splat(0.375 * u),

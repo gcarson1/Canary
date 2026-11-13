@@ -1,10 +1,16 @@
 //! A tiny CLAP plugin for the host tests: stereo gain (param 1, 0..=4) plus 1.0
 //! added to the output while a note is held. Reports 32 samples of latency and
 //! saves its gain as state. Counts live instances so tests can see it destroyed.
+//! Has a Cocoa editor that only logs its lifecycle calls to `GUI_LOG`.
 
 use std::ffi::CStr;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Mutex;
+
+use clack_extensions::gui::{
+    GuiApiType, GuiConfiguration, GuiSize, PluginGui, PluginGuiImpl, Window,
+};
 
 use clack_extensions::audio_ports::{
     AudioPortFlags, AudioPortInfo, AudioPortInfoWriter, AudioPortType, PluginAudioPorts,
@@ -25,6 +31,16 @@ pub const ID: &str = "dev.canary.test-gain";
 pub const GAIN: u32 = 1;
 pub const LATENCY: u32 = 32;
 pub static LIVE: AtomicUsize = AtomicUsize::new(0);
+/// Editor calls in order, for the editor lifecycle test.
+pub static GUI_LOG: Mutex<Vec<&str>> = Mutex::new(Vec::new());
+pub const GUI_SIZE: GuiSize = GuiSize {
+    width: 320,
+    height: 200,
+};
+
+fn log(call: &'static str) {
+    GUI_LOG.lock().unwrap().push(call);
+}
 
 pub struct TestGain;
 
@@ -81,7 +97,8 @@ impl Plugin for TestGain {
             .register::<PluginAudioPorts>()
             .register::<PluginParams>()
             .register::<PluginState>()
-            .register::<PluginLatency>();
+            .register::<PluginLatency>()
+            .register::<PluginGui>();
     }
 }
 
@@ -239,5 +256,59 @@ impl PluginStateImpl for Main<'_> {
 impl PluginLatencyImpl for Main<'_> {
     fn get(&self) -> u32 {
         LATENCY
+    }
+}
+
+impl PluginGuiImpl for Main<'_> {
+    fn is_api_supported(&self, configuration: GuiConfiguration) -> bool {
+        configuration.api_type == GuiApiType::COCOA && !configuration.is_floating
+    }
+
+    fn get_preferred_api(&self) -> Option<GuiConfiguration<'_>> {
+        Some(GuiConfiguration {
+            api_type: GuiApiType::COCOA,
+            is_floating: false,
+        })
+    }
+
+    fn create(&self, _configuration: GuiConfiguration) -> Result<(), PluginError> {
+        log("create");
+        Ok(())
+    }
+
+    fn destroy(&self) {
+        log("destroy");
+    }
+
+    fn set_scale(&self, _scale: f64) -> Result<(), PluginError> {
+        Ok(())
+    }
+
+    fn get_size(&self) -> Option<GuiSize> {
+        log("get_size");
+        Some(GUI_SIZE)
+    }
+
+    fn set_size(&self, _size: GuiSize) -> Result<(), PluginError> {
+        Ok(())
+    }
+
+    fn set_parent(&self, _window: Window) -> Result<(), PluginError> {
+        log("set_parent");
+        Ok(())
+    }
+
+    fn set_transient(&self, _window: Window) -> Result<(), PluginError> {
+        Err(PluginError::Message("embedded only"))
+    }
+
+    fn show(&self) -> Result<(), PluginError> {
+        log("show");
+        Ok(())
+    }
+
+    fn hide(&self) -> Result<(), PluginError> {
+        log("hide");
+        Ok(())
     }
 }

@@ -576,6 +576,32 @@ fn sampler_takes_dropped_files_and_slice_clicks() {
 }
 
 #[test]
+fn pressing_a_pad_plays_its_key_until_release() {
+    // Pad 01 (slice 1, ROOT 36) is the bottom-left cell of the pad grid.
+    let mut h = rig_with(vec![sampler()]);
+    h.run();
+    let pad = egui::Pos2::new(310.0, 850.0);
+    h.hover_at(pad);
+    h.run();
+    press(&mut h, pad, true);
+    h.run();
+    let notes = |h: &Harness<'_, Rig>| -> Vec<(u8, bool)> {
+        h.state()
+            .requests
+            .iter()
+            .filter_map(|r| match *r {
+                Request::Note { track: 0, key, on } => Some((key, on)),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(notes(&h), [(36, true)], "{:?}", h.state().requests);
+    press(&mut h, pad, false);
+    h.run();
+    assert_eq!(notes(&h), [(36, true), (36, false)]);
+}
+
+#[test]
 fn dock_switches_listening_and_takes_a_reference_drop() {
     // Dock: x 1100..1440, y 520..900; body inset 12pt, monitor strip at y 864..888.
     let mut h = rig();

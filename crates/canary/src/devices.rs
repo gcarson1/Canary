@@ -265,13 +265,20 @@ impl Devices {
         }
     }
 
-    /// Schedules `track`'s instrument, if it has one, taking live MIDI. Its step
-    /// feeds the track node.
-    pub fn instrument_step(&self, plan: &mut ExecutionPlan, track: &Track) -> Option<StepId> {
+    /// Schedules `track`'s instrument, if it has one, taking live MIDI when
+    /// `live_midi` (the selected track). Its step feeds the track node.
+    pub fn instrument_step(
+        &self,
+        plan: &mut ExecutionPlan,
+        track: &Track,
+        live_midi: bool,
+    ) -> Option<StepId> {
         let live = track.devices.iter().filter_map(|d| self.live.get(&d.uid));
         let instrument = live.clone().find(|l| l.instrument)?;
         let step = plan.add(instrument.id, vec![], 2).ok()?;
-        plan.route_midi(step);
+        if live_midi {
+            plan.route_midi(step);
+        }
         // shortcut: instruments only play live MIDI, which PDC does not compensate,
         // and the track node sums its clips with the instrument; delaying the
         // others would put this track's clips early. Revisit with sequenced notes.
@@ -637,5 +644,32 @@ mod tests {
             1,
             "retried once it comes back"
         );
+    }
+
+    #[test]
+    fn only_the_selected_track_instrument_takes_live_midi() {
+        let mut d = Devices::scan();
+        let mut track = Track::new("t");
+        track.devices = vec![Device {
+            uid: 1,
+            format: PluginFormat::Builtin,
+            bundle: None,
+            id: "canary.sampler".into(),
+            name: "Sampler".into(),
+            state: Vec::new(),
+        }];
+        let p = Project {
+            tracks: vec![track],
+            ..Project::default()
+        };
+        assert!(d.sync(&p, 48_000.0, 64).is_empty());
+        for selected in [true, false] {
+            let mut plan = ExecutionPlan::new(64);
+            d.apply_changes(&mut plan);
+            let step = d
+                .instrument_step(&mut plan, &p.tracks[0], selected)
+                .unwrap();
+            assert_eq!(plan.takes_midi(step), selected);
+        }
     }
 }

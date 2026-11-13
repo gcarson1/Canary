@@ -47,7 +47,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _midi = match daw_engine::midi_input_ports()?.first() {
         Some(name) => {
             println!("MIDI input: {name}");
-            Some(daw_engine::connect_midi(handle.midi.take().unwrap(), 0)?)
+            Some(daw_engine::connect_midi(
+                std::sync::Arc::new(std::sync::Mutex::new(handle.midi.take().unwrap())),
+                0,
+            )?)
         }
         None => {
             println!("no MIDI input ports; effects still process silence");

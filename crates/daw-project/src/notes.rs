@@ -13,6 +13,9 @@ use crate::Project;
 pub const PPQ: u64 = 960;
 /// One step of the step sequencer: a sixteenth note.
 pub const STEP: u64 = PPQ / 4;
+/// The latest tick anything may reach: 10 000 bars of 4/4, over five hours at
+/// 120 BPM. Bounds the work of turning a project into sequences.
+pub const MAX_TICKS: u64 = 10_000 * 4 * PPQ;
 
 /// One note. Valid notes have `length >= 1`, `key <= 127` and `velocity` in 1..=127.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -31,7 +34,10 @@ impl Note {
     }
 
     pub fn is_valid(&self) -> bool {
-        self.length >= 1 && self.key <= 127 && (1..=127).contains(&self.velocity)
+        self.length >= 1
+            && self.end() <= MAX_TICKS
+            && self.key <= 127
+            && (1..=127).contains(&self.velocity)
     }
 }
 
@@ -44,6 +50,14 @@ pub struct Pattern {
     pub name: String,
     /// Ticks, at least 1. Pattern mode loops this long.
     pub length: u64,
+}
+
+impl Pattern {
+    /// At least one step long (so song mode repeats it a bounded number of times)
+    /// and no longer than `MAX_TICKS`.
+    pub fn is_valid(&self) -> bool {
+        (STEP..=MAX_TICKS).contains(&self.length) && self.id < u64::MAX
+    }
 }
 
 /// A track's notes in one pattern.
@@ -70,6 +84,10 @@ pub struct PatternClip {
 impl PatternClip {
     pub fn end(&self) -> u64 {
         self.start.saturating_add(self.length)
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.length >= 1 && self.end() <= MAX_TICKS && self.offset <= MAX_TICKS
     }
 }
 

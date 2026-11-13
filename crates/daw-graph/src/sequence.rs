@@ -56,7 +56,8 @@ impl NoteState {
         let jumped = !context.playing || self.next != Some(context.playhead) || self.flush;
         if jumped {
             for (channel, held) in self.held.iter_mut().enumerate() {
-                while *held != 0 {
+                // A key stays held until its note-off fits, so none is lost.
+                while *held != 0 && out.len() < out.capacity() {
                     let key = held.trailing_zeros() as u8;
                     *held &= *held - 1;
                     let data = [0x80 | channel as u8, key, 0];
@@ -69,7 +70,8 @@ impl NoteState {
                     );
                 }
             }
-            self.flush = false;
+            // Anything that did not fit is released next block.
+            self.flush = !self.is_idle();
         }
         let mut live = live.iter().copied().peekable();
         if context.playing {

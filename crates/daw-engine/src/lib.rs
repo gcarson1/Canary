@@ -925,6 +925,38 @@ mod tests {
     }
 
     #[test]
+    fn a_changed_sequence_across_a_plan_swap_releases_held_notes() {
+        use daw_core::SeqEvent;
+        let on = |at, key| SeqEvent {
+            at,
+            data: [0x90, key, 100],
+        };
+        let probe = |seq: Vec<SeqEvent>, insert: bool| {
+            let mut plan = ExecutionPlan::new(64);
+            if insert {
+                plan.insert(NodeId(1), Box::new(NoteProbe));
+            }
+            let step = plan.add(NodeId(1), vec![], 1).unwrap();
+            plan.sequence(step, seq);
+            Box::new(plan)
+        };
+        let (mut handle, mut audio) = engine(16, 48_000.0);
+        handle.send_plan(probe(vec![on(5, 60)], true)).unwrap();
+        handle.commands.push(Command::Play).unwrap();
+        let mut block = vec![0.0; 32];
+        audio.process(&mut block, 1);
+        assert_eq!(block[5], 60.0);
+        // The same sequence again: the note plays on.
+        handle.send_plan(probe(vec![on(5, 60)], false)).unwrap();
+        audio.process(&mut block, 1);
+        assert!(block.iter().all(|&v| v == 0.0));
+        // An edited sequence: the held note ends at the start of the next block.
+        handle.send_plan(probe(vec![on(5, 62)], false)).unwrap();
+        audio.process(&mut block, 1);
+        assert_eq!(block[0], -60.0);
+    }
+
+    #[test]
     fn engine_publishes_the_playhead_for_other_threads() {
         let (mut handle, mut audio) = engine(16, 48_000.0);
         let clock = handle.playhead_clock();

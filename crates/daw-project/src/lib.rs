@@ -9,8 +9,9 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+pub mod edit;
 mod notes;
-pub use notes::{sorted, Note, Pattern, PatternClip, PatternNotes, Playback, PPQ, STEP};
+pub use notes::{sorted, Note, Pattern, PatternClip, PatternNotes, Playback, MAX_TICKS, PPQ, STEP};
 
 /// Bumped when the file format changes incompatibly.
 const FORMAT_VERSION: u32 = 1;
@@ -350,8 +351,22 @@ impl Project {
     }
 
     /// A pattern id not used in the project.
+    /// Also past every id a note list or clip still points at, so a new pattern
+    /// never picks up notes it did not make.
     pub fn new_pattern_id(&self) -> u64 {
-        self.patterns.iter().map(|p| p.id + 1).max().unwrap_or(1)
+        let referenced = self.tracks.iter().flat_map(|t| {
+            t.notes
+                .iter()
+                .map(|n| n.pattern)
+                .chain(t.pattern_clips.iter().map(|c| c.pattern))
+        });
+        self.patterns
+            .iter()
+            .map(|p| p.id)
+            .chain(referenced)
+            .map(|id| id.saturating_add(1))
+            .max()
+            .unwrap_or(1)
     }
 }
 
@@ -476,7 +491,7 @@ impl Action {
                 }
             }
             InsertPattern { index, pattern } => {
-                if pattern.length == 0 {
+                if !pattern.is_valid() {
                     return Err(ActionError::BadValue);
                 }
                 if index > p.patterns.len() {
@@ -498,18 +513,11 @@ impl Action {
                 }
             }
             SetPattern { index, pattern } => {
-                if pattern.length == 0 {
+                let slot = p.patterns.get_mut(index).ok_or(ActionError::OutOfRange)?;
+                // Notes and clips point at the id, so it never changes.
+                if !pattern.is_valid() || pattern.id != slot.id {
                     return Err(ActionError::BadValue);
                 }
-                let clash = p
-                    .patterns
-                    .iter()
-                    .enumerate()
-                    .any(|(i, q)| i != index && q.id == pattern.id);
-                if clash {
-                    return Err(ActionError::DuplicateId);
-                }
-                let slot = p.patterns.get_mut(index).ok_or(ActionError::OutOfRange)?;
                 SetPattern {
                     index,
                     pattern: std::mem::replace(slot, pattern),
@@ -530,10 +538,15 @@ impl Action {
                     Some(i) => std::mem::replace(&mut t.notes[i].notes, sorted(notes)),
                     None if notes.is_empty() => Vec::new(),
                     None => {
-                        t.notes.push(PatternNotes {
-                            pattern,
-                            notes: sorted(notes),
-                        });
+                        // Kept in pattern order, so undo restores the same list.
+                        let at = t.notes.partition_point(|n| n.pattern < pattern);
+                        t.notes.insert(
+                            at,
+                            PatternNotes {
+                                pattern,
+                                notes: sorted(notes),
+                            },
+                        );
                         Vec::new()
                     }
                 };
@@ -548,7 +561,7 @@ impl Action {
                 index,
                 clip,
             } => {
-                if clip.length == 0 {
+                if !clip.is_valid() {
                     return Err(ActionError::BadValue);
                 }
                 let t = track(p, ti)?;
@@ -574,7 +587,7 @@ impl Action {
                 index,
                 clip,
             } => {
-                if clip.length == 0 {
+                if !clip.is_valid() {
                     return Err(ActionError::BadValue);
                 }
                 let slot = track(p, ti)?
@@ -760,10 +773,14 @@ impl History {
         let mut ids: Vec<u64> = p.patterns.iter().map(|q| q.id).collect();
         ids.sort_unstable();
         unique &= ids.windows(2).all(|w| w[0] != w[1]);
-        let musical = p.patterns.iter().all(|q| q.length > 0)
+        let musical = p.patterns.iter().all(Pattern::is_valid)
             && p.tracks.iter().all(|t| {
-                t.notes.iter().flat_map(|n| &n.notes).all(Note::is_valid)
-                    && t.pattern_clips.iter().all(|c| c.length > 0)
+                // One note list per pattern, or removing a pattern leaves notes behind.
+                let mut lists: Vec<u64> = t.notes.iter().map(|n| n.pattern).collect();
+                lists.sort_unstable();
+                lists.windows(2).all(|w| w[0] != w[1])
+                    && t.notes.iter().flat_map(|n| &n.notes).all(Note::is_valid)
+                    && t.pattern_clips.iter().all(PatternClip::is_valid)
             });
         if !(p.bpm.is_finite() && p.bpm > 0.0)
             || p.sample_rate == 0
@@ -1198,10 +1215,37 @@ mod tests {
                     ..clip(0)
                 },
             },
+            Action::InsertPatternClip {
+                track: 0,
+                index: 0,
+                clip: clip(MAX_TICKS),
+            },
+            Action::InsertPattern {
+                index: 0,
+                pattern: pattern(3, STEP - 1),
+            },
+            // The id is what notes and clips point at; it cannot change.
+            Action::SetPattern {
+                index: 0,
+                pattern: pattern(9, PPQ),
+            },
         ] {
             assert!(h.apply(bad).is_err());
         }
         assert_eq!(h.project(), snapshots.last().unwrap());
+
+        // Note lists stay in pattern order, so a removal undoes to the same list.
+        h.apply(Action::SetNotes {
+            track: 0,
+            pattern: 2,
+            notes: vec![note(0, 40)],
+        })
+        .unwrap();
+        let two_lists = h.project().clone();
+        h.apply(h.project().remove_pattern(0).unwrap()).unwrap();
+        assert!(h.undo());
+        assert_eq!(h.project(), &two_lists);
+        assert!(h.undo());
 
         // Removing a pattern takes its notes and clips with it, in one undo step.
         let remove = h.project().remove_pattern(0).unwrap();
@@ -1210,6 +1254,13 @@ mod tests {
         assert_eq!(p.patterns, [pattern(2, 8 * PPQ)]);
         assert!(p.tracks[0].notes.is_empty() && p.tracks[0].pattern_clips.is_empty());
         assert_eq!(p.new_pattern_id(), 3);
+        // An id a note list still points at (a pattern removed on its own) is skipped.
+        let mut dangling = p.clone();
+        dangling.tracks[0].notes.push(PatternNotes {
+            pattern: 6,
+            notes: vec![note(0, 1)],
+        });
+        assert_eq!(dangling.new_pattern_id(), 7);
         assert!(h.undo());
         assert_eq!(h.project(), snapshots.last().unwrap());
 

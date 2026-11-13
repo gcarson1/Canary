@@ -123,6 +123,30 @@ fn fixture() -> (History, HashMap<PathBuf, WaveformPyramid>, Vec<PathBuf>) {
         })
         .unwrap();
     }
+    // A reverb bus fed by a send from the first track and the pad's output.
+    let mut bus = Track::new("Reverb_Bus");
+    bus.bus = true;
+    h.apply(Action::InsertTrack {
+        index: 3,
+        track: bus,
+    })
+    .unwrap();
+    let bus_id = h.project().tracks[3].id;
+    h.apply(Action::SetRouting {
+        track: 0,
+        output: None,
+        sends: vec![daw_project::Send {
+            to: bus_id,
+            level: 0.6,
+        }],
+    })
+    .unwrap();
+    h.apply(Action::SetRouting {
+        track: 1,
+        output: Some(bus_id),
+        sends: Vec::new(),
+    })
+    .unwrap();
     // A gain ride on the first track: down, a bent rise, back to unity.
     let point = |tick, value, curve| daw_project::Point { tick, value, curve };
     h.apply(Action::SetAutomation {
@@ -168,6 +192,7 @@ fn harness(
                         files: &files,
                         plugins: &plugins(),
                         devices: &[vec![sampler()], devices()].concat(),
+                        meters: &[[0.4, 0.5], [0.9, 1.0], [0.0, 0.0], [0.2, 0.25]],
                     },
                 );
             })
@@ -329,10 +354,15 @@ fn every_viewport_and_theme_renders_and_passes_the_audits() {
     std::fs::create_dir_all(&dir).unwrap();
     for (theme, name) in [(Theme::DARK, "dark"), (Theme::LIGHT, "light")] {
         let allowed = theme.tokens();
-        for (size, page) in SIZES
-            .into_iter()
-            .flat_map(|s| [Page::Playlist, Page::Sequencer, Page::PianoRoll].map(|p| (s, p)))
-        {
+        for (size, page) in SIZES.into_iter().flat_map(|s| {
+            [
+                Page::Playlist,
+                Page::Sequencer,
+                Page::PianoRoll,
+                Page::Mixer,
+            ]
+            .map(|p| (s, p))
+        }) {
             let mut h = harness(size, theme, playing(), page);
             h.run();
             let (mut colors, mut rounded) = (Vec::new(), 0);
@@ -419,6 +449,7 @@ fn rig_from(mut ws: Workspace, rack: Vec<DeviceView>) -> Harness<'static, Rig> {
                             files: &files,
                             plugins: &plugins(),
                             devices: &rack,
+                            meters: &[],
                         },
                     );
                     rig.requests.extend(out);
@@ -482,7 +513,7 @@ fn dragging_a_clip_moves_it_across_lanes_and_delete_mid_drag_is_safe() {
         [before],
         "only the dragged clip went; no other clip was overwritten"
     );
-    assert_eq!(tracks.len(), 3, "one Backspace removes one thing");
+    assert_eq!(tracks.len(), 4, "one Backspace removes one thing");
 }
 
 #[test]
@@ -565,6 +596,7 @@ fn dragging_a_module_title_moves_the_device() {
             id: id.into(),
             name: id.into(),
             state: Vec::new(),
+            sidechain: None,
         };
         let insert = Action::InsertDevice {
             track: 0,
@@ -797,7 +829,7 @@ fn piano_roll_draws_moves_and_deletes_notes() {
     assert!(!after.contains(&moved));
     assert_eq!(
         h.state().history.project().tracks.len(),
-        3,
+        4,
         "no track deleted"
     );
 }

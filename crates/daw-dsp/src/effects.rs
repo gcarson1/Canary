@@ -48,6 +48,11 @@ pub trait Effect: Send {
     fn set_param(&mut self, index: usize, value: f32);
     fn set_sample_rate(&mut self, sample_rate: f32);
     fn process(&mut self, left: &mut [f32], right: &mut [f32]);
+    /// Like `process`, with a sidechain `key` signal to listen to instead of the
+    /// input. Effects without a detector ignore the key.
+    fn process_keyed(&mut self, left: &mut [f32], right: &mut [f32], _key: [&[f32]; 2]) {
+        self.process(left, right);
+    }
     /// Clears signal state and jumps every gliding knob to its value.
     fn reset(&mut self);
 }
@@ -119,6 +124,16 @@ impl Compressor {
     }
 }
 
+impl Compressor {
+    /// The gain for a detector input at `peak`, one sample on.
+    fn gain(&mut self, peak: f32) -> f32 {
+        let peak = if peak.is_finite() { peak } else { 0.0 };
+        let level = self.env.process(peak);
+        let over = gain_to_db(level) - self.threshold.tick();
+        db_to_gain(reduction(over, self.ratio) + self.makeup.tick())
+    }
+}
+
 impl Effect for Compressor {
     fn params(&self) -> &'static [ParamSpec] {
         &Self::PARAMS
@@ -142,10 +157,16 @@ impl Effect for Compressor {
     }
     fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
         for (l, r) in left.iter_mut().zip(right.iter_mut()) {
-            let level = self.env.process(l.abs().max(r.abs()));
-            let over = gain_to_db(level) - self.threshold.tick();
-            let db = reduction(over, self.ratio) + self.makeup.tick();
-            let g = db_to_gain(db);
+            let g = self.gain(l.abs().max(r.abs()));
+            *l *= g;
+            *r *= g;
+        }
+    }
+    /// Ducks the input by the key's level (sidechain compression).
+    fn process_keyed(&mut self, left: &mut [f32], right: &mut [f32], key: [&[f32]; 2]) {
+        let frames = left.iter_mut().zip(right.iter_mut());
+        for ((l, r), (kl, kr)) in frames.zip(key[0].iter().zip(key[1])) {
+            let g = self.gain(kl.abs().max(kr.abs()));
             *l *= g;
             *r *= g;
         }
@@ -427,6 +448,22 @@ mod tests {
     use std::f32::consts::PI;
 
     const SR: f32 = 48_000.0;
+
+    #[test]
+    fn a_loud_key_ducks_the_input_and_a_silent_one_leaves_it() {
+        let quiet = vec![0.1f32; 48_000];
+        let duck = |key: f32| {
+            let mut c = effect("canary.compressor", SR).unwrap();
+            let (mut l, mut r) = (quiet.clone(), quiet.clone());
+            let k = vec![key; 48_000];
+            c.process_keyed(&mut l, &mut r, [&k, &k]);
+            l[47_999]
+        };
+        assert!((duck(0.0) - 0.1).abs() < 1e-4, "no key, no reduction");
+        // Key at 0 dBFS, threshold -18 dB, ratio 4: about 13.5 dB down.
+        let ducked = duck(1.0);
+        assert!(ducked < 0.1 * 0.25 && ducked > 0.1 * 0.15, "{ducked}");
+    }
 
     /// Peak of the last half of `fx` run on a stereo sine.
     fn run(fx: &mut dyn Effect, freq: f32, amp: f32) -> f32 {

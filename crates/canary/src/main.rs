@@ -20,7 +20,9 @@ use daw_core::{Clip, Command, NodeId, SampleData, SeqEvent, Telemetry, TrackPara
 use daw_dsp::WaveformPyramid;
 use daw_dsp::{integrated_loudness, TruePeak};
 use daw_engine::{EngineHandle, MidiConnection, MidiSender, Recorder};
-use daw_graph::{ExecutionPlan, MasterNode, Monitor, MonitorMode, Source, TrackNode};
+use daw_graph::{
+    ExecutionPlan, GainNode, MasterNode, Monitor, MonitorMode, Source, StepId, TrackNode,
+};
 use daw_host::LayerKind;
 use daw_project::{Action, ClipRef, History, Lane, Playback, Target, Track};
 use daw_ui::{theme, EngineView, Inputs, Listen, Request, SampleDrop, Status, Workspace};
@@ -30,6 +32,10 @@ use devices::Devices;
 const MAX_BLOCK: usize = 4096;
 /// The reference track's node, just below the device ids; tracks stay under it.
 const REFERENCE_NODE: NodeId = NodeId(devices::FIRST_DEVICE_NODE - 1);
+/// Track nodes are 1..=MAX_TRACKS; send nodes take the ids after them, up to
+/// the reference's.
+const MAX_TRACKS: usize = 1023;
+const SEND_NODES: std::ops::Range<u32> = MAX_TRACKS as u32 + 1..REFERENCE_NODE.0;
 const AUDIO_EXTENSIONS: [&str; 7] = ["wav", "flac", "mp3", "m4a", "aac", "aif", "aiff"];
 const MIDI_EXTENSIONS: [&str; 2] = ["mid", "midi"];
 
@@ -80,6 +86,9 @@ struct App {
     built_loop: Option<(u64, u64)>,
     built_clicks: Vec<SeqEvent>,
     built_automation: Vec<Vec<Lane>>,
+    built_routing: Vec<Routing>,
+    /// Each track's output peak for the mixer, held and falling.
+    meters: Vec<[f32; 2]>,
     /// The metronome switch as last sent to the engine.
     sent_metronome: bool,
     /// Live MIDI to the selected track's instrument: pads and the keyboard.
@@ -195,6 +204,8 @@ impl App {
             built_loop: None,
             built_clicks: Vec::new(),
             built_automation: Vec::new(),
+            built_routing: Vec::new(),
+            meters: Vec::new(),
             sent_metronome: false,
             midi,
             _midi_in: midi_in,
@@ -413,6 +424,7 @@ impl App {
                 .iter()
                 .map(|t| &t.automation)
                 .eq(self.built_automation.iter())
+            && routing(self.history.project()) == self.built_routing
             && loop_range(self.history.project(), playback) == self.built_loop
             && tracks.len() == self.built_clips.len()
             && tracks
@@ -449,12 +461,7 @@ impl App {
         sequences: Vec<Vec<SeqEvent>>,
         clicks: Vec<SeqEvent>,
     ) {
-        let count = self
-            .history
-            .project()
-            .tracks
-            .len()
-            .min(REFERENCE_NODE.0 as usize - 1);
+        let count = self.history.project().tracks.len().min(MAX_TRACKS);
         self.params.truncate(count);
         while self.params.len() < count {
             self.params
@@ -466,9 +473,21 @@ impl App {
             plan.remove(id);
         }
         self.devices.apply_changes(&mut plan);
-        let tracks = &self.history.project().tracks[..count];
+        let project = self.history.project();
+        let tracks = &project.tracks[..count];
+        // Sources before the buses they feed (and sidechain keys before their use).
+        let order: Vec<usize> = project
+            .route_order()
+            .unwrap_or_else(|| (0..project.tracks.len()).collect())
+            .into_iter()
+            .filter(|&i| i < count)
+            .collect();
+        let mut out_step: Vec<Option<StepId>> = vec![None; count];
+        let mut bus_in: Vec<Vec<StepId>> = vec![Vec::new(); count];
         let mut steps = Vec::with_capacity(count);
-        for (i, track) in tracks.iter().enumerate() {
+        let mut sends = Vec::new();
+        for &i in &order {
+            let track = &tracks[i];
             // An ARA plug-in on the track renders its clips itself.
             let ara = self.devices.ara_track(track);
             // A looping pattern plays on its own, as in FL's PAT mode.
@@ -497,19 +516,59 @@ impl App {
                         if let Some(seq) = sequences.get(i).filter(|s| !s.is_empty()) {
                             plan.sequence(step, seq.clone());
                         }
-                        (0..2)
-                            .map(|channel| vec![Source { step, channel }])
-                            .collect()
+                        vec![step]
                     }
                     None => vec![],
                 };
+            // A bus sums what is routed or sent to it, after any instrument.
+            let feeds: Vec<StepId> = inputs.into_iter().chain(bus_in[i].drain(..)).collect();
+            let inputs = if feeds.is_empty() {
+                vec![]
+            } else {
+                (0..2)
+                    .map(|channel| feeds.iter().map(|&step| Source { step, channel }).collect())
+                    .collect()
+            };
             let track_step = plan.add(id, inputs, 2).expect("inputs are earlier steps");
-            steps.push(
+            let keys: HashMap<u64, StepId> = track
+                .devices
+                .iter()
+                .enumerate()
+                .filter_map(|(d, dev)| Some((dev.uid, out_step[project.sidechain_of(i, d)?]?)))
+                .collect();
+            let last =
                 self.devices
-                    .effects_after(&mut plan, track, track_step, &mut device_steps),
-            );
-            let project = self.history.project();
-            for lane in &track.automation {
+                    .effects_after(&mut plan, track, track_step, &mut device_steps, &keys);
+            out_step[i] = Some(last);
+            match project.output_of(i).filter(|&j| j < count) {
+                Some(j) => bus_in[j].push(last),
+                None => steps.push(last),
+            }
+            for (j, level) in project.sends_of(i) {
+                let id = NodeId(SEND_NODES.start + sends.len() as u32);
+                if j >= count || !SEND_NODES.contains(&id.0) {
+                    continue;
+                }
+                plan.insert(id, Box::new(GainNode { gain: level }));
+                let from = |channel| {
+                    vec![Source {
+                        step: last,
+                        channel,
+                    }]
+                };
+                let step = plan
+                    .add(id, vec![from(0), from(1)], 2)
+                    .expect("earlier step");
+                bus_in[j].push(step);
+                sends.push(id);
+            }
+            // Song automation only plays with the song, not under a looping pattern.
+            let lanes = if playback == Playback::Song {
+                &track.automation[..]
+            } else {
+                &[]
+            };
+            for lane in lanes {
                 let (step, param) = match lane.target {
                     Target::Gain => (Some(track_step), TrackNode::GAIN),
                     Target::Pan => (Some(track_step), TrackNode::PAN),
@@ -526,7 +585,7 @@ impl App {
         }
         let sum = |channel| steps.iter().map(|&step| Source { step, channel }).collect();
         let mut inputs: Vec<Vec<Source>> = vec![sum(0), sum(1)];
-        self.live = (1..=count as u32).map(NodeId).collect();
+        self.live = (1..=count as u32).map(NodeId).chain(sends).collect();
         // The reference plays in sync, into the master's spare inputs, never the mix.
         let reference = self.history.project().reference.clone();
         if let Some(audio) = reference.as_ref().and_then(|p| self.audio.get(p)) {
@@ -542,6 +601,7 @@ impl App {
         self.built_reference = reference;
         plan.add(master, inputs, 2)
             .expect("sources are earlier steps");
+        let tracks = &self.history.project().tracks[..count];
         self.built_clips = tracks.iter().map(|t| t.clips.clone()).collect();
         self.built_devices = tracks
             .iter()
@@ -563,6 +623,7 @@ impl App {
         self.built_loop = looping;
         plan.set_clicks(clicks.clone());
         self.built_clicks = clicks;
+        self.built_routing = routing(self.history.project());
         self.built_automation = self
             .history
             .project()
@@ -615,6 +676,14 @@ impl App {
         }
         if got_levels {
             self.view.peak = peak;
+        }
+        // Track meters fall about 20 dB a second at 60 frames a second.
+        self.meters.resize(self.params.len(), [0.0; 2]);
+        for (shown, params) in self.meters.iter_mut().zip(&self.params) {
+            let peak = params.take_peak();
+            for side in 0..2 {
+                shown[side] = peak[side].max(shown[side] * 0.93);
+            }
         }
         let r = self.monitor.readings();
         self.view.loudness = [r.momentary, r.short_term, r.integrated];
@@ -1040,6 +1109,7 @@ impl eframe::App for App {
                 files: &self.files,
                 plugins: &self.devices.choices,
                 devices: &views,
+                meters: &self.meters,
             },
         );
         for request in requests {
@@ -1076,6 +1146,27 @@ impl eframe::App for App {
         let busy = self.view.playing || self.view.recording || !self.pending.is_empty();
         ctx.request_repaint_after(Duration::from_millis(if busy { 16 } else { 250 }));
     }
+}
+
+/// What of a track's routing the plan depends on: id, bus, output, sends and
+/// each device's sidechain.
+type Routing = (
+    u64,
+    bool,
+    Option<u64>,
+    Vec<daw_project::Send>,
+    Vec<Option<u64>>,
+);
+
+fn routing(project: &daw_project::Project) -> Vec<Routing> {
+    project
+        .tracks
+        .iter()
+        .map(|t| {
+            let keys = t.devices.iter().map(|d| d.sidechain).collect();
+            (t.id, t.bus, t.output, t.sends.clone(), keys)
+        })
+        .collect()
 }
 
 /// The metronome's beats as timeline samples (`data[0] == 1` on downbeats):

@@ -195,10 +195,11 @@ fn automation_lane(
 
     // The envelope, sampled every two pixels, and its points.
     let lp = p.with_clip_rect(lane.intersect(lanes));
+    // In samples, as the engine plays it, so a tempo change bends it the same way.
     let env: Vec<AutoPoint> = shown
         .iter()
         .map(|p| AutoPoint {
-            at: p.tick,
+            at: project.samples_at(p.tick),
             value: p.value,
             curve: p.curve,
         })
@@ -206,8 +207,7 @@ fn automation_lane(
     let mut line = Vec::new();
     let mut x = lanes.min.x;
     while x <= lanes.max.x {
-        let tick = project.ticks_at(view.sample_at(lanes, x) as u64);
-        let v = automation_value(&env, tick).unwrap_or(scale.rest);
+        let v = automation_value(&env, view.sample_at(lanes, x) as u64).unwrap_or(scale.rest);
         line.push(Pos2::new(x, y_of(v)));
         x += 2.0 * m.px.max(1.0);
     }

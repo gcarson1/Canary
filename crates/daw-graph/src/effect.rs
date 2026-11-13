@@ -190,7 +190,11 @@ impl AudioNode for EffectNode {
                 }
             }
         }
-        self.effect.process(left, right);
+        // Inputs 2 and 3, when the plan wires them, are the sidechain key.
+        match inputs {
+            [_, _, kl, kr, ..] => self.effect.process_keyed(left, right, [kl, kr]),
+            _ => self.effect.process(left, right),
+        }
 
         let (start, keep_from) = (self.mix, self.keep);
         let keep_to = if delta { 0.0 } else { 1.0 };

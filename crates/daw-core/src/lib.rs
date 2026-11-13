@@ -341,6 +341,9 @@ pub struct TrackParams {
     solo: AtomicBool,
     /// Shared by every track in a mix: how many of them are soloed.
     solo_count: Arc<AtomicUsize>,
+    /// Highest output peak per side since the meter was last read (f32 bits;
+    /// for non-negative floats the bit order is the numeric order).
+    peak: [AtomicU32; 2],
 }
 
 impl TrackParams {
@@ -353,7 +356,22 @@ impl TrackParams {
             mute: AtomicBool::new(false),
             solo: AtomicBool::new(false),
             solo_count,
+            peak: [AtomicU32::new(0), AtomicU32::new(0)],
         }
+    }
+
+    /// Audio thread: raises the held peaks to at least `peak` (linear, per side).
+    pub fn report_peak(&self, peak: [f32; 2]) {
+        for (slot, p) in self.peak.iter().zip(peak) {
+            if p.is_finite() && p > 0.0 {
+                slot.fetch_max(p.to_bits(), Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Main thread: the peaks since the last call, then starts over.
+    pub fn take_peak(&self) -> [f32; 2] {
+        [0, 1].map(|i| f32::from_bits(self.peak[i].swap(0, Ordering::Relaxed)))
     }
 
     pub fn gain(&self) -> f32 {

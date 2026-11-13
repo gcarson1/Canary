@@ -71,7 +71,8 @@ impl Transport {
                 beat,
                 beats_per_bar,
             } => {
-                if frames > 0 && beat > 0 && beats_per_bar > 0 {
+                // Counting in mid-play would stop the music for a bar.
+                if frames > 0 && beat > 0 && beats_per_bar > 0 && !self.playing {
                     self.count_in = Some(CountIn {
                         frames,
                         beat,

@@ -114,10 +114,13 @@ impl AudioNode for TrackNode {
         self.right.set_target(right);
         match outputs {
             [l, r, ..] => {
+                let mut peak = [0.0f32; 2];
                 for (l, r) in l.iter_mut().zip(r.iter_mut()) {
                     *l *= self.left.tick();
                     *r *= self.right.tick();
+                    peak = [peak[0].max(l.abs()), peak[1].max(r.abs())];
                 }
+                self.params.report_peak(peak);
             }
             [mono] => {
                 for s in mono.iter_mut() {

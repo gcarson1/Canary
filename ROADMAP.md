@@ -94,10 +94,10 @@ The UI follows Styles.md whichever framework is chosen.
 - [ ] Plugin delay compensation for sequenced instruments (notes scheduled early by the instrument path's latency)
 
 ### Phase 8: Mixer and Routing
-- [ ] MIXER view: channel strips with ladder faders, pan dials, meters, M/S, insert slots, send knobs
-- [ ] Buses: group/folder buses, track output assignment, aux sends (pre/post fader) to return buses
-- [ ] Sidechain: built-in compressor key input from any track; plugins with a sidechain bus
-- [ ] Per-track peak meters and a CPU/DSP load readout
+- [x] MIXER view: channel strips with ladder faders (-60..+6 dB, double-click resets), pan dials, per-track peak meters (`TrackParams::report_peak`), M/S, output selector and send rows; drags are one undo step each (`History::apply_gesture`). Insert slots stay in the rack
+- [x] Buses: `+ BUS` in the mixer; any track outputs to the master or a bus, and sends post-fader to buses (`Track::id`/`bus`/`output`/`sends`, `Action::SetRouting`, refused if it would loop; `Project::route_order` schedules sources first). Still to do: pre-fader sends, folder tracks in the playlist
+- [x] Sidechain: built-in compressor key input from any track (`Device::sidechain`, `Action::SetSidechain`, key on the effect's inputs 2-3, `Effect::process_keyed`); KEY in a built-in module's header picks the source track. Still to do: plugins with a sidechain bus
+- [ ] CPU/DSP load readout (per-track peak meters are in the mixer)
 - [ ] Freeze (render a track through its devices to audio, devices unloaded) and bounce in place
 - [ ] Input monitoring and per-track record arm; duplex recording with input/output latency compensation
 

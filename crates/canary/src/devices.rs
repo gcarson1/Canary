@@ -143,6 +143,7 @@ impl Devices {
             id: a.info.id.clone(),
             name: a.info.name.clone(),
             state: Vec::new(),
+            sidechain: None,
         };
         self.instantiate(&device, track, sample_rate, max_block)?;
         Ok(device)
@@ -307,13 +308,19 @@ impl Devices {
         track: &Track,
         mut step: StepId,
         steps: &mut HashMap<u64, StepId>,
+        keys: &HashMap<u64, StepId>,
     ) -> StepId {
         for d in &track.devices {
             let Some(l) = self.live.get_mut(&d.uid).filter(|l| !l.instrument) else {
                 continue;
             };
             let from = |channel| vec![Source { step, channel }];
-            if let Ok(next) = plan.add(l.id, vec![from(0), from(1)], 2) {
+            let mut inputs = vec![from(0), from(1)];
+            // Built-in effects take a sidechain key on inputs 2 and 3.
+            if let (Some(&key), PluginFormat::Builtin) = (keys.get(&d.uid), d.format) {
+                inputs.extend((0..2).map(|channel| vec![Source { step: key, channel }]));
+            }
+            if let Ok(next) = plan.add(l.id, inputs, 2) {
                 l.latency = l.hosted.latency_samples();
                 plan.set_latency(next, l.latency);
                 steps.insert(d.uid, next);
@@ -683,6 +690,7 @@ mod tests {
                 id: DELAY.into(),
                 name: "AUDelay".into(),
                 state: Vec::new(),
+                sidechain: None,
             })
             .collect();
         Project {
@@ -756,6 +764,7 @@ mod tests {
             id: "canary.sampler".into(),
             name: "Sampler".into(),
             state: Vec::new(),
+            sidechain: None,
         }];
         let p = Project {
             tracks: vec![track],

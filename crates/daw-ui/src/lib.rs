@@ -3,6 +3,7 @@
 //! dock), drawn with egui. Edits go into `daw_project::History`; anything the
 //! engine must do comes back as `Request`s. This crate never touches audio.
 
+mod mixer;
 mod piano;
 mod rack;
 mod sequencer;
@@ -146,6 +147,8 @@ pub struct Inputs<'a> {
     pub plugins: &'a [PluginChoice],
     /// The selected track's devices, in order, with live parameter values.
     pub devices: &'a [DeviceView],
+    /// Each track's output peak (linear, left and right), for the mixer meters.
+    pub meters: &'a [[f32; 2]],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -160,6 +163,7 @@ pub enum Page {
     Sequencer,
     Playlist,
     PianoRoll,
+    Mixer,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,6 +177,8 @@ pub enum Snap {
 /// A project change made while drawing, applied once the frame is drawn.
 enum Edit {
     Apply(Action),
+    /// One step of a continuous drag with this gesture id: one undo step overall.
+    Gesture(Action, u64),
     Undo,
     Redo,
 }
@@ -222,6 +228,8 @@ pub struct Workspace {
     picker: Option<f32>,
     /// Points the rack is scrolled to the left.
     rack_scroll: f32,
+    /// Points the mixer is scrolled to the left.
+    mixer_scroll: f32,
     /// The rack device being dragged to a new slot.
     device_drag: Option<usize>,
     /// An asset browser file being dragged (onto a sampler).
@@ -257,6 +265,7 @@ impl Default for Workspace {
             picker: None,
             device_drag: None,
             rack_scroll: 0.0,
+            mixer_scroll: 0.0,
             file_drag: None,
             held_note: None,
         }
@@ -378,6 +387,7 @@ impl Workspace {
             Page::Sequencer => sequencer::show(self, ui, &p, &m, z.timeline, &inputs),
             Page::Playlist => timeline::show(self, ui, &p, &m, z.timeline, &inputs, &mut out),
             Page::PianoRoll => piano::show(self, ui, &p, &m, z.timeline, &inputs, &mut out),
+            Page::Mixer => mixer::show(self, ui, &p, &m, z.timeline, &inputs),
         }
         // The rack scrolls sideways; nothing in it may draw or react outside it.
         ui.scope_builder(egui::UiBuilder::new().max_rect(z.rack), |ui| {
@@ -417,7 +427,11 @@ impl Workspace {
                 Edit::Apply(action) => drop(inputs.history.apply(action)),
                 Edit::Undo => drop(inputs.history.undo()),
                 Edit::Redo => drop(inputs.history.redo()),
+                Edit::Gesture(action, id) => drop(inputs.history.apply_gesture(action, id)),
             }
+        }
+        if !ui.input(|i| i.pointer.any_down()) {
+            inputs.history.end_gesture();
         }
         self.clear_selection(inputs.history);
         // A newly pressed pad's note sounds until the pointer comes up.
@@ -612,6 +626,7 @@ impl Workspace {
             (Page::Sequencer, "SEQUENCER"),
             (Page::Playlist, "PLAYLIST"),
             (Page::PianoRoll, "PIANO ROLL"),
+            (Page::Mixer, "MIXER"),
         ] {
             let active = self.page == page;
             let tab = p.text(
@@ -637,7 +652,9 @@ impl Workspace {
             }
             if resp.clicked() && !active {
                 self.page = page;
-                self.song = page == Page::Playlist;
+                if page != Page::Mixer {
+                    self.song = page == Page::Playlist;
+                }
             }
             x = tab.max.x + u;
         }

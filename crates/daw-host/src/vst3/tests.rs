@@ -440,6 +440,23 @@ fn params_and_notes_reach_the_processor_without_allocating() {
 }
 
 #[test]
+fn automation_shares_change_slots_and_wins_over_a_dial_in_the_same_block() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let b = bundle();
+    let id = b.plugins()[0].id.clone();
+    let (mut plugin, mut node) = Vst3Plugin::new(&b, &id, 48_000.0, 64).unwrap();
+    assert!(plugin.set_param(0, 0.5));
+    node.automate(9, 0.1); // a parameter the plugin does not read
+    node.automate(0, 0.25);
+    let out = assert_no_alloc(|| run(&mut node, &[]));
+    assert_eq!(
+        out, [0.25; 8],
+        "one slot for id 0, holding the automated value"
+    );
+    assert_eq!(node.param_changes.count.load(Ordering::Relaxed), 2);
+}
+
+#[test]
 fn state_round_trips_and_the_plugin_terminates_when_both_halves_go() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let before = LIVE.load(Ordering::SeqCst);

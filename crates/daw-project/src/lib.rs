@@ -10,7 +10,9 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 mod automation;
+mod routing;
 pub use automation::{valid_points, Lane, Point, Target};
+pub use routing::Send;
 pub mod edit;
 mod notes;
 pub mod smf;
@@ -73,7 +75,20 @@ impl Default for Project {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Track {
+    /// Unique in the project and stable across edits: routing refers to it.
+    /// 0 until the track is inserted, which assigns one.
+    #[serde(default)]
+    pub id: u64,
     pub name: String,
+    /// A bus: other tracks can output or send to it.
+    #[serde(default)]
+    pub bus: bool,
+    /// The bus this track plays into (a track id), or the master when `None`.
+    #[serde(default)]
+    pub output: Option<u64>,
+    /// Post-fader sends to buses.
+    #[serde(default)]
+    pub sends: Vec<Send>,
     pub gain: f32,
     pub pan: f32,
     pub mute: bool,
@@ -116,6 +131,9 @@ pub struct Device {
     /// The plugin's opaque state as of the last save.
     #[serde(default, with = "base64")]
     pub state: Vec<u8>,
+    /// A track (by id) whose audio feeds the device's key input (sidechain).
+    #[serde(default)]
+    pub sidechain: Option<u64>,
 }
 
 /// Plugin state can be large; base64 keeps it a quarter of a JSON number array.
@@ -172,7 +190,11 @@ mod base64 {
 impl Track {
     pub fn new(name: impl Into<String>) -> Self {
         Self {
+            id: 0,
             name: name.into(),
+            bus: false,
+            output: None,
+            sends: Vec::new(),
             gain: 1.0,
             pan: 0.0,
             mute: false,
@@ -298,6 +320,19 @@ pub enum Action {
         index: usize,
         clip: PatternClip,
     },
+    /// Sets where `track` plays (a bus id or the master) and its sends.
+    /// Refused if it would route a bus into itself, directly or not.
+    SetRouting {
+        track: usize,
+        output: Option<u64>,
+        sends: Vec<Send>,
+    },
+    /// Feeds track `source`'s audio (by id) into device `device`'s key input.
+    SetSidechain {
+        track: usize,
+        device: usize,
+        source: Option<u64>,
+    },
     /// Several edits that undo as one step (a split, say). All or nothing.
     Batch(Vec<Action>),
 }
@@ -334,6 +369,9 @@ pub enum ActionError {
     BadValue,
     /// A pattern id already in the project.
     DuplicateId,
+    /// Routing that would feed a bus back into itself, or a send level that is
+    /// not finite.
+    BadRoute,
 }
 
 impl fmt::Display for ActionError {
@@ -343,6 +381,7 @@ impl fmt::Display for ActionError {
             Self::BadTempo => write!(f, "tempo must be a positive number"),
             Self::BadValue => write!(f, "value out of range"),
             Self::DuplicateId => write!(f, "pattern id already in use"),
+            Self::BadRoute => write!(f, "that routing would loop back on itself"),
         }
     }
 }
@@ -413,9 +452,14 @@ impl Action {
                 SetTempo(std::mem::replace(&mut p.bpm, bpm))
             }
             SetReference(path) => SetReference(std::mem::replace(&mut p.reference, path)),
-            InsertTrack { index, track } => {
+            InsertTrack { index, mut track } => {
                 if index > p.tracks.len() {
                     return Err(ActionError::OutOfRange);
+                }
+                // A new track (or one whose id is taken) gets a fresh id; the
+                // inverse keeps it, so undo and redo agree.
+                if track.id == 0 || p.track_index(track.id).is_some() {
+                    track.id = p.new_track_id();
                 }
                 p.tracks.insert(index, track);
                 RemoveTrack { index }
@@ -666,6 +710,52 @@ impl Action {
                     clip: std::mem::replace(slot, clip),
                 }
             }
+            SetRouting {
+                track: ti,
+                output,
+                sends,
+            } => {
+                if !sends
+                    .iter()
+                    .all(|s| s.level.is_finite() && (0.0..=2.0).contains(&s.level))
+                {
+                    return Err(ActionError::BadRoute);
+                }
+                let t = track(p, ti)?;
+                let old_output = std::mem::replace(&mut t.output, output);
+                let old_sends = std::mem::replace(&mut t.sends, sends);
+                if p.route_order().is_none() {
+                    let t = &mut p.tracks[ti];
+                    t.output = old_output;
+                    t.sends = old_sends;
+                    return Err(ActionError::BadRoute);
+                }
+                SetRouting {
+                    track: ti,
+                    output: old_output,
+                    sends: old_sends,
+                }
+            }
+            SetSidechain {
+                track: ti,
+                device,
+                source,
+            } => {
+                let slot = track(p, ti)?
+                    .devices
+                    .get_mut(device)
+                    .ok_or(ActionError::OutOfRange)?;
+                let old = std::mem::replace(&mut slot.sidechain, source);
+                if p.route_order().is_none() {
+                    p.tracks[ti].devices[device].sidechain = old;
+                    return Err(ActionError::BadRoute);
+                }
+                SetSidechain {
+                    track: ti,
+                    device,
+                    source: old,
+                }
+            }
             Batch(actions) => {
                 let mut inverses = Vec::with_capacity(actions.len());
                 for action in actions {
@@ -699,6 +789,8 @@ pub struct History {
     revision: u64,
     /// Device uids below this were handed out, including any only in undo history.
     next_uid: u64,
+    /// The gesture whose edits are folding into the top undo step, if any.
+    gesture: Option<u64>,
 }
 
 impl History {
@@ -763,12 +855,35 @@ impl History {
 
     /// Applies an edit, makes it undoable and clears the redo stack.
     pub fn apply(&mut self, action: Action) -> Result<(), ActionError> {
+        self.gesture = None;
         let inverse = action.apply(&mut self.project)?;
         self.undo.push(inverse);
         self.redo.clear();
         self.dirty = true;
         self.revision += 1;
         Ok(())
+    }
+
+    /// Applies one edit of a continuous gesture (a fader drag) named `gesture`:
+    /// the first makes an undo step, later ones with the same `gesture` fold
+    /// into it, so undo returns to where the gesture began. Every edit of one
+    /// gesture must change the same thing (one track's props, say).
+    pub fn apply_gesture(&mut self, action: Action, gesture: u64) -> Result<(), ActionError> {
+        if self.gesture != Some(gesture) || self.undo.is_empty() {
+            self.apply(action)?;
+            self.gesture = Some(gesture);
+            return Ok(());
+        }
+        action.apply(&mut self.project)?;
+        self.redo.clear();
+        self.dirty = true;
+        self.revision += 1;
+        Ok(())
+    }
+
+    /// Ends any gesture, so the next `apply_gesture` starts a new undo step.
+    pub fn end_gesture(&mut self) {
+        self.gesture = None;
     }
 
     /// Returns false when there is nothing to undo.
@@ -781,6 +896,7 @@ impl History {
     }
 
     fn step(&mut self, forward: bool) -> bool {
+        self.gesture = None;
         let (from, to) = if forward {
             (&mut self.redo, &mut self.undo)
         } else {
@@ -818,11 +934,25 @@ impl History {
     /// Reads a project written by `save`, with empty undo history.
     pub fn load(path: &Path) -> Result<Self, ProjectError> {
         let bytes = fs::read(path).map_err(ProjectError::Io)?;
-        let file: ProjectFile = serde_json::from_slice(&bytes).map_err(ProjectError::Format)?;
+        let mut file: ProjectFile = serde_json::from_slice(&bytes).map_err(ProjectError::Format)?;
         if file.version != FORMAT_VERSION {
             return Err(ProjectError::Version(file.version));
         }
+        // Projects from before routing have no track ids: number them.
+        let first = file.project.new_track_id();
+        let unnumbered = file.project.tracks.iter_mut().filter(|t| t.id == 0);
+        for (id, t) in (first..).zip(unnumbered) {
+            t.id = id;
+        }
         let p = &file.project;
+        let mut track_ids: Vec<u64> = p.tracks.iter().map(|t| t.id).collect();
+        track_ids.sort_unstable();
+        let routable = track_ids.windows(2).all(|w| w[0] != w[1])
+            && p.route_order().is_some()
+            && p.tracks
+                .iter()
+                .flat_map(|t| &t.sends)
+                .all(|s| s.level.is_finite() && (0.0..=2.0).contains(&s.level));
         let finite = p
             .tracks
             .iter()
@@ -860,6 +990,7 @@ impl History {
             || !finite
             || !unique
             || !musical
+            || !routable
         {
             return Err(ProjectError::Invalid);
         }
@@ -1125,6 +1256,7 @@ mod tests {
             id: "aumu:dls :appl".into(),
             name: "DLSMusicDevice".into(),
             state: Vec::new(),
+            sidechain: None,
         };
         h.apply(Action::InsertDevice {
             track: 0,
@@ -1182,6 +1314,7 @@ mod tests {
                 id: (*id).into(),
                 name: (*id).into(),
                 state: Vec::new(),
+                sidechain: None,
             };
             h.apply(Action::InsertDevice {
                 track: 0,
@@ -1377,6 +1510,49 @@ mod tests {
             assert!(h.redo());
             assert_eq!(h.project(), want);
         }
+    }
+
+    #[test]
+    fn a_gesture_folds_into_one_undo_step() {
+        let mut h = History::default();
+        h.apply(Action::InsertTrack {
+            index: 0,
+            track: Track::new("A"),
+        })
+        .unwrap();
+        let start = h.project().clone();
+        let props = |gain| TrackProps {
+            gain,
+            ..TrackProps::of(&start.tracks[0])
+        };
+        for g in [0.9, 0.7, 0.5] {
+            h.apply_gesture(
+                Action::SetTrackProps {
+                    index: 0,
+                    props: props(g),
+                },
+                7,
+            )
+            .unwrap();
+        }
+        assert_eq!(h.project().tracks[0].gain, 0.5);
+        h.end_gesture();
+        h.apply_gesture(
+            Action::SetTrackProps {
+                index: 0,
+                props: props(0.2),
+            },
+            7,
+        )
+        .unwrap();
+        assert!(h.undo());
+        assert_eq!(
+            h.project().tracks[0].gain,
+            0.5,
+            "a new gesture, its own step"
+        );
+        assert!(h.undo());
+        assert_eq!(h.project(), &start, "the first gesture undoes as one");
     }
 
     #[test]

@@ -213,6 +213,63 @@ pub(crate) fn show(
             }
             title_end = edit.min.x;
         }
+        // Built-in effects take a sidechain key: click KEY to step through tracks.
+        let project = inputs.history.project();
+        let dev = project.tracks.get(track).and_then(|t| t.devices.get(di));
+        let keyed = dev
+            .filter(|d| d.format == daw_project::PluginFormat::Builtin && device.sampler.is_none());
+        if let Some(d) = keyed {
+            let source =
+                d.sidechain
+                    .and_then(|id| project.track_index(id))
+                    .map_or("OFF".to_string(), |j| {
+                        project.tracks[j]
+                            .name
+                            .chars()
+                            .take(6)
+                            .collect::<String>()
+                            .to_uppercase()
+                    });
+            let key = p.text(
+                Pos2::new(title_end - 0.75 * u, top),
+                Align2::RIGHT_CENTER,
+                format!("KEY {source}"),
+                m.mono(0.625),
+                if d.sidechain.is_some() {
+                    t.accent_cyan
+                } else {
+                    t.faint
+                },
+            );
+            let resp = ui.interact(
+                key.expand(0.25 * u),
+                ui.scope_id().with(("key-device", di)),
+                Sense::click(),
+            );
+            if resp.hovered() {
+                p.hline(key.x_range(), m.snap(key.max.y), m.hair(t.muted));
+            }
+            if resp.clicked() && !was_open {
+                let choices: Vec<Option<u64>> = std::iter::once(None)
+                    .chain(
+                        project
+                            .tracks
+                            .iter()
+                            .enumerate()
+                            .filter(|&(j, _)| j != track)
+                            .map(|(_, t)| Some(t.id)),
+                    )
+                    .collect();
+                let now = choices.iter().position(|&c| c == d.sidechain).unwrap_or(0);
+                // Sources that would loop are refused; the next click moves on.
+                ws.edit(Action::SetSidechain {
+                    track,
+                    device: di,
+                    source: choices[(now + 1) % choices.len()],
+                });
+            }
+            title_end = key.min.x;
+        }
         let title = Rect::from_x_y_ranges(
             module.min.x..=title_end - 0.5 * u,
             module.min.y..=top + 0.75 * u,
@@ -259,10 +316,17 @@ pub(crate) fn show(
             let area = Rect::from_min_size(origin, cell);
             let id = ui.scope_id().with(("dial", di, param.id));
             // Right-click a dial to automate it on the playlist.
-            let right = ui.input(|i| {
-                i.pointer.secondary_clicked()
-                    && i.pointer.interact_pos().is_some_and(|p| area.contains(p))
-            });
+            // The sampler only automates attack (4), release (5) and gain (7); its
+            // other dials reshape zones on the main thread.
+            let automatable = device.sampler.is_none() || [4, 5, 7].contains(&param.id);
+            let clip = ui.clip_rect();
+            let right = automatable
+                && ui.input(|i| {
+                    i.pointer.secondary_clicked()
+                        && i.pointer
+                            .interact_pos()
+                            .is_some_and(|p| area.contains(p) && clip.contains(p))
+                });
             let uid = inputs
                 .history
                 .project()
@@ -530,7 +594,7 @@ fn sampler_panel(
 }
 
 /// A 270° arc dial: drag up or down to change. Returns the new value while dragged.
-fn dial(
+pub(crate) fn dial(
     ui: &egui::Ui,
     p: &egui::Painter,
     m: &Metrics,

@@ -1738,7 +1738,16 @@ fn loop_range(project: &daw_project::Project, playback: Playback) -> Option<(u64
         Playback::Pattern(id) => project
             .pattern(id)
             .map(|p| (0, project.samples_at(p.length).max(1))),
-        Playback::Song => None,
+        // The song loops its region when the loop is on.
+        Playback::Song => project
+            .loop_region
+            .filter(|_| project.loop_on)
+            .map(|(a, b)| {
+                (
+                    project.samples_at(a),
+                    project.samples_at(b).max(project.samples_at(a) + 1),
+                )
+            }),
     }
 }
 

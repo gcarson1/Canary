@@ -536,12 +536,51 @@ pub(crate) fn show(
     p.hline(r.x_range(), m.snap(ruler.max.y), m.hair(t.line));
     p.vline(m.snap(ruler.min.x), r.y_range(), m.hair(t.line));
     let seek = ui.interact(ruler, ui.scope_id().with("ruler"), Sense::click_and_drag());
-    let alt = ui.input(|i| i.modifiers.alt);
-    if (seek.clicked() || seek.dragged()) && !alt {
+    let (alt, shift) = ui.input(|i| (i.modifiers.alt, i.modifiers.shift));
+    // The loop region: a band on the ruler; Shift-drag the ruler to draw it.
+    let shown = ws.loop_drag.or(project.loop_region);
+    if let Some((a, b)) = shown {
+        let x = |t: u64| v.x_of(lanes, project.samples_at(t) as f64);
+        let band = Rect::from_x_y_ranges(
+            x(a).max(ruler.min.x)..=x(b).min(ruler.max.x),
+            ruler.max.y - 0.25 * u..=ruler.max.y,
+        );
+        if band.width() > 0.0 {
+            let color = if project.loop_on || ws.loop_drag.is_some() {
+                t.accent_amber
+            } else {
+                t.line_2
+            };
+            p.rect_filled(band, 0.0, color);
+        }
+    }
+    if seek.drag_started() && shift {
+        // Where the button went down: a drag only starts after some movement.
+        let origin = ui.input(|i| i.pointer.press_origin());
+        if let Some(pos) = origin.or(seek.interact_pointer_pos()) {
+            let at = project.ticks_at(snap_f(v.sample_at(lanes, pos.x), ws.snap, project) as u64);
+            ws.loop_anchor = Some(at);
+        }
+    }
+    if let (Some(anchor), Some(pos)) = (ws.loop_anchor, seek.interact_pointer_pos()) {
+        let at = project.ticks_at(snap_f(v.sample_at(lanes, pos.x), ws.snap, project) as u64);
+        ws.loop_drag = (at != anchor).then(|| (anchor.min(at), anchor.max(at)));
+    }
+    let mut new_loop = None;
+    if seek.drag_stopped() && ws.loop_anchor.take().is_some() {
+        new_loop = ws.loop_drag.take();
+    }
+    if (seek.clicked() || seek.dragged()) && !alt && ws.loop_anchor.is_none() && !shift {
         if let Some(pos) = seek.interact_pointer_pos() {
             let at = v.sample_at(lanes, pos.x);
             out.push(Request::Seek(snap_f(at, ws.snap, project) as u64));
         }
+    }
+    if let Some(region) = new_loop {
+        ws.edit(Action::SetLoop {
+            region: Some(region),
+            on: true,
+        });
     }
     tempo_markers(ws, ui, p, m, ruler, lanes, project, &seek, alt);
 

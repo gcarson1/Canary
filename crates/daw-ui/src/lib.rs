@@ -291,6 +291,9 @@ pub struct Workspace {
     rack_scroll: f32,
     /// What Cmd+C or Cmd+X took, for Cmd+V.
     clipboard: Option<Clipboard>,
+    /// Where a Shift-drag on the ruler began (ticks), and the region it draws.
+    loop_anchor: Option<u64>,
+    loop_drag: Option<(u64, u64)>,
     /// Points the mixer is scrolled to the left.
     mixer_scroll: f32,
     /// The rack device being dragged to a new slot.
@@ -330,6 +333,8 @@ impl Default for Workspace {
             device_drag: None,
             rack_scroll: 0.0,
             clipboard: None,
+            loop_anchor: None,
+            loop_drag: None,
             mixer_scroll: 0.0,
             file_drag: None,
             held_note: None,
@@ -754,6 +759,16 @@ impl Workspace {
             }
             match (key, mods.command, mods.shift) {
                 (Key::P, false, _) => self.tool = Tool::Draw,
+                // L turns the song's loop on or off (the piano roll uses L itself).
+                (Key::L, false, false) if self.page != Page::PianoRoll => {
+                    let p = inputs.history.project();
+                    if p.loop_region.is_some() {
+                        self.edit(Action::SetLoop {
+                            region: p.loop_region,
+                            on: !p.loop_on,
+                        });
+                    }
+                }
                 (Key::C, false, _) if self.page != Page::PianoRoll => self.tool = Tool::Slice,
                 (Key::L, true, true) => {
                     self.theme = if self.theme == Theme::DARK {

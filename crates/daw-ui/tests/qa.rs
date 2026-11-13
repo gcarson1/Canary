@@ -944,3 +944,30 @@ fn clip_keys_reverse_and_step_the_gain_of_the_selected_clip() {
         .iter()
         .all(|c| !c.reverse));
 }
+
+#[test]
+fn shift_dragging_the_ruler_draws_a_loop_and_l_toggles_it() {
+    let mut h = rig();
+    h.run();
+    // Ruler y 96..124 from x 400; 400 samples per point, a bar is 96 000.
+    h.event(egui::Event::ModifiersChanged(egui::Modifiers::SHIFT));
+    let from = egui::Pos2::new(400.0 + 240.0, 110.0); // bar 2
+    h.hover_at(from);
+    h.run();
+    press(&mut h, from, true);
+    h.run();
+    for step in 1..=12 {
+        h.hover_at(from + Vec2::new(40.0 * step as f32, 0.0));
+        h.run();
+    }
+    press(&mut h, from + Vec2::new(480.0, 0.0), false); // bar 4
+    h.run();
+    h.event(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
+    h.run();
+    let p = h.state().history.project();
+    assert_eq!(p.loop_region, Some((4 * PPQ, 12 * PPQ)));
+    assert!(p.loop_on);
+    h.key_press(egui::Key::L);
+    h.run();
+    assert!(!h.state().history.project().loop_on);
+}

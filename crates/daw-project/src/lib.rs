@@ -45,6 +45,12 @@ pub struct Project {
     /// Time signatures by rising bar, the first at bar 0; empty means 4/4.
     #[serde(default)]
     pub meters: Vec<MeterChange>,
+    /// The song's loop (cycle) region in ticks, `start < end`, and whether the
+    /// song plays it over and over.
+    #[serde(default)]
+    pub loop_region: Option<(u64, u64)>,
+    #[serde(default)]
+    pub loop_on: bool,
 }
 
 /// An ARA plug-in's document state as it wrote it.
@@ -69,6 +75,8 @@ impl Default for Project {
             patterns: Vec::new(),
             tempos: Vec::new(),
             meters: Vec::new(),
+            loop_region: None,
+            loop_on: false,
         }
     }
 }
@@ -253,6 +261,11 @@ fn unity() -> f32 {
     1.0
 }
 
+/// A loop region runs forward and stays in range.
+fn loop_ok(region: Option<(u64, u64)>) -> bool {
+    region.is_none_or(|(a, b)| a < b && b <= MAX_TICKS)
+}
+
 impl ClipRef {
     /// Clip gain is finite and within 0..=4 (+12 dB).
     pub fn gain_ok(&self) -> bool {
@@ -311,6 +324,11 @@ pub enum Action {
     SetTempoMap(Vec<TempoChange>),
     /// Replaces the time signatures.
     SetMeters(Vec<MeterChange>),
+    /// Sets the song's loop region (ticks) and whether it loops.
+    SetLoop {
+        region: Option<(u64, u64)>,
+        on: bool,
+    },
     InsertPattern {
         index: usize,
         pattern: Pattern,
@@ -608,6 +626,17 @@ impl Action {
                     return Err(ActionError::BadTempo);
                 }
                 SetTempoMap(std::mem::replace(&mut p.tempos, changes))
+            }
+            SetLoop { region, on } => {
+                if !loop_ok(region) {
+                    return Err(ActionError::BadValue);
+                }
+                let old = (p.loop_region, p.loop_on);
+                (p.loop_region, p.loop_on) = (region, on && region.is_some());
+                SetLoop {
+                    region: old.0,
+                    on: old.1,
+                }
             }
             SetMeters(changes) => {
                 if !valid_meters(&changes) {
@@ -1022,7 +1051,8 @@ impl History {
         let mut ids: Vec<u64> = p.patterns.iter().map(|q| q.id).collect();
         ids.sort_unstable();
         unique &= ids.windows(2).all(|w| w[0] != w[1]);
-        let musical = p.tracks.iter().flat_map(|t| &t.clips).all(ClipRef::gain_ok)
+        let musical = loop_ok(p.loop_region)
+            && p.tracks.iter().flat_map(|t| &t.clips).all(ClipRef::gain_ok)
             && valid_tempos(&p.tempos)
             && valid_meters(&p.meters)
             && p.patterns.iter().all(Pattern::is_valid)

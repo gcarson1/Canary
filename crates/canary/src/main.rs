@@ -748,7 +748,7 @@ impl App {
             .map_err(|e| e.to_string())
             .and_then(|b| daw_project::smf::read(&b).map_err(|e| e.to_string()));
         let notes = match imported {
-            Ok(i) if !i.notes.is_empty() => i.notes,
+            Ok(notes) if !notes.is_empty() => notes,
             Ok(_) => return self.error(format!("{name}: no notes")),
             Err(e) => return self.error(format!("{name}: {e}")),
         };
@@ -838,8 +838,9 @@ impl App {
         if let Some(take) = self.midi_take.take() {
             let _ = self.engine.commands.push(Command::Stop);
             let project = self.history.project();
-            let Some(t) = project.tracks.get(take.track) else {
-                return self.error("take's track was removed".into());
+            let t = project.tracks.get(take.track);
+            let Some(t) = t.filter(|_| project.tracks.len() == take.tracks) else {
+                return self.error("take discarded: tracks were added or removed".into());
             };
             if project.pattern(take.pattern).is_none() {
                 return self.error("take's pattern was removed".into());
@@ -862,6 +863,10 @@ impl App {
         else {
             return self.error("select a track to record MIDI".into());
         };
+        // Takes wrap at the pattern's length, which only matches a looping pattern.
+        if self.ws.playback(self.history.project()) == Playback::Song {
+            return self.error("switch to PAT to record MIDI".into());
+        }
         let (id, create) = self.ws.pattern_for_edit(self.history.project());
         if let Some(create) = create {
             if let Err(e) = self.history.apply(create) {
@@ -870,7 +875,8 @@ impl App {
         }
         let length = self.history.project().pattern(id).map_or(1, |p| p.length);
         while self.engine.midi_log.pop().is_ok() {} // nothing from before the take
-        self.midi_take = Some(take::MidiTake::new(track, id, length));
+        let tracks = self.history.project().tracks.len();
+        self.midi_take = Some(take::MidiTake::new(track, tracks, id, length));
         if self.ws.count_in {
             // One bar of the meter at the playhead, at the tempo there.
             let project = self.history.project();
@@ -887,7 +893,11 @@ impl App {
     }
 
     fn toggle_record(&mut self) {
-        if self.midi_take.is_some() || self.ws.page != daw_ui::Page::Playlist {
+        let audio_take = self
+            .recorder
+            .as_ref()
+            .is_some_and(|(r, _)| r.is_recording());
+        if self.midi_take.is_some() || (self.ws.page != daw_ui::Page::Playlist && !audio_take) {
             return self.toggle_midi_take();
         }
         if self.recorder.is_none() {

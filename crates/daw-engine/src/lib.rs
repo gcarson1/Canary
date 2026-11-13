@@ -228,10 +228,20 @@ impl AudioEngine {
                     if rolling {
                         // Heard against the timeline one callback earlier.
                         let back = total as u64;
+                        let looping = self.transport.loop_range();
                         for e in now.iter() {
                             let at = self.transport.playhead() + u64::from(e.sample_offset);
+                            // Just after a loop wrap, what was heard is the end of the pass.
+                            let heard = match looping {
+                                Some((start, end))
+                                    if at >= start && at - start < back && end - start > back =>
+                                {
+                                    end - (back - (at - start))
+                                }
+                                _ => at.saturating_sub(back),
+                            };
                             let _ = self.midi_log.push(SeqEvent {
-                                at: at.saturating_sub(back),
+                                at: heard,
                                 data: e.data,
                             });
                         }

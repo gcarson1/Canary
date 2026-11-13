@@ -7,6 +7,9 @@ use daw_project::{Note, Project};
 pub struct MidiTake {
     pub track: usize,
     pub pattern: u64,
+    /// Tracks in the project when the take began: if that changes, `track` may
+    /// point at another track, so the take is not saved.
+    pub tracks: usize,
     /// Pattern length in ticks; positions wrap at it, as the loop does.
     length: u64,
     /// Sounding notes by channel and key: start tick and velocity.
@@ -15,9 +18,10 @@ pub struct MidiTake {
 }
 
 impl MidiTake {
-    pub fn new(track: usize, pattern: u64, length: u64) -> Self {
+    pub fn new(track: usize, tracks: usize, pattern: u64, length: u64) -> Self {
         Self {
             track,
+            tracks,
             pattern,
             length: length.max(1),
             open: Vec::new(),
@@ -75,7 +79,7 @@ mod tests {
         // 120 BPM at 48 kHz: 25 samples per tick. A one-bar pattern.
         let project = Project::default();
         let bar = 4 * PPQ;
-        let mut take = MidiTake::new(0, 1, bar);
+        let mut take = MidiTake::new(0, 1, 1, bar);
         let at = |tick: u64| tick * 25;
         let ev = |tick, status, key, vel| SeqEvent {
             at: at(tick),

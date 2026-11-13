@@ -92,9 +92,12 @@ impl Project {
         samples.round() as u64
     }
 
-    /// The tick at timeline sample `sample` (rounded down).
+    /// The last tick whose `samples_at` is at or before `sample`, so the two
+    /// round-trip exactly.
     pub fn ticks_at(&self, sample: u64) -> u64 {
-        let target = sample as f64;
+        // samples_at rounds to the nearest sample: tick t maps at or before
+        // `sample` while its exact position is under `sample + 0.5`.
+        let target = sample as f64 + 0.5 - 1e-9;
         let mut at = 0.0;
         let mut seg = self.segments().peekable();
         while let Some((start, bpm)) = seg.next() {
@@ -103,7 +106,7 @@ impl Project {
                 Some(&(next, _)) if at + (next - start) as f64 * per <= target => {
                     at += (next - start) as f64 * per;
                 }
-                _ => return start + ((target - at) / per + 1e-6).floor() as u64,
+                _ => return start + ((target - at) / per).floor() as u64,
             }
         }
         0
@@ -230,6 +233,14 @@ mod tests {
             assert_eq!(p.ticks_at(p.samples_at(t)), t, "tick {t}");
         }
         assert_eq!(p.bpm_at(0), 120.0);
+        // At 124 BPM a tick is 24.19 samples, so positions round both ways.
+        let odd = Project {
+            bpm: 124.0,
+            ..project()
+        };
+        for t in 0..8_000 {
+            assert_eq!(odd.ticks_at(odd.samples_at(t)), t, "tick {t}");
+        }
         assert_eq!(p.bpm_at(4 * PPQ), 60.0);
     }
 

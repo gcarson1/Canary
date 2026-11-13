@@ -23,14 +23,6 @@ impl fmt::Display for SmfError {
 
 impl std::error::Error for SmfError {}
 
-/// A MIDI file's notes, every track and channel merged, at `PPQ`.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Imported {
-    pub notes: Vec<Note>,
-    /// The first tempo in the file, if it sets one.
-    pub bpm: Option<f64>,
-}
-
 struct Reader<'a> {
     bytes: &'a [u8],
     pos: usize,
@@ -72,9 +64,13 @@ impl Reader<'_> {
     }
 }
 
-/// Reads a format 0 or 1 file. Notes still held at the end of a track end there;
-/// notes past `MAX_TICKS` are dropped.
-pub fn read(bytes: &[u8]) -> Result<Imported, SmfError> {
+/// Most notes one file may hold down at once; more is a broken or hostile file
+/// (each note-off searches them).
+const MAX_HELD: usize = 4096;
+
+/// Reads a format 0 or 1 file: every track and channel merged, at `PPQ`. Notes
+/// still held at the end of a track end there; notes past `MAX_TICKS` are dropped.
+pub fn read(bytes: &[u8]) -> Result<Vec<Note>, SmfError> {
     let mut r = Reader { bytes, pos: 0 };
     if r.take(4)? != b"MThd" {
         return Err(SmfError::Malformed);
@@ -89,10 +85,13 @@ pub fn read(bytes: &[u8]) -> Result<Imported, SmfError> {
         return Err(SmfError::Malformed);
     }
     r.pos = header_end;
-    let scale = |t: u64| t * PPQ / u64::from(division);
+    let scale = |t: u64| t.saturating_mul(PPQ) / u64::from(division);
     let mut notes = Vec::new();
-    let mut bpm = None;
     for _ in 0..tracks {
+        // A header may count more tracks than the file holds.
+        if r.pos >= r.bytes.len() {
+            break;
+        }
         // Skip chunks that are not tracks, as the spec asks.
         let (id, len) = loop {
             let id: [u8; 4] = r.take(4)?.try_into().expect("four bytes");
@@ -126,14 +125,7 @@ pub fn read(bytes: &[u8]) -> Result<Imported, SmfError> {
                 0xff => {
                     let kind = t.u8()?;
                     let len = t.vlq()? as usize;
-                    let data = t.take(len)?;
-                    if kind == 0x51 && len == 3 && bpm.is_none() {
-                        let us =
-                            u32::from(data[0]) << 16 | u32::from(data[1]) << 8 | u32::from(data[2]);
-                        if us > 0 {
-                            bpm = Some(60_000_000.0 / f64::from(us));
-                        }
-                    }
+                    t.take(len)?;
                     if kind == 0x2f {
                         break;
                     }
@@ -153,6 +145,9 @@ pub fn read(bytes: &[u8]) -> Result<Imported, SmfError> {
                     };
                     let key = (b & 0x0f, a);
                     if kind == 0x90 && v > 0 {
+                        if open.len() >= MAX_HELD {
+                            return Err(SmfError::Malformed);
+                        }
                         open.push((key, tick, v));
                     } else if kind == 0x80 || kind == 0x90 {
                         if let Some(i) = open.iter().position(|o| o.0 == key) {
@@ -181,10 +176,7 @@ pub fn read(bytes: &[u8]) -> Result<Imported, SmfError> {
         })
         .filter(Note::is_valid)
         .collect();
-    Ok(Imported {
-        notes: crate::sorted(notes),
-        bpm,
-    })
+    Ok(crate::sorted(notes))
 }
 
 fn vlq(out: &mut Vec<u8>, mut v: u32) {
@@ -212,7 +204,10 @@ pub fn write(notes: &[Note], bpm: f64) -> Vec<u8> {
     }
     events.sort_by_key(|e| (e.0, e.1[0]));
     let mut track = Vec::new();
-    let us = (60_000_000.0 / bpm.clamp(1.0, 1000.0)).round() as u32;
+    // 24 bits of microseconds per beat: 3.58 BPM is the slowest a file can say.
+    let us = (60_000_000.0 / bpm.clamp(1.0, 1000.0))
+        .round()
+        .min(f64::from(0xff_ffffu32)) as u32;
     track.extend([0x00, 0xff, 0x51, 0x03]);
     track.extend(&us.to_be_bytes()[1..]);
     let mut last = 0u64;
@@ -255,9 +250,7 @@ mod tests {
     #[test]
     fn write_then_read_round_trips() {
         let notes = vec![n(0, STEP, 60, 100), n(0, PPQ, 64, 80), n(PPQ, STEP, 60, 1)];
-        let read = read(&write(&notes, 128.0)).unwrap();
-        assert_eq!(read.notes, crate::sorted(notes));
-        assert!((read.bpm.unwrap() - 128.0).abs() < 0.01);
+        assert_eq!(read(&write(&notes, 128.0)).unwrap(), crate::sorted(notes));
     }
 
     #[test]
@@ -283,9 +276,8 @@ mod tests {
         f.extend((notes.len() as u32).to_be_bytes());
         f.extend(notes);
         let read = read(&f).unwrap();
-        assert_eq!(read.bpm, Some(120.0));
         assert_eq!(
-            read.notes,
+            read,
             [n(0, 2 * 480, 60, 90), n(480, (48 + 128) * 10, 62, 70)]
         );
     }

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command as Process;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
-use std::thread;
+use std::thread::{self, JoinHandle};
 
 use daw_engine::{recorder, RecordInput, Recorder};
 use daw_ui::ExportFormat;
@@ -14,10 +14,12 @@ use daw_ui::ExportFormat;
 /// Seconds past the song's end, so reverb and delay tails ring out.
 pub const TAIL_SECONDS: u64 = 2;
 
-/// One file being written: where, and its recorder.
+/// One file being written: where, its recorder, and how many frames its output
+/// lags the dry signal (plugin delay), trimmed off the front when it is done.
 pub struct Output {
     pub path: PathBuf,
     pub recorder: Recorder,
+    pub skip: u64,
 }
 
 pub struct Export {
@@ -29,9 +31,14 @@ pub struct Export {
     pub stems: Vec<(usize, Output)>,
     /// Recorder inputs for the next plan to tap: `None` is the master.
     pub taps: Vec<(Option<usize>, RecordInput)>,
-    /// Set once the transport has been seen rolling from the start.
+    /// Play has been sent, once the plan carrying the taps was delivered.
+    pub play_sent: bool,
+    /// The transport has been seen rolling since Play was sent.
     pub started: bool,
 }
+
+/// A background format conversion; it returns the files it could not convert.
+pub type Conversion = JoinHandle<Vec<String>>;
 
 fn clean(name: &str) -> String {
     name.replace(['/', ':'], "-")
@@ -39,7 +46,7 @@ fn clean(name: &str) -> String {
 
 impl Export {
     /// Starts writers for the mix, named `name`, and for each `(index, name)`
-    /// stem, into `dir`. Fails if a file cannot be created.
+    /// stem, into `dir`. Fails, leaving no files, if one cannot be created.
     pub fn start(
         dir: &Path,
         name: &str,
@@ -50,24 +57,37 @@ impl Export {
         playhead: Arc<AtomicU64>,
     ) -> Result<Self, String> {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-        let make = |file: String| -> Result<(Output, RecordInput), String> {
+        let mut made: Vec<(Output, RecordInput)> = Vec::new();
+        let files = std::iter::once(format!("{}.wav", clean(name))).chain(
+            stems
+                .iter()
+                // The index keeps two tracks with one name from sharing a file.
+                .map(|(i, stem)| format!("{} - {:02} {}.wav", clean(name), i + 1, clean(stem))),
+        );
+        for file in files {
             let path = dir.join(file);
             let (mut rec, input) = recorder(2, sample_rate, playhead.clone());
-            rec.start(&path)
-                .map_err(|e| format!("{}: {e}", path.display()))?;
-            Ok((
+            if let Err(e) = rec.start(&path) {
+                for (mut out, _) in made {
+                    let _ = out.recorder.stop();
+                    let _ = std::fs::remove_file(&out.path);
+                }
+                return Err(format!("{}: {e}", path.display()));
+            }
+            made.push((
                 Output {
                     path,
                     recorder: rec,
+                    skip: 0,
                 },
                 input,
-            ))
-        };
-        let (master, input) = make(format!("{}.wav", clean(name)))?;
+            ));
+        }
+        let mut made = made.into_iter();
+        let (master, input) = made.next().expect("the master is always made");
         let mut taps = vec![(None, input)];
         let mut outputs = Vec::new();
-        for (i, stem) in stems {
-            let (out, input) = make(format!("{} - {}.wav", clean(name), clean(stem)))?;
+        for ((out, input), (i, _)) in made.zip(stems) {
             taps.push((Some(*i), input));
             outputs.push((*i, out));
         }
@@ -77,52 +97,110 @@ impl Export {
             master,
             stems: outputs,
             taps,
+            play_sent: false,
             started: false,
         })
     }
 
-    /// Stops every writer and converts the files to the chosen format in the
-    /// background. Returns the master's path, or the first error.
-    pub fn finish(mut self) -> Result<PathBuf, String> {
+    /// The latest sample any output must record to, plugin delay included.
+    pub fn record_end(&self) -> u64 {
+        let skip = self.outputs().map(|o| o.skip).max().unwrap_or(0);
+        self.end + skip
+    }
+
+    fn outputs(&self) -> impl Iterator<Item = &Output> {
+        std::iter::once(&self.master).chain(self.stems.iter().map(|s| &s.1))
+    }
+
+    fn outputs_mut(&mut self) -> impl Iterator<Item = &mut Output> {
+        std::iter::once(&mut self.master).chain(self.stems.iter_mut().map(|s| &mut s.1))
+    }
+
+    /// Stops every writer, trims each file's plugin delay, and starts converting
+    /// to the chosen format. Returns the master's final path and the conversion
+    /// job (which reports failures), or the first error.
+    pub fn finish(mut self) -> Result<(PathBuf, Option<Conversion>), String> {
         let mut paths = Vec::new();
-        for out in std::iter::once(&mut self.master).chain(self.stems.iter_mut().map(|s| &mut s.1))
-        {
-            out.recorder
-                .stop()
-                .map_err(|e| format!("{}: {e}", out.path.display()))?;
+        let mut error = None;
+        for out in self.outputs_mut() {
+            match out.recorder.stop() {
+                Ok(take) if take.dropped_frames > 0 => {
+                    error.get_or_insert(format!(
+                        "{}: the disk fell behind and {} frames were lost",
+                        out.path.display(),
+                        take.dropped_frames
+                    ));
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    error.get_or_insert(format!("{}: {e}", out.path.display()));
+                }
+            }
+            if out.skip > 0 && error.is_none() {
+                if let Err(e) = trim_front(&out.path, out.skip) {
+                    error.get_or_insert(format!("{}: {e}", out.path.display()));
+                }
+            }
             paths.push(out.path.clone());
         }
-        let master = self.master.path.clone();
-        if let Some((args, ext)) = afconvert_args(self.format) {
-            // Converting can take a while; the WAVs are already safe on disk.
-            thread::spawn(move || {
-                for wav in paths {
-                    let out = wav.with_extension(ext);
-                    let status = Process::new("/usr/bin/afconvert")
-                        .args(args)
-                        .arg(&wav)
-                        .arg(&out)
-                        .status();
-                    if status.is_ok_and(|s| s.success()) {
-                        let _ = std::fs::remove_file(&wav);
-                    } else {
-                        eprintln!("afconvert failed for {}", wav.display());
-                    }
-                }
-            });
-            return Ok(master.with_extension(ext));
+        if let Some(e) = error {
+            return Err(e);
         }
-        Ok(master)
+        let master = self.master.path.clone();
+        let Some((args, ext)) = afconvert_args(self.format) else {
+            return Ok((master, None));
+        };
+        let job = thread::spawn(move || {
+            let mut failures = Vec::new();
+            for wav in paths {
+                let out = wav.with_extension(ext);
+                let status = Process::new("/usr/bin/afconvert")
+                    .args(args)
+                    .arg(&wav)
+                    .arg(&out)
+                    .status();
+                if status.is_ok_and(|s| s.success()) {
+                    let _ = std::fs::remove_file(&wav);
+                } else {
+                    // The WAV stays, so nothing is lost.
+                    failures.push(format!("could not convert {}", wav.display()));
+                }
+            }
+            failures
+        });
+        Ok((master.with_extension(ext), Some(job)))
     }
 
     /// Stops the writers and deletes the partial files.
     pub fn abort(mut self) {
-        for out in std::iter::once(&mut self.master).chain(self.stems.iter_mut().map(|s| &mut s.1))
-        {
+        for out in self.outputs_mut() {
             let _ = out.recorder.stop();
             let _ = std::fs::remove_file(&out.path);
         }
     }
+}
+
+/// Rewrites a stereo float WAV without its first `frames` frames.
+fn trim_front(path: &Path, frames: u64) -> Result<(), String> {
+    let mut reader = hound::WavReader::open(path).map_err(|e| e.to_string())?;
+    let spec = reader.spec();
+    let channels = usize::from(spec.channels.max(1));
+    let samples: Vec<f32> = reader
+        .samples::<f32>()
+        .collect::<Result<_, _>>()
+        .map_err(|e| e.to_string())?;
+    let skip = (frames as usize * channels).min(samples.len());
+    let split: Vec<Vec<f32>> = (0..channels)
+        .map(|c| {
+            samples[skip..]
+                .iter()
+                .skip(c)
+                .step_by(channels)
+                .copied()
+                .collect()
+        })
+        .collect();
+    daw_engine::write_wav(path, &split, spec.sample_rate)
 }
 
 /// `afconvert` options and the file extension for a format other than the
@@ -154,5 +232,24 @@ mod tests {
         assert_eq!(exts.len(), 4);
         assert!(afconvert_args(ExportFormat::Wav32).is_none());
         assert_eq!(clean("a/b:c"), "a-b-c");
+    }
+
+    #[test]
+    fn trimming_drops_the_delay_from_the_front() {
+        let dir = std::env::temp_dir().join(format!("canary-trim-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.wav");
+        let left: Vec<f32> = (0..10).map(|i| i as f32).collect();
+        let right: Vec<f32> = left.iter().map(|x| -x).collect();
+        daw_engine::write_wav(&path, &[left, right], 48_000).unwrap();
+        trim_front(&path, 3).unwrap();
+        let s: Vec<f32> = hound::WavReader::open(&path)
+            .unwrap()
+            .into_samples::<f32>()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(&s[..4], &[3.0, -3.0, 4.0, -4.0]);
+        assert_eq!(s.len(), 14);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

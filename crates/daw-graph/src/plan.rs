@@ -139,6 +139,8 @@ pub struct ExecutionPlan {
     /// (step, index into its `delays`) of every delay, sorted by `Delay::key`.
     delay_order: Vec<(usize, usize)>,
     latency: u32,
+    /// Per step, how far its output lags the dry signal (set by `compensate`).
+    ready: Vec<u32>,
 }
 
 impl ExecutionPlan {
@@ -158,6 +160,7 @@ impl ExecutionPlan {
             updates: Vec::new(),
             delay_order: Vec::new(),
             latency: 0,
+            ready: Vec::new(),
         }
     }
 
@@ -360,6 +363,12 @@ impl ExecutionPlan {
         self.delay_order
             .sort_by_key(|&(i, j)| steps[i].delays[j].key);
         self.latency = ready.last().copied().unwrap_or(0);
+        self.ready = ready;
+    }
+
+    /// How far `step`'s output lags the dry signal, after `compensate`.
+    pub fn step_latency(&self, step: StepId) -> Option<u32> {
+        self.ready.get(step.0).copied()
     }
 
     /// How far the output lags the dry signal after `compensate`, in samples.

@@ -1149,20 +1149,20 @@ mod tests {
         let mut plan = ExecutionPlan::new(64);
         plan.insert(NodeId(1), Box::new(Const));
         let step = plan.add(NodeId(1), vec![], 2).unwrap();
-        assert!(plan.tap(step, bounce_tap(input, 64)));
+        assert!(plan.tap(step, bounce_tap(input, 64, 100)));
         handle.send_plan(Box::new(plan)).unwrap();
         let mut block = vec![0.0; 256];
         audio.process(&mut block, 2); // stopped: nothing written
         handle.commands.push(Command::Play).unwrap();
         assert_no_alloc(|| audio.process(&mut block, 2));
         let take = rec.stop().unwrap();
-        assert_eq!(take.frames, 128);
+        assert_eq!(take.frames, 100, "stops at its end sample");
         let samples: Vec<f32> = hound::WavReader::open(&path)
             .unwrap()
             .into_samples::<f32>()
             .map(Result::unwrap)
             .collect();
-        assert_eq!(samples.len(), 256);
+        assert_eq!(samples.len(), 200);
         assert!(samples.chunks(2).all(|f| f == [0.25, -0.25]));
         std::fs::remove_dir_all(&dir).unwrap();
     }

@@ -120,6 +120,10 @@ struct App {
     midi_take: Option<take::MidiTake>,
     /// A mix export in progress.
     export: Option<export::Export>,
+    /// The monitor mode and A/B reference to put back after an export.
+    export_restore: Option<(MonitorMode, bool)>,
+    /// The last export's format conversion, still running.
+    converting: Option<thread::JoinHandle<Vec<String>>>,
     /// Stretched or pitched clip renders coming back from worker threads.
     stretch_tx: mpsc::Sender<Stretched>,
     stretch_rx: mpsc::Receiver<Stretched>,
@@ -238,6 +242,8 @@ impl App {
             recorder: None,
             midi_take: None,
             export: None,
+            export_restore: None,
+            converting: None,
             stretch_tx,
             stretch_rx,
             title: String::new(),
@@ -664,14 +670,24 @@ impl App {
             .add(master, inputs, 2)
             .expect("sources are earlier steps");
         if let Some(e) = self.export.as_mut() {
+            // Each output lags by its path's plugin delay: record that much
+            // longer, then trim it off the front.
+            plan.compensate();
             for (who, input) in e.taps.drain(..) {
                 let step = match who {
                     None => Some(master_step),
                     Some(i) => out_step.get(i).copied().flatten(),
                 };
-                if let Some(step) = step {
-                    plan.tap(step, daw_engine::bounce_tap(input, MAX_BLOCK));
+                let Some(step) = step else { continue };
+                let skip = u64::from(plan.step_latency(step).unwrap_or(0));
+                let out = match who {
+                    None => Some(&mut e.master),
+                    Some(i) => e.stems.iter_mut().find(|s| s.0 == i).map(|s| &mut s.1),
+                };
+                if let Some(out) = out {
+                    out.skip = skip;
                 }
+                plan.tap(step, daw_engine::bounce_tap(input, MAX_BLOCK, e.end + skip));
             }
         }
         let tracks = &self.history.project().tracks[..count];
@@ -798,6 +814,11 @@ impl App {
             }
         };
         match request {
+            // An export owns the transport: stopping it aborts, the rest wait.
+            Request::Stop if self.export.is_some() => {
+                self.abort_export("EXPORT ABORTED".into(), false)
+            }
+            Request::Play | Request::Seek(_) if self.export.is_some() => {}
             Request::Play => command(self, Command::Play),
             Request::Stop => command(self, Command::Stop),
             Request::Seek(at) => {
@@ -1038,15 +1059,11 @@ impl App {
     /// Starts an export of the song (and with `stems`, of every track), or
     /// aborts the one running.
     fn toggle_export(&mut self, stems: bool) {
-        if let Some(e) = self.export.take() {
-            let _ = self.engine.commands.push(Command::Stop);
-            e.abort();
-            self.built = None;
-            self.ws.status = Some(Status {
-                text: "EXPORT ABORTED".into(),
-                error: false,
-            });
-            return;
+        if self.export.is_some() {
+            return self.abort_export("EXPORT ABORTED".into(), false);
+        }
+        if self.converting.is_some() {
+            return self.error("still converting the last export".into());
         }
         let project = self.history.project();
         let song_end = project.song_end();
@@ -1082,8 +1099,13 @@ impl App {
             Ok(e) => {
                 self.export = Some(e);
                 self.ws.song = true;
+                // The mix as it is, not what the monitor section is listening to.
+                self.export_restore = Some((self.monitor.mode(), self.monitor.reference()));
+                self.monitor.set_mode(MonitorMode::Stereo);
+                self.monitor.set_reference(false);
                 self.built = None; // the next plan carries the taps
-                for c in [Command::Stop, Command::Seek(0), Command::Play] {
+                                   // Play waits until that plan is delivered (tend_export).
+                for c in [Command::Stop, Command::Seek(0)] {
                     let _ = self.engine.commands.push(c);
                 }
             }
@@ -1091,22 +1113,57 @@ impl App {
         }
     }
 
-    /// Ends the export once the song has played through.
+    /// Stops an export, deletes its partial files and puts the monitor back.
+    fn abort_export(&mut self, text: String, error: bool) {
+        if let Some(e) = self.export.take() {
+            let _ = self.engine.commands.push(Command::Stop);
+            e.abort();
+            self.built = None;
+        }
+        self.restore_monitor();
+        self.ws.status = Some(Status { text, error });
+    }
+
+    fn restore_monitor(&mut self) {
+        if let Some((mode, reference)) = self.export_restore.take() {
+            self.monitor.set_mode(mode);
+            self.monitor.set_reference(reference);
+        }
+    }
+
+    /// Starts the export rolling once its plan is in, and ends it once the song
+    /// has played through; reports a finished conversion.
     fn tend_export(&mut self) {
-        let rate = u64::from(self.view.sample_rate);
+        if self.converting.as_ref().is_some_and(|j| j.is_finished()) {
+            let job = self.converting.take().expect("checked");
+            match job.join() {
+                Ok(failures) if failures.is_empty() => {}
+                Ok(failures) => self.error(failures.join("; ")),
+                Err(_) => self.error("conversion thread failed".into()),
+            }
+        }
         let Some(e) = self.export.as_mut() else {
             return;
         };
-        // Rolling from the top: an old playhead from before the seek does not count.
-        if self.view.playing && self.view.playhead < rate {
+        if !e.play_sent {
+            if e.taps.is_empty() && self.queued.is_none() {
+                let _ = self.engine.commands.push(Command::Play);
+                e.play_sent = true;
+            }
+            return;
+        }
+        if self.view.playing {
             e.started = true;
         }
         if !e.started {
             return;
         }
-        let done = self.view.playhead >= e.end || !self.view.playing;
-        if !done {
-            let pct = self.view.playhead * 100 / e.end.max(1);
+        let end = e.record_end();
+        if self.view.playhead < end {
+            if !self.view.playing {
+                return self.abort_export("EXPORT STOPPED EARLY · NOTHING SAVED".into(), true);
+            }
+            let pct = self.view.playhead * 100 / end.max(1);
             self.ws.status = Some(Status {
                 text: format!("EXPORTING {pct}% · EXPORT AGAIN TO ABORT"),
                 error: false,
@@ -1116,8 +1173,10 @@ impl App {
         let e = self.export.take().expect("checked above");
         let _ = self.engine.commands.push(Command::Stop);
         self.built = None;
+        self.restore_monitor();
         match e.finish() {
-            Ok(path) => {
+            Ok((path, job)) => {
+                self.converting = job;
                 self.ws.status = Some(Status {
                     text: format!(
                         "EXPORTED {}",

@@ -8,10 +8,10 @@ use daw_graph::{EffectNode, ParamBank, PolySynthNode};
 
 use crate::{HostError, Hosted, Instance, ParamInfo, PluginInfo};
 
-/// The built-in effects, for the catalog.
 /// The built-in synth's id.
 pub const SYNTH: &str = "canary.synth";
 
+/// The built-in instruments and effects, for the catalog.
 pub fn builtins() -> Vec<PluginInfo> {
     [(crate::sampler::ID, "Sampler"), (SYNTH, "Synth")]
         .iter()

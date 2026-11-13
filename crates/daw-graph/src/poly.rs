@@ -193,9 +193,12 @@ impl PolySynthNode {
         let [status, note, value] = data;
         match (status & 0xF0, value) {
             (0x90, v) if v > 0 => {
-                // A free voice, else the oldest.
+                // A free voice, else the oldest released one, else the oldest.
                 let i = (0..VOICES)
-                    .min_by_key(|&i| (!self.voices[i].is_free(), self.voices[i].age))
+                    .min_by_key(|&i| {
+                        let v = &self.voices[i];
+                        (!v.is_free(), v.held, v.age)
+                    })
                     .expect("VOICES > 0");
                 let target = 440.0 * 2f32.powf((f32::from(note & 0x7F) - 69.0) / 12.0);
                 let glide = self.p(GLIDE) > 0.0 && self.last_freq > 0.0;

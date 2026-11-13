@@ -177,7 +177,11 @@ struct Comb {
 impl Comb {
     fn process(&mut self, x: f32, feedback: f32, damp: f32) -> f32 {
         let y = self.buf[self.pos];
+        // Flush the decaying tail to zero before it turns denormal (slow on x86).
         self.store = y * (1.0 - damp) + self.store * damp;
+        if self.store.abs() < 1e-15 {
+            self.store = 0.0;
+        }
         self.buf[self.pos] = x + self.store * feedback;
         self.pos = (self.pos + 1) % self.buf.len();
         y
@@ -523,6 +527,9 @@ impl Effect for Gate {
         for (l, r) in left.iter_mut().zip(right.iter_mut()) {
             let x = l.abs().max(r.abs());
             self.level = x.max(self.level * detect);
+            if self.level < 1e-15 {
+                self.level = 0.0;
+            }
             let open = gain_to_db(self.level) > self.threshold;
             let (target, coef) = if open {
                 (1.0, self.attack)

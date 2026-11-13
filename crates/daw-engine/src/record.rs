@@ -108,24 +108,28 @@ impl RecordInput {
 pub struct BounceTap {
     input: RecordInput,
     scratch: Box<[f32]>,
+    end: u64,
 }
 
 /// A tap for `ExecutionPlan::tap` writing into `input` (a 2-channel recorder's),
-/// for blocks up to `max_block` frames.
-pub fn bounce_tap(input: RecordInput, max_block: usize) -> Box<dyn daw_graph::Tap> {
+/// for blocks up to `max_block` frames, up to timeline sample `end` (exclusive),
+/// so the file's length does not depend on when the transport is stopped.
+pub fn bounce_tap(input: RecordInput, max_block: usize, end: u64) -> Box<dyn daw_graph::Tap> {
     Box::new(BounceTap {
         input,
         scratch: vec![0.0; max_block * 2].into_boxed_slice(),
+        end,
     })
 }
 
 impl daw_graph::Tap for BounceTap {
     /// Writes only while the transport rolls.
     fn write(&mut self, left: &[f32], right: &[f32], context: &daw_core::ProcessContext) {
-        if !context.playing {
+        if !context.playing || context.playhead >= self.end {
             return;
         }
         let n = left.len().min(right.len()).min(self.scratch.len() / 2);
+        let n = n.min((self.end - context.playhead) as usize);
         for i in 0..n {
             self.scratch[2 * i] = left[i];
             self.scratch[2 * i + 1] = right[i];

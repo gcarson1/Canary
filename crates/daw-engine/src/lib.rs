@@ -11,7 +11,10 @@ pub use load::{load_audio, resample, LoadError};
 pub use midi::{connect_midi, midi_input_ports, MidiConnection, MidiError, MidiSender};
 pub use output::{start_output, OutputError};
 pub use peaks::cached_waveform;
-pub use record::{recorder, start_input, InputError, RecordError, RecordInput, Recorder, Take};
+pub use record::{
+    bounce_tap, recorder, start_input, BounceTap, InputError, RecordError, RecordInput, Recorder,
+    Take,
+};
 pub use transport::Transport;
 
 use std::fmt;
@@ -1114,6 +1117,54 @@ mod tests {
         let mut long = vec![0.0; 9_600];
         audio.process(&mut long, 1);
         assert!(long[4_800..].iter().all(|&s| s == 0.0));
+    }
+
+    /// Left 0.25, right -0.25.
+    struct Const;
+
+    impl AudioNode for Const {
+        fn process(
+            &mut self,
+            _inputs: &[&[f32]],
+            outputs: &mut [&mut [f32]],
+            _midi_in: &[daw_core::MidiEvent],
+            _midi_out: &mut Vec<daw_core::MidiEvent>,
+            _context: &ProcessContext,
+        ) {
+            outputs[0].fill(0.25);
+            outputs[1].fill(-0.25);
+        }
+
+        fn reset(&mut self) {}
+    }
+
+    #[test]
+    fn a_bounce_tap_writes_a_step_to_disk_only_while_rolling() {
+        let dir = std::env::temp_dir().join(format!("canary-bounce-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bounce.wav");
+        let (mut handle, mut audio) = engine(16, 48_000.0);
+        let (mut rec, input) = recorder(2, 48_000, handle.playhead_clock());
+        rec.start(&path).unwrap();
+        let mut plan = ExecutionPlan::new(64);
+        plan.insert(NodeId(1), Box::new(Const));
+        let step = plan.add(NodeId(1), vec![], 2).unwrap();
+        assert!(plan.tap(step, bounce_tap(input, 64)));
+        handle.send_plan(Box::new(plan)).unwrap();
+        let mut block = vec![0.0; 256];
+        audio.process(&mut block, 2); // stopped: nothing written
+        handle.commands.push(Command::Play).unwrap();
+        assert_no_alloc(|| audio.process(&mut block, 2));
+        let take = rec.stop().unwrap();
+        assert_eq!(take.frames, 128);
+        let samples: Vec<f32> = hound::WavReader::open(&path)
+            .unwrap()
+            .into_samples::<f32>()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(samples.len(), 256);
+        assert!(samples.chunks(2).all(|f| f == [0.25, -0.25]));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

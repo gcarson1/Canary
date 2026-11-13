@@ -7,6 +7,7 @@
 mod devices;
 #[cfg(target_os = "macos")]
 mod editor;
+mod export;
 mod take;
 
 use std::collections::{HashMap, HashSet};
@@ -101,6 +102,8 @@ struct App {
     recorder: Option<(Recorder, cpal::Stream)>,
     /// MIDI being recorded into a pattern.
     midi_take: Option<take::MidiTake>,
+    /// A mix export in progress.
+    export: Option<export::Export>,
     title: String,
     /// The master node until the first plan takes it; it then stays in the
     /// engine for good, so meters keep their history across edits.
@@ -213,6 +216,7 @@ impl App {
             devices: Devices::scan(),
             recorder: None,
             midi_take: None,
+            export: None,
             title: String::new(),
             master: Some(Box::new(master)),
             monitor,
@@ -391,6 +395,10 @@ impl App {
     fn sync(&mut self) {
         if let Some(plan) = self.queued.take() {
             self.send(plan);
+            return;
+        }
+        // While exporting, the plan with the taps stays: a rebuild would drop them.
+        if self.export.as_ref().is_some_and(|e| e.taps.is_empty()) {
             return;
         }
         let revision = self.history.revision();
@@ -599,8 +607,20 @@ impl App {
             self.live.push(REFERENCE_NODE);
         }
         self.built_reference = reference;
-        plan.add(master, inputs, 2)
+        let master_step = plan
+            .add(master, inputs, 2)
             .expect("sources are earlier steps");
+        if let Some(e) = self.export.as_mut() {
+            for (who, input) in e.taps.drain(..) {
+                let step = match who {
+                    None => Some(master_step),
+                    Some(i) => out_step.get(i).copied().flatten(),
+                };
+                if let Some(step) = step {
+                    plan.tap(step, daw_engine::bounce_tap(input, MAX_BLOCK));
+                }
+            }
+        }
         let tracks = &self.history.project().tracks[..count];
         self.built_clips = tracks.iter().map(|t| t.clips.clone()).collect();
         self.built_devices = tracks
@@ -738,6 +758,7 @@ impl App {
             Request::AddFile { track, path, at } => self.load(path, Some((track, at))),
             Request::ExportMidi { track } => self.export_midi(track),
             Request::ToggleRecord => self.toggle_record(),
+            Request::Export { stems } => self.toggle_export(stems),
             Request::AddDevice { track, choice } => {
                 let uid = self.history.new_device_uid();
                 let rate = self.view.sample_rate as f32;
@@ -836,6 +857,102 @@ impl App {
                     self.history.mark_dirty();
                 }
             }
+        }
+    }
+
+    /// Starts an export of the song (and with `stems`, of every track), or
+    /// aborts the one running.
+    fn toggle_export(&mut self, stems: bool) {
+        if let Some(e) = self.export.take() {
+            let _ = self.engine.commands.push(Command::Stop);
+            e.abort();
+            self.built = None;
+            self.ws.status = Some(Status {
+                text: "EXPORT ABORTED".into(),
+                error: false,
+            });
+            return;
+        }
+        let project = self.history.project();
+        let song_end = project.song_end();
+        if song_end == 0 {
+            return self.error("nothing to export".into());
+        }
+        let rate = project.sample_rate;
+        let end = project.samples_at(song_end) + export::TAIL_SECONDS * u64::from(rate);
+        let tracks: Vec<(usize, String)> = if stems {
+            project
+                .tracks
+                .iter()
+                .enumerate()
+                .map(|(i, t)| (i, t.name.clone()))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let name = self
+            .project_path
+            .file_stem()
+            .map_or_else(|| "Canary".into(), |s| s.to_string_lossy().into_owned());
+        let started = export::Export::start(
+            &self.samples_dir.join("Exports"),
+            &name,
+            &tracks,
+            rate,
+            end,
+            self.ws.export_format,
+            self.engine.playhead_clock(),
+        );
+        match started {
+            Ok(e) => {
+                self.export = Some(e);
+                self.ws.song = true;
+                self.built = None; // the next plan carries the taps
+                for c in [Command::Stop, Command::Seek(0), Command::Play] {
+                    let _ = self.engine.commands.push(c);
+                }
+            }
+            Err(e) => self.error(format!("cannot export: {e}")),
+        }
+    }
+
+    /// Ends the export once the song has played through.
+    fn tend_export(&mut self) {
+        let rate = u64::from(self.view.sample_rate);
+        let Some(e) = self.export.as_mut() else {
+            return;
+        };
+        // Rolling from the top: an old playhead from before the seek does not count.
+        if self.view.playing && self.view.playhead < rate {
+            e.started = true;
+        }
+        if !e.started {
+            return;
+        }
+        let done = self.view.playhead >= e.end || !self.view.playing;
+        if !done {
+            let pct = self.view.playhead * 100 / e.end.max(1);
+            self.ws.status = Some(Status {
+                text: format!("EXPORTING {pct}% · EXPORT AGAIN TO ABORT"),
+                error: false,
+            });
+            return;
+        }
+        let e = self.export.take().expect("checked above");
+        let _ = self.engine.commands.push(Command::Stop);
+        self.built = None;
+        match e.finish() {
+            Ok(path) => {
+                self.ws.status = Some(Status {
+                    text: format!(
+                        "EXPORTED {}",
+                        path.file_name()
+                            .map_or_else(String::new, |n| n.to_string_lossy().to_uppercase())
+                    ),
+                    error: false,
+                });
+            }
+            Err(e) => self.error(format!("export failed: {e}")),
         }
     }
 
@@ -1082,6 +1199,7 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         self.receive_loads();
         self.read_telemetry();
+        self.tend_export();
         self.engine.collect_garbage();
         if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::S)) {
             self.save();

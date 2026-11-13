@@ -103,6 +103,33 @@ impl RecordInput {
     }
 }
 
+/// Feeds a stereo plan step's output to a two-channel recorder (a bounce or an
+/// export). Allocation-free: interleaves into a buffer sized up front.
+pub struct BounceTap {
+    input: RecordInput,
+    scratch: Box<[f32]>,
+}
+
+/// A tap for `ExecutionPlan::tap` writing into `input` (a 2-channel recorder's),
+/// for blocks up to `max_block` frames.
+pub fn bounce_tap(input: RecordInput, max_block: usize) -> Box<dyn daw_graph::Tap> {
+    Box::new(BounceTap {
+        input,
+        scratch: vec![0.0; max_block * 2].into_boxed_slice(),
+    })
+}
+
+impl daw_graph::Tap for BounceTap {
+    fn write(&mut self, left: &[f32], right: &[f32]) {
+        let n = left.len().min(right.len()).min(self.scratch.len() / 2);
+        for i in 0..n {
+            self.scratch[2 * i] = left[i];
+            self.scratch[2 * i + 1] = right[i];
+        }
+        self.input.push(&self.scratch[..2 * n]);
+    }
+}
+
 /// The ring handed back, samples written, and how the file ended.
 type WriterResult = (Consumer<f32>, u64, Result<(), hound::Error>);
 

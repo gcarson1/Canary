@@ -121,6 +121,11 @@ pub enum Request {
         key: u8,
         on: bool,
     },
+    /// Play the song through and write the mix (and with `stems`, every track)
+    /// to files in `Inputs::export_format`; again while exporting aborts.
+    Export {
+        stems: bool,
+    },
     /// Write `track`'s notes in the current pattern to a MIDI file.
     ExportMidi {
         track: usize,
@@ -155,6 +160,41 @@ pub struct Inputs<'a> {
 pub enum Tool {
     Draw,
     Slice,
+}
+
+/// What EXPORT writes. Right-click EXPORT to change it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExportFormat {
+    /// 32-bit float WAV, as rendered.
+    #[default]
+    Wav32,
+    Wav24,
+    Aiff24,
+    Flac,
+    /// AAC in an .m4a at 256 kbit/s.
+    Aac,
+}
+
+impl ExportFormat {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Wav32 => "WAV32F",
+            Self::Wav24 => "WAV24",
+            Self::Aiff24 => "AIFF24",
+            Self::Flac => "FLAC",
+            Self::Aac => "AAC",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::Wav32 => Self::Wav24,
+            Self::Wav24 => Self::Aiff24,
+            Self::Aiff24 => Self::Flac,
+            Self::Flac => Self::Aac,
+            Self::Aac => Self::Wav32,
+        }
+    }
 }
 
 /// The center view, picked by the top bar's tabs.
@@ -212,6 +252,7 @@ pub struct Workspace {
     pub count_in: bool,
     /// The automation lane drawn over the selected track in the playlist.
     pub automation: Option<Target>,
+    pub export_format: ExportFormat,
     seq: sequencer::View,
     roll: piano::View,
     timeline: timeline::View,
@@ -254,6 +295,7 @@ impl Default for Workspace {
             metronome: false,
             count_in: false,
             automation: None,
+            export_format: ExportFormat::default(),
             seq: sequencer::View::default(),
             roll: piano::View::default(),
             timeline: timeline::View::default(),
@@ -826,6 +868,31 @@ impl Workspace {
             m.mono(0.75),
             t.muted,
         );
+        // EXPORT (Shift: with stems); right-click picks the format.
+        let label = format!("EXPORT {}", self.export_format.label());
+        let g = p.layout_no_wrap(label.clone(), m.mono(0.625), t.text);
+        let export = m.snap_rect(Rect::from_min_size(
+            Pos2::new(rate.min.x - 1.0 * u - g.size().x - 0.75 * u, cy - 0.625 * u),
+            Vec2::new(g.size().x + 0.75 * u, 1.25 * u),
+        ));
+        let resp = ui.interact(export, ui.scope_id().with("export"), Sense::click());
+        let line = if resp.hovered() { t.text } else { t.line_2 };
+        p.rect_stroke(export, 0.0, m.hair(line), StrokeKind::Inside);
+        p.text(
+            export.center(),
+            Align2::CENTER_CENTER,
+            label,
+            m.mono(0.625),
+            t.muted,
+        );
+        if resp.clicked() {
+            let stems = ui.input(|i| i.modifiers.shift);
+            out.push(Request::Export { stems });
+        }
+        if resp.secondary_clicked() {
+            self.export_format = self.export_format.next();
+        }
+        let rate = export;
         if let Some(status) = &self.status {
             let color = if status.error { t.bad } else { t.muted };
             p.text(

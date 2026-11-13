@@ -12,7 +12,7 @@ mod track;
 pub use effect::{EffectNode, ParamBank};
 pub use monitor::{MasterNode, Monitor, MonitorMode, Readings};
 pub use plan::{
-    ExecutionPlan, LiveNodes, NodeArena, PlanError, Source, StepId, MAX_CHANNELS, MAX_LATENCY,
+    ExecutionPlan, LiveNodes, NodeArena, PlanError, Source, StepId, Tap, MAX_CHANNELS, MAX_LATENCY,
     MAX_NODES,
 };
 pub use sampler::{SamplerData, SamplerNode, Zone, SAMPLER_PARAMS};

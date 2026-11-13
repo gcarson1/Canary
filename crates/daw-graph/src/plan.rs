@@ -19,6 +19,12 @@ const MIDI_CAPACITY: usize = 1024;
 /// reporting garbage cannot exhaust memory.
 pub const MAX_LATENCY: u32 = 1 << 20;
 
+/// Receives a step's stereo output every block while the transport rolls, such
+/// as a bounce writer. Called on the audio thread: never allocate, lock or block.
+pub trait Tap: Send {
+    fn write(&mut self, left: &[f32], right: &[f32]);
+}
+
 /// Index of a step in an `ExecutionPlan`, in the order it was added.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StepId(pub usize);
@@ -74,6 +80,7 @@ struct Step {
     notes: NoteState,
     /// Parameter envelopes applied to the node before each block.
     automation: Vec<(u32, Box<[AutoPoint]>)>,
+    tap: Option<Box<dyn Tap>>,
     /// Set by `set_latency`; otherwise read from this plan's inserted node, else 0.
     latency: Option<u32>,
     /// Compensation delays on this step's sources, in (input, source) order.
@@ -206,6 +213,7 @@ impl ExecutionPlan {
             sequence: Box::default(),
             notes: NoteState::default(),
             automation: Vec::new(),
+            tap: None,
             latency: None,
             delays: Vec::new(),
         });
@@ -246,6 +254,18 @@ impl ExecutionPlan {
         points.sort_by_key(|p| p.at);
         s.automation.push((id, points.into_boxed_slice()));
         true
+    }
+
+    /// Hands `step`'s first two outputs to `tap` after every block in which the
+    /// transport rolls. Returns false (dropping the tap) if there is no such step.
+    pub fn tap(&mut self, step: StepId, tap: Box<dyn Tap>) -> bool {
+        match self.steps.get_mut(step.0) {
+            Some(s) => {
+                s.tap = Some(tap);
+                true
+            }
+            None => false,
+        }
     }
 
     /// The metronome's beats while this plan plays: timeline samples, with
@@ -402,6 +422,7 @@ impl ExecutionPlan {
                 sequence,
                 notes,
                 automation,
+                tap,
                 ..
             } = &mut rest[0];
 
@@ -460,6 +481,11 @@ impl ExecutionPlan {
                 &mut self.midi_out,
                 context,
             );
+            if let (Some(tap), true, [l, r, ..]) =
+                (tap.as_mut(), context.playing, &outs[..num_outputs])
+            {
+                tap.write(l, r);
+            }
         }
     }
 }

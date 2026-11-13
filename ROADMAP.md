@@ -116,7 +116,8 @@ The UI follows Styles.md whichever framework is chosen.
 - [ ] Device presets (save/load per built-in device)
 
 ### Phase 11: Projects, Export and Polish
-- [ ] Export: WAV/AIFF/FLAC (16/24/32-bit, any rate, dither), MP3/AAC through macOS, stems per track/bus, export a range, offline faster than real time
+- [x] Export: EXPORT in the top bar plays the song through (to its end plus a 2 s tail) and writes the mix, Shift-click adds a stem per track (post-fader, before buses), through plan taps (`ExecutionPlan::tap`, `daw_engine::bounce_tap`) into 32-bit float WAVs; right-click picks WAV32F, WAV24, AIFF24, FLAC or AAC (converted by macOS `afconvert`). Files land in the samples folder's `Exports`. Clicking EXPORT again aborts
+- [ ] Offline export faster than real time, export a range, dither and sample-rate choice
 - [ ] Project templates (new project from template), autosave and crash recovery, collect-and-save (copy samples into the project folder), relative sample paths
 - [ ] Preferences: audio device, sample rate and buffer size, all MIDI inputs, theme (dark/daylight), UI scale
 - [ ] Keyboard shortcuts for every tool and view; copy/paste of clips and notes; marquee select in the playlist; undo/redo covers every edit

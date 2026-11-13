@@ -724,8 +724,17 @@ fn draw_pattern_clip(
     };
     // Repeat k of the pattern starts at clip tick k * length - offset % length.
     let first = clip.offset % pattern.length;
+    // Start at the first repeat that reaches the visible area, stop past it.
+    let visible = project.ticks_at(
+        (f64::from(p.clip_rect().min.x - rect.min.x) * zoom).max(0.0) as u64
+            + project.samples_at(clip.start),
+    ) as i128;
     let mut rep = clip.start as i128 - first as i128;
-    while rep < clip.end() as i128 {
+    if visible > rep + pattern.length as i128 {
+        rep += (visible - rep) / pattern.length as i128 * pattern.length as i128
+            - pattern.length as i128;
+    }
+    while rep < clip.end() as i128 && x_of(rep.max(0) as u64) <= p.clip_rect().max.x {
         if rep > clip.start as i128 {
             cp.vline(m.snap(x_of(rep as u64)), body.y_range(), m.hair(t.line_2));
         }
@@ -835,6 +844,29 @@ fn draw_clip(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trimming_a_pattern_clip_keeps_a_grid_step_and_the_pattern_start() {
+        let clip = PatternClip {
+            pattern: 1,
+            start: 1_000,
+            length: 2_000,
+            offset: 300,
+        };
+        // The start edge can open back to the pattern's own start, no further.
+        let t = trim_pattern(&clip, Grab::Start, 0, 240);
+        assert_eq!((t.start, t.length, t.offset), (700, 2_300, 0));
+        let t = trim_pattern(&clip, Grab::Start, 1_500, 240);
+        assert_eq!(
+            (t.start, t.length, t.offset, t.end()),
+            (1_500, 1_500, 800, 3_000)
+        );
+        // Neither edge closes the clip below one grid step.
+        let t = trim_pattern(&clip, Grab::Start, 9_000, 240);
+        assert_eq!((t.start, t.length), (2_760, 240));
+        let t = trim_pattern(&clip, Grab::End, 0, 240);
+        assert_eq!((t.start, t.length), (1_000, 240));
+    }
 
     #[test]
     fn clock_counts_bars_beats_and_sixteenths_from_one() {

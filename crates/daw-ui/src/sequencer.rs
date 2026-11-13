@@ -16,9 +16,16 @@ const LENGTHS: [u64; 4] = [16, 32, 48, 64];
 
 #[derive(Default)]
 pub(crate) struct View {
-    /// The selected track's notes while a velocity drag is in progress.
-    velocity: Option<(usize, Vec<Note>)>,
+    /// The selected track's notes while a velocity drag is in progress, and the
+    /// project revision it started at (another edit cancels it).
+    velocity: Option<(usize, Vec<Note>, u64)>,
     scroll_y: f32,
+}
+
+impl View {
+    pub(crate) fn is_dragging(&self) -> bool {
+        self.velocity.is_some()
+    }
 }
 
 /// Index of the step `note` starts in.
@@ -164,6 +171,7 @@ pub(crate) fn show(
                 });
             }
             ws.selected_track = Some(ti);
+            ws.selected_clip = None;
             ws.set_notes(project, ti, next);
         }
         rp.hline(r.x_range(), row.max.y, m.hair(t.line));
@@ -183,8 +191,12 @@ pub(crate) fn show(
         return;
     };
     let stored = id.map_or(&[][..], |id| project.tracks[ti].notes_in(id));
+    let revision = inputs.history.revision();
+    if ws.seq.velocity.as_ref().is_some_and(|v| v.2 != revision) {
+        ws.seq.velocity = None;
+    }
     let shown: Vec<Note> = match &ws.seq.velocity {
-        Some((track, notes)) if *track == ti => notes.clone(),
+        Some((track, notes, _)) if *track == ti => notes.clone(),
         _ => stored.to_vec(),
     };
     let bars = Rect::from_x_y_ranges(
@@ -220,13 +232,16 @@ pub(crate) fn show(
         let v = ((bars.max.y - pos.y) / bars.height() * 127.0)
             .round()
             .clamp(1.0, 127.0) as u8;
-        let notes = ws.seq.velocity.get_or_insert_with(|| (ti, stored.to_vec()));
+        let notes = ws
+            .seq
+            .velocity
+            .get_or_insert_with(|| (ti, stored.to_vec(), revision));
         for n in notes.1.iter_mut().filter(|n| step_of(n) == s) {
             n.velocity = v;
         }
     }
     if !ui.input(|i| i.pointer.any_down()) {
-        if let Some((track, notes)) = ws.seq.velocity.take() {
+        if let Some((track, notes, _)) = ws.seq.velocity.take() {
             if track == ti && notes != stored {
                 ws.set_notes(project, track, notes);
             }

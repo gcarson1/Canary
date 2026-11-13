@@ -408,6 +408,7 @@ impl Workspace {
     pub fn is_dragging(&self) -> bool {
         self.timeline.is_dragging()
             || self.roll.is_dragging()
+            || self.seq.is_dragging()
             || self.device_drag.is_some()
             || self.file_drag.is_some()
     }
@@ -506,7 +507,8 @@ impl Workspace {
             let action = match (
                 self.selected_pattern_clip
                     .filter(|_| self.page == Page::Playlist),
-                self.selected_clip,
+                // Only the playlist shows clips; elsewhere Delete takes the track.
+                self.selected_clip.filter(|_| self.page == Page::Playlist),
                 self.selected_track,
             ) {
                 (Some((track, index)), _, _) => {

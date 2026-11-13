@@ -507,17 +507,21 @@ impl App {
         self.built_selected = self.ws.selected_track;
         // PAT mode loops the pattern; jump into it if the playhead is past its end.
         let looping = loop_range(self.history.project(), playback);
-        if self.built_playback != Some(playback) {
-            if let Some((start, _)) = looping.filter(|&(_, end)| self.view.playhead >= end) {
-                let _ = self.engine.commands.push(Command::Seek(start));
+        // A loop that changed (mode, pattern length, tempo) may now end behind the
+        // playhead, which the transport would never wrap: move it in.
+        if looping != self.built_loop {
+            if let Some(at) = into_loop(looping, self.view.playhead) {
+                let _ = self.engine.commands.push(Command::Seek(at));
             }
-        }
-        if let Err(e) = self.engine.commands.push(Command::SetLoop(looping)) {
-            eprintln!("engine busy, dropped {e:?}");
         }
         self.built_playback = Some(playback);
         self.built_sequences = sequences;
         self.built_loop = looping;
+        if let Err(e) = self.engine.commands.push(Command::SetLoop(looping)) {
+            eprintln!("engine busy, dropped {e:?}");
+            self.built_loop = None; // differs next frame, so the loop is sent again
+            self.built = None;
+        }
         let pending = &self.pending;
         let errors = self
             .devices
@@ -594,7 +598,11 @@ impl App {
         match request {
             Request::Play => command(self, Command::Play),
             Request::Stop => command(self, Command::Stop),
-            Request::Seek(at) => command(self, Command::Seek(at)),
+            Request::Seek(at) => {
+                // While a pattern loops, a seek lands inside it.
+                let at = into_loop(self.built_loop, at).unwrap_or(at);
+                command(self, Command::Seek(at))
+            }
             Request::AddFile { track, path, at } => self.load(path, Some((track, at))),
             Request::ToggleRecord => self.toggle_record(),
             Request::AddDevice { track, choice } => {
@@ -836,6 +844,13 @@ impl eframe::App for App {
     }
 }
 
+/// Where to put a playhead at `at` so it plays inside `looping`: `None` if it
+/// already is (or there is no loop), else the same spot in the loop, wrapped.
+fn into_loop(looping: Option<(u64, u64)>, at: u64) -> Option<u64> {
+    let (start, end) = looping?;
+    (at >= end).then(|| start + (at - start) % (end - start))
+}
+
 /// The transport loop for `playback`: the whole pattern in PAT mode.
 fn loop_range(project: &daw_project::Project, playback: Playback) -> Option<(u64, u64)> {
     match playback {
@@ -873,4 +888,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Box::new(move |cc| Ok(Box::new(App::new(cc, project_path, samples_dir)?))),
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn playheads_past_a_loop_wrap_into_it() {
+        assert_eq!(into_loop(None, 500), None);
+        assert_eq!(into_loop(Some((0, 100)), 99), None);
+        assert_eq!(into_loop(Some((0, 100)), 100), Some(0));
+        assert_eq!(into_loop(Some((0, 100)), 250), Some(50));
+        assert_eq!(into_loop(Some((40, 100)), 130), Some(70));
+    }
 }

@@ -6,6 +6,8 @@
 //! [ and ] velocity down/up 10%, H humanize.
 //! A velocity lane sits underneath. Each gesture is one undoable edit.
 
+use std::collections::HashSet;
+
 use daw_project::{edit, Note, Project, PPQ, STEP};
 use egui::{Align2, Key, Pos2, Rect, Sense, StrokeKind};
 
@@ -179,7 +181,8 @@ pub(crate) fn show(
         |y: f32| (127.0 - ((y - grid.min.y + scroll) / kh).floor()).clamp(0.0, 127.0) as u8;
 
     // Drop selections that an undo or another edit took away.
-    ws.roll.selected.retain(|n| stored.contains(n));
+    let stored_set: HashSet<Note> = stored.iter().copied().collect();
+    ws.roll.selected.retain(|n| stored_set.contains(n));
     let stale = ws.roll.gesture.as_ref().is_some_and(|g| {
         g.revision != inputs.history.revision() || g.track != ti || g.pattern != pattern_id
     });
@@ -243,6 +246,8 @@ pub(crate) fn show(
         Some(g) if g.kind != Kind::Select => (g.preview.clone(), g.preview_sel.clone()),
         _ => (stored.to_vec(), ws.roll.selected.clone()),
     };
+    // Looked up per note per frame: a set, so large selections stay fast.
+    let shown_sel: HashSet<Note> = shown_sel.into_iter().collect();
     let note_rect = |n: &Note| {
         m.snap_rect(Rect::from_x_y_ranges(
             x_of(n.start as f64)..=x_of(n.end() as f64).max(x_of(n.start as f64) + 2.0 * m.px),
@@ -616,8 +621,8 @@ fn keys_pressed(
             Key::ArrowLeft => Some(edit::shift(stored, &sel, -(grid as i64), 0)),
             Key::D if mods.command => Some(edit::duplicate(stored, &sel, grid.max(STEP))),
             Key::L if !mods.command => Some(edit::legato(stored, &sel)),
-            Key::OpenBracket => Some(edit::scale_velocity(stored, &sel, 0.9)),
-            Key::CloseBracket => Some(edit::scale_velocity(stored, &sel, 1.1)),
+            Key::OpenBracket if !mods.command => Some(edit::scale_velocity(stored, &sel, 0.9)),
+            Key::CloseBracket if !mods.command => Some(edit::scale_velocity(stored, &sel, 1.1)),
             Key::H if !mods.command => {
                 // A fresh seed each press, from the notes themselves.
                 let seed = stored.iter().fold(0x9e37_79b9u64, |h, n| {

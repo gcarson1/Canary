@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use daw_core::{Clip, SampleData};
 use daw_dsp::MinMax;
-use daw_project::{Action, ClipRef, PatternClip, Project, Track};
+use daw_project::{Action, ClipRef, PatternClip, Project, Track, STEP};
 use egui::{Align2, Pos2, Rect, Sense, StrokeKind};
 
 use crate::theme::Metrics;
@@ -95,17 +95,6 @@ fn trim_pattern(clip: &PatternClip, grab: Grab, at: u64, grid: u64) -> PatternCl
     }
 }
 
-/// Snap grid length in samples, or `None` for no snapping.
-fn grid(snap: Snap, bpm: f64, sample_rate: u32) -> Option<f64> {
-    let beat = 60.0 / bpm * f64::from(sample_rate);
-    match snap {
-        Snap::Sixteenth => Some(beat / 4.0),
-        Snap::Eighth => Some(beat / 2.0),
-        Snap::Bar => Some(beat * 4.0),
-        Snap::Off => None,
-    }
-}
-
 impl View {
     pub(crate) fn is_dragging(&self) -> bool {
         self.drag.is_some() || self.pattern_drag.is_some()
@@ -120,23 +109,36 @@ impl View {
     }
 }
 
-/// `sample` rounded to the snap grid, never below zero.
-pub(crate) fn snap_f(sample: f64, snap: Snap, bpm: f64, sample_rate: u32) -> f64 {
-    match grid(snap, bpm, sample_rate) {
-        Some(g) => (sample / g).round() * g,
-        None => sample,
+/// `sample` rounded to the snap grid (through the tempo and meter maps), never
+/// below zero.
+pub(crate) fn snap_f(sample: f64, snap: Snap, project: &Project) -> f64 {
+    let sample = sample.max(0.0);
+    if snap == Snap::Off {
+        return sample;
     }
-    .max(0.0)
+    let tick = project.ticks_at(sample as u64);
+    let snapped = match snap {
+        Snap::Bar => {
+            let bar = project.bar_beat(tick).bar - 1;
+            let (a, b) = (project.bar_tick(bar), project.bar_tick(bar + 1));
+            if tick - a < b - tick {
+                a
+            } else {
+                b
+            }
+        }
+        _ => {
+            let g = crate::piano::snap_ticks(snap);
+            (tick + g / 2) / g * g
+        }
+    };
+    project.samples_at(snapped) as f64
 }
 
-/// 1-based bar, beat and sixteenth of `sample` in 4/4.
-pub(crate) fn bar_beat_step(sample: u64, bpm: f64, sample_rate: u32) -> (u64, u64, u64) {
-    let sixteenths = (sample as f64 / (60.0 / bpm * f64::from(sample_rate) / 4.0)) as u64;
-    (
-        sixteenths / 16 + 1,
-        sixteenths / 4 % 4 + 1,
-        sixteenths % 4 + 1,
-    )
+/// 1-based bar, beat and sixteenth within the beat of `sample`.
+pub(crate) fn bar_beat_step(sample: u64, project: &Project) -> (u64, u64, u64) {
+    let at = project.bar_beat(project.ticks_at(sample));
+    (at.bar, at.beat, at.ticks / STEP + 1)
 }
 
 /// True while the transport plays through one of the track's clips and it is
@@ -184,7 +186,6 @@ pub(crate) fn show(
 ) {
     let (t, u) = (ws.theme, m.u);
     let project = inputs.history.project();
-    let (bpm, rate) = (project.bpm, inputs.engine.sample_rate);
     let label_w = 7.5 * u;
     let ruler_h = 1.75 * u;
     let lane_h = 4.0 * u;
@@ -219,19 +220,18 @@ pub(crate) fn show(
 
     // Ruler: bar numbers; click or drag to seek.
     let v = &ws.timeline;
-    let beat = 60.0 / bpm * f64::from(rate);
-    let bar = beat * 4.0;
-    let first_bar = (v.start / bar).floor().max(0.0) as u64;
-    let bars_visible = (f64::from(lanes.width()) * v.zoom / bar).ceil() as u64 + 1;
+    let x_at = |tick: u64| v.x_of(lanes, project.samples_at(tick) as f64);
+    let first_bar = project.bar_beat(project.ticks_at(v.start as u64)).bar - 1;
     // Fewer labels when bars are narrow, so numbers never collide.
-    let bar_px = (bar / v.zoom) as f32;
+    let bar_px = x_at(project.bar_tick(first_bar + 1)) - x_at(project.bar_tick(first_bar));
     let every = [1, 2, 4, 8, 16, 32, 64, 128]
         .into_iter()
         .find(|&n| bar_px * n as f32 >= 3.0 * u)
         .unwrap_or(256);
-    for b in first_bar..first_bar + bars_visible {
-        let x = m.snap(v.x_of(lanes, b as f64 * bar));
-        if x > lanes.max.x {
+    for b in first_bar.. {
+        let tick = project.bar_tick(b);
+        let x = m.snap(x_at(tick));
+        if x > lanes.max.x || tick >= daw_project::MAX_TICKS {
             break;
         }
         if b % every != 0 {
@@ -248,8 +248,9 @@ pub(crate) fn show(
             );
         }
         if bar_px >= 4.0 * u {
-            for q in 1..4 {
-                let x = m.snap(v.x_of(lanes, b as f64 * bar + q as f64 * beat));
+            let meter = project.bar_beat(tick).meter;
+            for q in 1..u64::from(meter.numerator) {
+                let x = m.snap(x_at(tick + q * meter.beat_ticks()));
                 clip_p.vline(x, lanes.y_range(), m.hair(t.line));
             }
         }
@@ -257,12 +258,14 @@ pub(crate) fn show(
     p.hline(r.x_range(), m.snap(ruler.max.y), m.hair(t.line));
     p.vline(m.snap(ruler.min.x), r.y_range(), m.hair(t.line));
     let seek = ui.interact(ruler, ui.scope_id().with("ruler"), Sense::click_and_drag());
-    if seek.clicked() || seek.dragged() {
+    let alt = ui.input(|i| i.modifiers.alt);
+    if (seek.clicked() || seek.dragged()) && !alt {
         if let Some(pos) = seek.interact_pointer_pos() {
             let at = v.sample_at(lanes, pos.x);
-            out.push(Request::Seek(snap_f(at, ws.snap, bpm, rate) as u64));
+            out.push(Request::Seek(snap_f(at, ws.snap, project) as u64));
         }
     }
+    tempo_markers(ws, ui, p, m, ruler, lanes, project, &seek, alt);
 
     if project.tracks.is_empty() {
         p.text(
@@ -572,13 +575,13 @@ pub(crate) fn show(
                 .map(|w| w.audio().clone());
             match d.grab {
                 Grab::Body => {
-                    d.preview.start = snap_f(at - d.offset, ws.snap, bpm, rate) as u64;
+                    d.preview.start = snap_f(at - d.offset, ws.snap, project) as u64;
                     let lane = ((pos.y - lanes.min.y + ws.timeline.scroll_y) / lane_h).floor();
                     d.to_track = (lane.max(0.0) as usize).min(project.tracks.len() - 1);
                 }
                 grab => {
                     if let Some(mut c) = audio.as_ref().and_then(|a| core_clip(original, a)) {
-                        let to = snap_f(at, ws.snap, bpm, rate) as u64;
+                        let to = snap_f(at, ws.snap, project) as u64;
                         if grab == Grab::Start {
                             c.trim_start(to);
                         } else {
@@ -621,7 +624,7 @@ pub(crate) fn show(
         match (hit, ws.tool, pointer_sample) {
             (Some((ti, ci, _)), Tool::Slice, Some(at)) => {
                 let clip = &project.tracks[ti].clips[ci];
-                let at = snap_f(at, ws.snap, bpm, rate) as u64;
+                let at = snap_f(at, ws.snap, project) as u64;
                 let split = inputs
                     .waveforms
                     .get(&clip.source)
@@ -678,6 +681,84 @@ pub(crate) fn show(
         v.start = ph as f64;
     }
     v.last_playhead = ph;
+}
+
+/// Tempo changes on the ruler: Option-click adds one at the snapped spot (at the
+/// tempo there), drag a marker up or down to change its tempo, right-click to
+/// remove it. Each is one undoable `SetTempoMap`.
+#[allow(clippy::too_many_arguments)]
+fn tempo_markers(
+    ws: &mut Workspace,
+    ui: &egui::Ui,
+    p: &egui::Painter,
+    m: &Metrics,
+    ruler: Rect,
+    lanes: Rect,
+    project: &Project,
+    seek: &egui::Response,
+    alt: bool,
+) {
+    let (t, u) = (ws.theme, m.u);
+    let rp = p.with_clip_rect(ruler);
+    let mut edit = None;
+    for (i, c) in project.tempos.iter().enumerate() {
+        let x = ws.timeline.x_of(lanes, project.samples_at(c.tick) as f64);
+        if !(ruler.min.x..=ruler.max.x).contains(&x) {
+            continue;
+        }
+        let bpm = match ws.tempo_marker_drag {
+            Some((j, bpm)) if j == i => bpm,
+            _ => c.bpm,
+        };
+        let label = rp.text(
+            Pos2::new(x + 0.25 * u, ruler.min.y + 0.25 * u),
+            Align2::LEFT_TOP,
+            format!("{bpm:.1}"),
+            m.mono(0.5),
+            t.accent_cyan,
+        );
+        rp.vline(m.snap(x), ruler.y_range(), m.hair(t.accent_cyan));
+        let resp = ui.interact(
+            label.union(Rect::from_x_y_ranges(
+                x - 0.25 * u..=x + 0.25 * u,
+                ruler.y_range(),
+            )),
+            ui.scope_id().with(("tempo", i)),
+            Sense::click_and_drag(),
+        );
+        if resp.dragged() {
+            let dy = f64::from(resp.drag_delta().y);
+            ws.tempo_marker_drag = Some((i, (bpm - dy * 0.25).clamp(20.0, 400.0)));
+        }
+        if resp.drag_stopped() {
+            if let Some((_, bpm)) = ws.tempo_marker_drag.take() {
+                let mut changes = project.tempos.clone();
+                changes[i].bpm = (bpm * 100.0).round() / 100.0;
+                edit = Some(changes);
+            }
+        }
+        if resp.secondary_clicked() {
+            let mut changes = project.tempos.clone();
+            changes.remove(i);
+            edit = Some(changes);
+        }
+    }
+    if seek.clicked() && alt {
+        if let Some(pos) = seek.interact_pointer_pos() {
+            let at = snap_f(ws.timeline.sample_at(lanes, pos.x), ws.snap, project);
+            let tick = project.ticks_at(at as u64);
+            if tick > 0 && project.tempos.iter().all(|c| c.tick != tick) {
+                let mut changes = project.tempos.clone();
+                let bpm = project.bpm_at(tick);
+                let at = changes.partition_point(|c| c.tick < tick);
+                changes.insert(at, daw_project::TempoChange { tick, bpm });
+                edit = Some(changes);
+            }
+        }
+    }
+    if let Some(changes) = edit {
+        ws.edit(Action::SetTempoMap(changes));
+    }
 }
 
 /// A pattern clip: its name, a marker at each repeat, and a sketch of every
@@ -871,17 +952,30 @@ mod tests {
     #[test]
     fn clock_counts_bars_beats_and_sixteenths_from_one() {
         // 120 BPM at 48 kHz: a beat is 24 000 samples, a sixteenth 6 000.
-        assert_eq!(bar_beat_step(0, 120.0, 48_000), (1, 1, 1));
-        assert_eq!(bar_beat_step(6_000, 120.0, 48_000), (1, 1, 2));
-        assert_eq!(bar_beat_step(24_000, 120.0, 48_000), (1, 2, 1));
-        assert_eq!(bar_beat_step(96_000 + 30_000, 120.0, 48_000), (2, 2, 2));
+        let p = Project::default();
+        assert_eq!(bar_beat_step(0, &p), (1, 1, 1));
+        assert_eq!(bar_beat_step(6_000, &p), (1, 1, 2));
+        assert_eq!(bar_beat_step(24_000, &p), (1, 2, 1));
+        assert_eq!(bar_beat_step(96_000 + 30_000, &p), (2, 2, 2));
     }
 
     #[test]
     fn snapping_rounds_to_the_grid_and_off_keeps_the_sample() {
-        assert_eq!(snap_f(6_100.0, Snap::Sixteenth, 120.0, 48_000), 6_000.0);
-        assert_eq!(snap_f(11_900.0, Snap::Eighth, 120.0, 48_000), 12_000.0);
-        assert_eq!(snap_f(50_000.0, Snap::Bar, 120.0, 48_000), 96_000.0);
-        assert_eq!(snap_f(123.0, Snap::Off, 120.0, 48_000), 123.0);
+        let p = Project::default();
+        assert_eq!(snap_f(6_100.0, Snap::Sixteenth, &p), 6_000.0);
+        assert_eq!(snap_f(11_900.0, Snap::Eighth, &p), 12_000.0);
+        assert_eq!(snap_f(50_000.0, Snap::Bar, &p), 96_000.0);
+        assert_eq!(snap_f(123.0, Snap::Off, &p), 123.0);
+        // A 3/4 bar is three beats.
+        let waltz = Project {
+            meters: vec![daw_project::MeterChange {
+                bar: 0,
+                numerator: 3,
+                denominator: 4,
+            }],
+            ..Project::default()
+        };
+        assert_eq!(snap_f(50_000.0, Snap::Bar, &waltz), 72_000.0);
+        assert_eq!(bar_beat_step(72_000, &waltz), (2, 1, 1));
     }
 }

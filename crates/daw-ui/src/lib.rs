@@ -74,8 +74,11 @@ pub enum Request {
     Play,
     Stop,
     Seek(u64),
+    /// Start or stop recording: audio on the playlist, MIDI into the current
+    /// pattern on the pattern pages.
     ToggleRecord,
     /// Load `path` and place it at `at` on `track`, or on a new track if `None`.
+    /// A MIDI file instead becomes the track's notes in the current pattern.
     AddFile {
         track: Option<usize>,
         path: PathBuf,
@@ -116,6 +119,10 @@ pub enum Request {
         track: usize,
         key: u8,
         on: bool,
+    },
+    /// Write `track`'s notes in the current pattern to a MIDI file.
+    ExportMidi {
+        track: usize,
     },
     /// Add a slice point at `at` (a fraction of the sample), or remove the nearest.
     SliceMarker {
@@ -198,6 +205,10 @@ pub struct Workspace {
     timeline: timeline::View,
     /// Tempo while its readout is being dragged; applied on release.
     tempo_drag: Option<f64>,
+    /// A ruler tempo marker being dragged: its index and the tempo so far.
+    tempo_marker_drag: Option<(usize, f64)>,
+    /// The time signature numerator while its readout is dragged.
+    meter_drag: Option<f32>,
     /// Clip indicator per side, latched until clicked.
     clip_latch: [bool; 2],
     edits: Vec<Edit>,
@@ -228,6 +239,8 @@ impl Default for Workspace {
             roll: piano::View::default(),
             timeline: timeline::View::default(),
             tempo_drag: None,
+            tempo_marker_drag: None,
+            meter_drag: None,
             clip_latch: [false; 2],
             edits: Vec::new(),
             picker: None,
@@ -430,7 +443,7 @@ impl Workspace {
 
     /// The pattern to put notes in, and the edit that creates it first if the
     /// project has none yet (one bar long).
-    fn pattern_for_edit(&mut self, project: &Project) -> (u64, Option<Action>) {
+    pub fn pattern_for_edit(&mut self, project: &Project) -> (u64, Option<Action>) {
         if let Some(id) = self.current_pattern(project) {
             self.pattern = Some(id);
             return (id, None);
@@ -646,8 +659,16 @@ impl Workspace {
             m.mono(0.6875),
             t.faint,
         );
-        x = label.max.x + 1.5 * u;
-        let (bar, beat, step) = timeline::bar_beat_step(engine.playhead, bpm, engine.sample_rate);
+        x = self.meter_readout(
+            ui,
+            p,
+            m,
+            label.max.x + 0.75 * u,
+            cy,
+            inputs.history.project(),
+        );
+        x += 1.5 * u;
+        let (bar, beat, step) = timeline::bar_beat_step(engine.playhead, inputs.history.project());
         let clock = p.text(
             Pos2::new(x, cy),
             Align2::LEFT_CENTER,
@@ -745,6 +766,67 @@ impl Workspace {
                 color,
             );
         }
+    }
+
+    /// The opening time signature, `4/4`: drag up or down to change the beats per
+    /// bar, right-click to cycle the beat note (4, 8, 16, 2). Returns its end.
+    fn meter_readout(
+        &mut self,
+        ui: &egui::Ui,
+        p: &egui::Painter,
+        m: &Metrics,
+        x: f32,
+        cy: f32,
+        project: &Project,
+    ) -> f32 {
+        let (t, u) = (self.theme, m.u);
+        let meter = project.bar_beat(0).meter;
+        let numerator = self
+            .meter_drag
+            .map_or(meter.numerator, |n| n.round().clamp(1.0, 32.0) as u8);
+        let rect = p.text(
+            Pos2::new(x, cy),
+            Align2::LEFT_CENTER,
+            format!("{numerator}/{}", meter.denominator),
+            m.mono(0.875),
+            t.text,
+        );
+        let resp = ui.interact(
+            rect.expand(0.25 * u),
+            ui.scope_id().with("meter"),
+            Sense::click_and_drag(),
+        );
+        if resp.dragged() {
+            let n = self.meter_drag.unwrap_or(f32::from(meter.numerator));
+            self.meter_drag = Some((n - resp.drag_delta().y * 0.1).clamp(1.0, 32.0));
+        }
+        let mut next = None;
+        if resp.drag_stopped() {
+            if let Some(n) = self.meter_drag.take() {
+                next = Some((n.round() as u8, meter.denominator));
+            }
+        }
+        if resp.secondary_clicked() {
+            let d = match meter.denominator {
+                4 => 8,
+                8 => 16,
+                16 => 2,
+                _ => 4,
+            };
+            next = Some((meter.numerator, d));
+        }
+        if let Some((numerator, denominator)) = next {
+            let mut meters: Vec<_> = project.meters().collect();
+            meters[0] = daw_project::MeterChange {
+                bar: 0,
+                numerator,
+                denominator,
+            };
+            if meters[0] != meter {
+                self.edit(Action::SetMeters(meters));
+            }
+        }
+        rect.max.x
     }
 
     /// `◂ PAT 01 ▸` and the PAT/SONG switch, from `x`; returns where they end.
@@ -917,8 +999,7 @@ impl Workspace {
                     at: timeline::snap_f(
                         inputs.engine.playhead as f64,
                         self.snap,
-                        inputs.history.project().bpm,
-                        inputs.engine.sample_rate,
+                        inputs.history.project(),
                     ) as u64,
                 });
             }

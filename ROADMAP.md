@@ -81,11 +81,11 @@ The UI follows Styles.md whichever framework is chosen.
 - [x] Step sequencer: 16-step matrix per track with velocity lane, pattern length in steps
 - [x] Piano roll: draw, move, resize, delete, select (box and shift), velocity lane, snap, keyboard preview, zoom/scroll
 - [x] MIDI editing: quantize, transpose, duplicate, legato, velocity scale and humanize (`daw_project::edit`; piano roll keys Q, arrows, Cmd+D, L, [ ], H)
-- [ ] Standard MIDI file import and export (`.mid`, format 0/1)
-- [ ] MIDI recording into the current pattern (quantize optional)
+- [x] Standard MIDI file import and export (`.mid`, format 0/1): `daw_project::smf`. `.mid` files list in 01; clicking one imports it into the selected track's current pattern (or a new track), lengthening the pattern to whole bars; Cmd+E in the piano roll exports to the samples folder
+- [x] MIDI recording into the current pattern: REC on the SEQUENCER or PIANO ROLL page records live MIDI (keyboard or pads) into the selected track; PAT mode overdubs every loop pass; the take is one undo step. The engine logs live MIDI at the timeline position the performer heard (`EngineHandle::midi_log`). Quantize afterwards with Q
 
 ### Phase 7: Time, Automation and Transport
-- [ ] Tempo map and time-signature map (`daw-project`), ticks ↔ samples through it everywhere; the bar:beat clock and grid follow it
+- [x] Tempo map and time-signature map (`daw-project`), ticks ↔ samples through it everywhere; the bar:beat clock, playlist grid, snap and piano roll follow it. Option-click the playlist ruler to add a tempo change (drag it to set the tempo, right-click removes); the `4/4` readout by the BPM sets the opening meter (drag: beats, right-click: note value). Audio clips stay at their sample positions (no warping yet). Still to do: meter changes after bar 1 in the UI
 - [ ] Loop region on the playlist, metronome (accented downbeat), count-in, punch in/out
 - [ ] Automation lanes: track gain/pan/mute and any plugin or built-in parameter, breakpoints with curve shapes, applied per block chunk on the audio thread; draw/edit in the playlist and piano roll lanes; record automation from the rack (latch/touch)
 - [ ] Transport info to plugins (tempo, position, playing, loop) for CLAP, VST3 and AU; ARA content access for the tempo map

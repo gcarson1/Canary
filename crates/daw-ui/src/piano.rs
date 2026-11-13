@@ -3,7 +3,7 @@
 //! resize, right-click to delete, Cmd-drag to box-select, Shift-click to add to
 //! the selection. The slice tool splits a note. Keys: Delete, Cmd+A, Q quantize,
 //! arrows transpose (Shift: octave) and nudge, Cmd+D duplicate, L legato,
-//! [ and ] velocity down/up 10%, H humanize.
+//! [ and ] velocity down/up 10%, H humanize, Cmd+E export a MIDI file.
 //! A velocity lane sits underneath. Each gesture is one undoable edit.
 
 use std::collections::HashSet;
@@ -212,15 +212,18 @@ pub(crate) fn show(
             t.bg_panel,
         );
     }
-    let beat_px = PPQ as f32 / zoom as f32;
-    let first = (start / PPQ as f64).floor() as u64;
+    // Patterns count bars in the song's opening meter.
+    let meter = project.bar_beat(0).meter;
+    let (beat_ticks, per_bar) = (meter.beat_ticks(), u64::from(meter.numerator));
+    let beat_px = beat_ticks as f32 / zoom as f32;
+    let first = (start / beat_ticks as f64).floor() as u64;
     let rp = p.with_clip_rect(ruler);
     for b in first.. {
-        let x = x_of((b * PPQ) as f64);
+        let x = x_of((b * beat_ticks) as f64);
         if x > grid.max.x {
             break;
         }
-        let bar = b % 4 == 0;
+        let bar = b % per_bar == 0;
         if bar || beat_px >= 0.75 * u {
             gp.vline(
                 m.snap(x),
@@ -232,7 +235,7 @@ pub(crate) fn show(
             rp.text(
                 Pos2::new(x + 0.25 * u, ruler.center().y),
                 Align2::LEFT_CENTER,
-                format!("{}", b / 4 + 1),
+                format!("{}", b / per_bar + 1),
                 m.mono(0.5625),
                 t.faint,
             );
@@ -559,7 +562,7 @@ pub(crate) fn show(
         }
     }
 
-    keys_pressed(ws, ui, project, ti, stored, grid_ticks);
+    keys_pressed(ws, ui, project, ti, stored, grid_ticks, out);
 }
 
 /// Keyboard edits on the selection (or every note when nothing is selected).
@@ -570,6 +573,7 @@ fn keys_pressed(
     ti: usize,
     stored: &[Note],
     grid: u64,
+    out: &mut Vec<Request>,
 ) {
     if ui.ctx().text_edit_focused() || ws.roll.gesture.is_some() {
         return;
@@ -598,6 +602,10 @@ fn keys_pressed(
                     .collect(),
                 Vec::new(),
             )),
+            Key::E if mods.command => {
+                out.push(Request::ExportMidi { track: ti });
+                None
+            }
             Key::A if mods.command => {
                 ws.roll.selected = stored.to_vec();
                 None

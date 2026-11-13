@@ -7,6 +7,7 @@
 mod devices;
 #[cfg(target_os = "macos")]
 mod editor;
+mod take;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -30,6 +31,13 @@ const MAX_BLOCK: usize = 4096;
 /// The reference track's node, just below the device ids; tracks stay under it.
 const REFERENCE_NODE: NodeId = NodeId(devices::FIRST_DEVICE_NODE - 1);
 const AUDIO_EXTENSIONS: [&str; 7] = ["wav", "flac", "mp3", "m4a", "aac", "aif", "aiff"];
+const MIDI_EXTENSIONS: [&str; 2] = ["mid", "midi"];
+
+fn has_extension(path: &Path, list: &[&str]) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| list.contains(&e.to_ascii_lowercase().as_str()))
+}
 
 /// A finished background load.
 struct Loaded {
@@ -78,6 +86,8 @@ struct App {
     devices: Devices,
     /// Open only while a take records, so the microphone is not held between takes.
     recorder: Option<(Recorder, cpal::Stream)>,
+    /// MIDI being recorded into a pattern.
+    midi_take: Option<take::MidiTake>,
     title: String,
     /// The master node until the first plan takes it; it then stays in the
     /// engine for good, so meters keep their history across edits.
@@ -103,11 +113,7 @@ fn audio_files(dir: &Path) -> Vec<PathBuf> {
         .flatten()
         .flatten()
         .map(|e| e.path())
-        .filter(|p| {
-            p.extension()
-                .and_then(|e| e.to_str())
-                .is_some_and(|e| AUDIO_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
-        })
+        .filter(|p| has_extension(p, &AUDIO_EXTENSIONS) || has_extension(p, &MIDI_EXTENSIONS))
         .collect();
     files.sort();
     files
@@ -188,6 +194,7 @@ impl App {
             queued: None,
             devices: Devices::scan(),
             recorder: None,
+            midi_take: None,
             title: String::new(),
             master: Some(Box::new(master)),
             monitor,
@@ -583,10 +590,17 @@ impl App {
             let db = (mix - reference).clamp(-24.0, (-peak).clamp(0.0, 24.0));
             self.monitor.set_reference_gain(10f32.powf(db / 20.0));
         }
-        self.view.recording = self
-            .recorder
-            .as_ref()
-            .is_some_and(|(r, _)| r.is_recording());
+        self.view.recording = self.midi_take.is_some()
+            || self
+                .recorder
+                .as_ref()
+                .is_some_and(|(r, _)| r.is_recording());
+        // Live MIDI the engine played; kept only while a take records.
+        while let Ok(e) = self.engine.midi_log.pop() {
+            if let Some(take) = self.midi_take.as_mut() {
+                take.add(e, self.history.project());
+            }
+        }
     }
 
     fn handle(&mut self, request: Request) {
@@ -603,7 +617,11 @@ impl App {
                 let at = into_loop(self.built_loop, at).unwrap_or(at);
                 command(self, Command::Seek(at))
             }
+            Request::AddFile { track, path, .. } if has_extension(&path, &MIDI_EXTENSIONS) => {
+                self.import_midi(track, &path)
+            }
             Request::AddFile { track, path, at } => self.load(path, Some((track, at))),
+            Request::ExportMidi { track } => self.export_midi(track),
             Request::ToggleRecord => self.toggle_record(),
             Request::AddDevice { track, choice } => {
                 let uid = self.history.new_device_uid();
@@ -706,7 +724,146 @@ impl App {
         }
     }
 
+    /// Reads a MIDI file into `track` (a new one if `None`), replacing its notes
+    /// in the current pattern and lengthening the pattern to whole bars to fit.
+    fn import_midi(&mut self, track: Option<usize>, path: &Path) {
+        let name = path
+            .file_stem()
+            .map_or_else(|| "MIDI".into(), |s| s.to_string_lossy().into_owned());
+        let imported = fs::read(path)
+            .map_err(|e| e.to_string())
+            .and_then(|b| daw_project::smf::read(&b).map_err(|e| e.to_string()));
+        let notes = match imported {
+            Ok(i) if !i.notes.is_empty() => i.notes,
+            Ok(_) => return self.error(format!("{name}: no notes")),
+            Err(e) => return self.error(format!("{name}: {e}")),
+        };
+        let project = self.history.project();
+        let mut batch = Vec::new();
+        let ti = match track.filter(|&t| t < project.tracks.len()) {
+            Some(t) => t,
+            None => {
+                let index = project.tracks.len();
+                batch.push(Action::InsertTrack {
+                    index,
+                    track: Track::new(name.clone()),
+                });
+                index
+            }
+        };
+        let bar = project.bar_tick(1).max(1);
+        let end = notes.iter().map(|n| n.end()).max().unwrap_or(1);
+        let length = (end.div_ceil(bar) * bar).min(daw_project::MAX_TICKS);
+        let (id, create) = self.ws.pattern_for_edit(project);
+        match create {
+            Some(Action::InsertPattern { index, mut pattern }) => {
+                pattern.length = pattern.length.max(length);
+                batch.push(Action::InsertPattern { index, pattern });
+            }
+            _ => {
+                let index = project.patterns.iter().position(|p| p.id == id);
+                if let Some(index) = index.filter(|&i| project.patterns[i].length < length) {
+                    let mut pattern = project.patterns[index].clone();
+                    pattern.length = length;
+                    batch.push(Action::SetPattern { index, pattern });
+                }
+            }
+        }
+        batch.push(Action::SetNotes {
+            track: ti,
+            pattern: id,
+            notes,
+        });
+        match self.history.apply(Action::Batch(batch)) {
+            Ok(()) => {
+                self.ws.selected_track = Some(ti);
+                self.ws.status = Some(Status {
+                    text: format!("IMPORTED {}", name.to_uppercase()),
+                    error: false,
+                });
+            }
+            Err(e) => self.error(format!("{name}: {e}")),
+        }
+    }
+
+    /// Writes `track`'s notes in the current pattern to a MIDI file in the
+    /// samples folder, named after the track and pattern.
+    fn export_midi(&mut self, track: usize) {
+        let project = self.history.project();
+        let (Some(t), Some(pattern)) = (
+            project.tracks.get(track),
+            self.ws
+                .current_pattern(project)
+                .and_then(|id| project.pattern(id)),
+        ) else {
+            return self.error("nothing to export".into());
+        };
+        let notes = t.notes_in(pattern.id);
+        if notes.is_empty() {
+            return self.error("no notes to export".into());
+        }
+        let clean = |s: &str| s.replace(['/', ':'], "-");
+        let file = format!("{} - {}.mid", clean(&t.name), clean(&pattern.name));
+        let bytes = daw_project::smf::write(notes, project.bpm);
+        match fs::write(self.samples_dir.join(&file), bytes) {
+            Ok(()) => {
+                self.files = audio_files(&self.samples_dir);
+                self.ws.status = Some(Status {
+                    text: format!("EXPORTED {}", file.to_uppercase()),
+                    error: false,
+                });
+            }
+            Err(e) => self.error(format!("{file}: {e}")),
+        }
+    }
+
+    /// Starts or ends a MIDI take into the selected track's current pattern
+    /// (made if there is none). The transport plays; in PAT mode the pattern
+    /// loops and every pass overdubs. The take lands as one undo step.
+    fn toggle_midi_take(&mut self) {
+        if let Some(take) = self.midi_take.take() {
+            let _ = self.engine.commands.push(Command::Stop);
+            let project = self.history.project();
+            let Some(t) = project.tracks.get(take.track) else {
+                return self.error("take's track was removed".into());
+            };
+            if project.pattern(take.pattern).is_none() {
+                return self.error("take's pattern was removed".into());
+            }
+            let (track, pattern) = (take.track, take.pattern);
+            let notes = take.finish(t.notes_in(pattern));
+            if let Err(e) = self.history.apply(Action::SetNotes {
+                track,
+                pattern,
+                notes,
+            }) {
+                self.error(format!("take not saved: {e}"));
+            }
+            return;
+        }
+        let Some(track) = self
+            .ws
+            .selected_track
+            .filter(|&t| t < self.history.project().tracks.len())
+        else {
+            return self.error("select a track to record MIDI".into());
+        };
+        let (id, create) = self.ws.pattern_for_edit(self.history.project());
+        if let Some(create) = create {
+            if let Err(e) = self.history.apply(create) {
+                return self.error(format!("cannot record: {e}"));
+            }
+        }
+        let length = self.history.project().pattern(id).map_or(1, |p| p.length);
+        while self.engine.midi_log.pop().is_ok() {} // nothing from before the take
+        self.midi_take = Some(take::MidiTake::new(track, id, length));
+        let _ = self.engine.commands.push(Command::Play);
+    }
+
     fn toggle_record(&mut self) {
+        if self.midi_take.is_some() || self.ws.page != daw_ui::Page::Playlist {
+            return self.toggle_midi_take();
+        }
         if self.recorder.is_none() {
             match daw_engine::start_input(self.view.sample_rate, self.engine.playhead_clock()) {
                 Ok((recorder, stream, _)) => self.recorder = Some((recorder, stream)),

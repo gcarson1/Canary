@@ -12,3 +12,6 @@ CLAUDE.local.md
 
 # Recorded takes from the examples
 *.wav
+
+# Bundled plugin binaries (scripts/fetch_plugins.sh)
+/third_party/plugins/

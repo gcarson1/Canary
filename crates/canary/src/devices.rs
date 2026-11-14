@@ -99,6 +99,7 @@ impl Devices {
                 name: a.info.name.clone(),
                 vendor: a.info.vendor.clone(),
                 format: match a.format {
+                    _ if a.bundled => "STOCK",
                     Format::AudioUnit => "AU",
                     Format::Clap => "CLAP",
                     Format::Vst3 => "VST3",

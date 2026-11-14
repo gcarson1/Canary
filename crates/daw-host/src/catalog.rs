@@ -28,6 +28,8 @@ pub struct Available {
     pub format: Format,
     pub bundle: Option<PathBuf>,
     pub info: PluginInfo,
+    /// Shipped with Canary (`Contents/PlugIns`), not installed by the user.
+    pub bundled: bool,
 }
 
 /// A plugin's main-thread handle and its node for the graph.
@@ -204,6 +206,22 @@ pub struct Catalog {
     vst3: HashMap<PathBuf, Arc<Vst3Bundle>>,
 }
 
+/// Where Canary's bundled plugins live: `Contents/PlugIns` beside the binary in
+/// Canary.app, or the repo's `third_party/plugins` for a `target/<profile>`
+/// build (filled by scripts/fetch_plugins.sh).
+fn bundled_folders() -> Vec<PathBuf> {
+    let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(Path::to_path_buf))
+    else {
+        return Vec::new();
+    };
+    vec![
+        dir.join("../PlugIns"),
+        dir.join("../../third_party/plugins"),
+    ]
+}
+
 /// Where macOS keeps plugins of a format, system-wide then per user.
 fn folders(kind: &str) -> Vec<PathBuf> {
     let mut dirs = vec![PathBuf::from("/Library/Audio/Plug-Ins").join(kind)];
@@ -242,6 +260,7 @@ impl Catalog {
                     format: Format::Builtin,
                     bundle: None,
                     info,
+                    bundled: false,
                 }),
         );
         #[cfg(target_os = "macos")]
@@ -250,32 +269,61 @@ impl Catalog {
                 format: Format::AudioUnit,
                 bundle: None,
                 info,
+                bundled: false,
             }));
+        for path in bundles(&bundled_folders(), "clap") {
+            // SAFETY: Canary's own bundled plugins, from scripts/fetch_plugins.sh.
+            if let Ok(entry) = unsafe { crate::load_bundle(&path) } {
+                c.list(Format::Clap, &path, crate::plugins(&entry), true);
+                c.clap.insert(path, entry);
+            }
+        }
         for path in bundles(&folders("CLAP"), "clap") {
             // SAFETY: plugins in the system plugin folders were installed by the user.
             if let Ok(entry) = unsafe { crate::load_bundle(&path) } {
-                c.list(Format::Clap, &path, crate::plugins(&entry));
-                c.clap.insert(path, entry);
+                // A user's own copy of a bundled plugin would list it twice.
+                let fresh: Vec<_> = crate::plugins(&entry)
+                    .into_iter()
+                    .filter(|p| !c.available.iter().any(|a| a.bundled && a.info.id == p.id))
+                    .collect();
+                if !fresh.is_empty() {
+                    c.list(Format::Clap, &path, fresh, false);
+                    c.clap.insert(path, entry);
+                }
             }
         }
         for path in bundles(&folders("VST3"), "vst3") {
             // SAFETY: as above.
             #[cfg(target_os = "macos")]
             if let Ok(bundle) = unsafe { Vst3Bundle::load(&path) } {
-                c.list(Format::Vst3, &path, bundle.plugins());
+                c.list(Format::Vst3, &path, bundle.plugins(), false);
                 c.vst3.insert(path, bundle);
             }
         }
         c
     }
 
-    fn list(&mut self, format: Format, bundle: &Path, plugins: Vec<PluginInfo>) {
+    fn list(&mut self, format: Format, bundle: &Path, plugins: Vec<PluginInfo>, bundled: bool) {
         self.available
             .extend(plugins.into_iter().map(|info| Available {
                 format,
                 bundle: Some(bundle.to_path_buf()),
                 info,
+                bundled,
             }));
+    }
+
+    /// The CLAP bundle to load for `id`: the saved path, or, when that is gone
+    /// (a project saved from another build of Canary), the bundled copy.
+    fn clap_path(&self, bundle: Option<&Path>, id: &str) -> Option<PathBuf> {
+        match bundle {
+            Some(path) if self.clap.contains_key(path) || path.exists() => Some(path.to_path_buf()),
+            _ => self
+                .available
+                .iter()
+                .find(|a| a.bundled && a.format == Format::Clap && a.info.id == id)
+                .and_then(|a| a.bundle.clone()),
+        }
     }
 
     /// Makes an instance of a plugin found by [`Catalog::scan`] (or saved in a
@@ -291,7 +339,7 @@ impl Catalog {
         let missing = || HostError::UnknownPlugin(id.to_owned());
         match format {
             Format::Clap => {
-                let path = bundle.ok_or_else(missing)?;
+                let path = &self.clap_path(bundle, id).ok_or_else(missing)?;
                 if !self.clap.contains_key(path) {
                     // SAFETY: the user chose this plugin.
                     let entry = unsafe { crate::load_bundle(path) }?;
@@ -340,7 +388,7 @@ impl Catalog {
         let missing = || HostError::UnknownPlugin(id.to_owned());
         match format {
             Format::Clap => {
-                let path = bundle.ok_or_else(missing)?;
+                let path = &self.clap_path(bundle, id).ok_or_else(missing)?;
                 if !self.clap.contains_key(path) {
                     // SAFETY: the user chose this plugin.
                     let entry = unsafe { crate::load_bundle(path) }?;

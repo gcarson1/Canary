@@ -23,7 +23,9 @@ Phases and progress live in ROADMAP.md: tick its checkboxes as work lands. The s
 - Lint/format: `cargo clippy --workspace -- -D warnings` and `cargo fmt --all`
 - Gate before committing: `scripts/check.sh` (fmt check, clippy `-D warnings`, all tests)
 - Run the app: `cargo run --release -p canary -- [project.daw] [--samples DIR]` (samples default to `~/Music/Canary`)
+- Bundled instruments: `scripts/fetch_plugins.sh` (run once before `bundle.sh` to include Surge XT, Dexed, OB-Xf)
 - Signed app bundle: `scripts/bundle.sh` (optional `SIGN_IDENTITY="Developer ID Application: …"`)
+- `cargo run --release -p daw-host --example stock_check` plays a note through each bundled instrument
 - `cargo test -p daw-ui` runs the Styles.md QA protocol and writes renders to `target/qa/`
 
 ## Conventions

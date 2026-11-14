@@ -19,6 +19,10 @@ use clack_host::events::Match;
 use clack_host::prelude::*;
 use daw_core::{MidiEvent, ProcessContext};
 use daw_graph::{AudioNode, MAX_CHANNELS};
+
+/// Audio ports a CLAP plugin may declare per direction (Surge XT has a main
+/// port and a sidechain).
+const MAX_PORTS: usize = 8;
 use rtrb::{Consumer, Producer, RingBuffer};
 
 /// Parameter changes waiting for the audio thread.
@@ -60,7 +64,7 @@ impl fmt::Display for HostError {
             }
             Self::ExtraPorts => write!(
                 f,
-                "plugins with more than one input or output port are not supported yet"
+                "plugin has more audio ports or buses than Canary supports"
             ),
             Self::State => write!(f, "plugin could not save or load its state"),
             Self::Status(s) => write!(f, "Audio Unit call failed (OSStatus {s})"),
@@ -265,12 +269,13 @@ impl ClapPlugin {
         let factory = entry.get_plugin_factory().ok_or(HostError::NoFactory)?;
         let unknown = || HostError::UnknownPlugin(id.to_owned());
         let cid = CString::new(id).map_err(|_| unknown())?;
-        if !factory
+        let descriptor = factory
             .plugin_descriptors()
-            .any(|d| d.id() == Some(cid.as_c_str()))
-        {
-            return Err(unknown());
-        }
+            .find(|d| d.id() == Some(cid.as_c_str()))
+            .ok_or_else(unknown)?;
+        // A synth may declare an audio input (Surge XT's audio-in oscillator);
+        // it is still an instrument, so it gets MIDI and leads the track.
+        let instrument = descriptor.features().any(|f| f.to_bytes() == b"instrument");
         let host_info = HostInfo::new(
             "Canary",
             "Canary",
@@ -288,25 +293,30 @@ impl ClapPlugin {
 
         let (inputs, outputs) = {
             let handle = instance.plugin_handle();
-            // Channels of the single port of each kind, or None for no port. The
-            // plugin must be handed exactly the ports it declared.
-            let channels = |is_input| -> Result<Option<u32>, HostError> {
+            // Channels of each port of a kind, the main one first (CLAP puts it
+            // at index 0). The plugin must be handed exactly the ports it
+            // declared; ports past the main one (a sidechain, extra outputs) get
+            // silence and are not heard yet.
+            let channels = |is_input| -> Result<Vec<u32>, HostError> {
                 let Some(ports) = handle.get_extension::<PluginAudioPorts>() else {
-                    return Ok(None);
+                    return Ok(Vec::new());
                 };
-                match ports.count(&handle, is_input) {
-                    0 => return Ok(None),
-                    1 => {}
-                    _ => return Err(HostError::ExtraPorts),
+                let count = ports.count(&handle, is_input);
+                if count as usize > MAX_PORTS {
+                    return Err(HostError::ExtraPorts);
                 }
-                let mut buffer = AudioPortInfoBuffer::new();
-                let n = ports
-                    .get(&handle, 0, is_input, &mut buffer)
-                    .map_or(0, |p| p.channel_count);
-                if n as usize > MAX_CHANNELS {
-                    return Err(HostError::TooManyChannels(n));
-                }
-                Ok(Some(n))
+                (0..count)
+                    .map(|i| {
+                        let mut buffer = AudioPortInfoBuffer::new();
+                        let n = ports
+                            .get(&handle, i, is_input, &mut buffer)
+                            .map_or(0, |p| p.channel_count);
+                        if n as usize > MAX_CHANNELS {
+                            return Err(HostError::TooManyChannels(n));
+                        }
+                        Ok(n)
+                    })
+                    .collect()
             };
             (channels(true)?, channels(false)?)
         };
@@ -363,20 +373,26 @@ impl ClapPlugin {
         };
 
         let (param_changes, param_rx) = RingBuffer::new(PARAM_QUEUE_CAPACITY);
-        let buffers = |n: Option<u32>| {
-            (0..n.unwrap_or(0))
-                .map(|_| vec![0.0; max_block].into_boxed_slice())
+        let buffers = |ports: &[u32]| {
+            ports
+                .iter()
+                .map(|&n| {
+                    (0..n)
+                        .map(|_| vec![0.0; max_block].into_boxed_slice())
+                        .collect()
+                })
                 .collect()
         };
-        let ports = |n: Option<u32>| AudioPorts::with_capacity(n.unwrap_or(0) as usize, 1);
+        let ports = |ports: &[u32]| {
+            let channels = ports.iter().sum::<u32>() as usize;
+            AudioPorts::with_capacity(channels, ports.len())
+        };
         let node = PluginNode {
             processor: processor.into(),
-            input_ports: ports(inputs),
-            output_ports: ports(outputs),
-            has_input: inputs.is_some(),
-            has_output: outputs.is_some(),
-            inputs: buffers(inputs),
-            outputs: buffers(outputs),
+            input_ports: ports(&inputs),
+            output_ports: ports(&outputs),
+            inputs: buffers(&inputs),
+            outputs: buffers(&outputs),
             max_block,
             events: EventBuffer::with_capacity(EVENT_CAPACITY),
             param_changes: param_rx,
@@ -387,7 +403,7 @@ impl ClapPlugin {
         Ok((
             ClapPlugin {
                 instance,
-                audio_input: inputs.is_some(),
+                audio_input: !inputs.is_empty() && !instrument,
                 params,
                 param_changes,
                 latency,
@@ -534,6 +550,9 @@ impl Drop for ClapPlugin {
     }
 }
 
+/// One audio port's channel buffers.
+type Port = Box<[Box<[f32]>]>;
+
 /// Audio-thread side of a hosted CLAP plugin. Copies its inputs into the plugin's
 /// main input port, sends live MIDI (notes as CLAP note events, everything else as
 /// raw MIDI) and parameter changes, and copies the main output port to its outputs.
@@ -542,10 +561,9 @@ pub struct PluginNode {
     processor: PluginAudioProcessor<CanaryHost>,
     input_ports: AudioPorts,
     output_ports: AudioPorts,
-    has_input: bool,
-    has_output: bool,
-    inputs: Box<[Box<[f32]>]>,
-    outputs: Box<[Box<[f32]>]>,
+    /// Per port; port 0 is the main one.
+    inputs: Box<[Port]>,
+    outputs: Box<[Port]>,
     /// The plugin was activated for blocks up to this long.
     max_block: usize,
     events: EventBuffer,
@@ -649,36 +667,37 @@ impl AudioNode for PluginNode {
             }
             return;
         }
-        // Untrusted plugins get pre-zeroed inputs where nothing feeds them.
-        for (ch, buffer) in self.inputs.iter_mut().enumerate() {
-            match inputs.get(ch) {
-                Some(input) => buffer[..n].copy_from_slice(input),
-                None => buffer[..n].fill(0.0),
+        // Untrusted plugins get pre-zeroed inputs where nothing feeds them: the
+        // node's inputs go to the main port, other ports hear silence.
+        for (port, buffers) in self.inputs.iter_mut().enumerate() {
+            for (ch, buffer) in buffers.iter_mut().enumerate() {
+                match inputs.get(ch).filter(|_| port == 0) {
+                    Some(input) => buffer[..n].copy_from_slice(input),
+                    None => buffer[..n].fill(0.0),
+                }
             }
         }
-        for buffer in self.outputs.iter_mut() {
+        for buffer in self.outputs.iter_mut().flatten() {
             buffer[..n].fill(0.0);
         }
         self.fill_events(midi_in, n as u32);
 
         let ok = match self.processor.ensure_processing_started() {
             Ok(processor) => {
-                let audio_in = self.input_ports.with_input_buffers(
-                    self.has_input.then_some(AudioPortBuffer {
+                let audio_in = self
+                    .input_ports
+                    .with_input_buffers(self.inputs.iter_mut().map(|port| AudioPortBuffer {
                         latency: 0,
                         channels: AudioPortBufferType::f32_input_only(
-                            self.inputs
-                                .iter_mut()
-                                .map(|b| InputChannel::variable(&mut b[..n])),
+                            port.iter_mut().map(|b| InputChannel::variable(&mut b[..n])),
                         ),
-                    }),
-                );
+                    }));
                 let mut audio_out =
                     self.output_ports
-                        .with_output_buffers(self.has_output.then_some(AudioPortBuffer {
+                        .with_output_buffers(self.outputs.iter_mut().map(|port| AudioPortBuffer {
                             latency: 0,
                             channels: AudioPortBufferType::f32_output_only(
-                                self.outputs.iter_mut().map(|b| &mut b[..n]),
+                                port.iter_mut().map(|b| &mut b[..n]),
                             ),
                         }));
                 processor
@@ -697,11 +716,12 @@ impl AudioNode for PluginNode {
         };
         self.steady_time += n as u64;
 
-        let last = self.outputs.len().checked_sub(1);
+        let main: &[Box<[f32]>] = self.outputs.first().map_or(&[], |p| p);
+        let last = main.len().checked_sub(1);
         for (ch, output) in outputs.iter_mut().enumerate() {
             match last {
                 Some(last) if ok && (ch <= last || last == 0) => {
-                    output.copy_from_slice(&self.outputs[ch.min(last)][..n]);
+                    output.copy_from_slice(&main[ch.min(last)][..n]);
                 }
                 _ => output.fill(0.0),
             }

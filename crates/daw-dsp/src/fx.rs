@@ -1,4 +1,4 @@
-//! The stock effects: EQ, reverb, delay, limiter, gate, filter, chorus,
+//! The stock effects: EQ, reverb, delay, limiter, phaser, gate, filter, chorus,
 //! bitcrusher and utility. Every buffer is sized in `set_sample_rate` (on the
 //! main thread, when the effect is made), so `process` never allocates.
 
@@ -316,14 +316,38 @@ impl Effect for Reverb {
 
 // ---------------------------------------------------------------- Delay
 
+/// Note lengths SYNC picks, in quarter notes: off (TIME MS), then 1/32, 1/16T,
+/// 1/16, 1/16D, 1/8T, 1/8, 1/8D, 1/4T, 1/4, 1/4D, 1/2, 1/1.
+pub const DELAY_SYNC: [f32; 13] = [
+    0.0,
+    0.125,
+    1.0 / 6.0,
+    0.25,
+    0.375,
+    1.0 / 3.0,
+    0.5,
+    0.75,
+    2.0 / 3.0,
+    1.0,
+    1.5,
+    2.0,
+    4.0,
+];
+/// The longest echo, in seconds: 1/1 at 60 BPM.
+const DELAY_MAX_SECONDS: f32 = 4.0;
+
 /// Stereo delay with feedback through a tone low-pass; PING-PONG crosses the
-/// feedback between sides. Wet only.
+/// feedback between sides. SYNC locks the time to a note length at the song
+/// tempo. Wet only.
 #[derive(Default)]
 pub struct Delay {
     sr: f32,
     lines: [Box<[f32]>; 2],
     pos: usize,
     time: Smoother,
+    time_ms: f32,
+    sync: usize,
+    bpm: f32,
     feedback: f32,
     ping_pong: bool,
     tone: [Biquad; 2],
@@ -331,12 +355,26 @@ pub struct Delay {
 }
 
 impl Delay {
-    const PARAMS: [ParamSpec; 4] = [
+    const PARAMS: [ParamSpec; 5] = [
         spec("TIME MS", 1.0, 2_000.0, 375.0),
         spec("FEEDBACK", 0.0, 95.0, 40.0),
         spec("PINGPONG", 0.0, 1.0, 0.0),
         freq("TONE", 500.0, 20_000.0, 8_000.0),
+        spec("SYNC", 0.0, 12.0, 0.0),
     ];
+
+    /// Points the time glide at TIME MS, or at the synced note length.
+    fn retime(&mut self) {
+        let beats = DELAY_SYNC[self.sync];
+        let seconds = if beats > 0.0 {
+            let bpm = if self.bpm > 0.0 { self.bpm } else { 120.0 };
+            beats * 60.0 / bpm
+        } else {
+            self.time_ms / 1000.0
+        };
+        self.time
+            .set_target(seconds.min(DELAY_MAX_SECONDS) * self.sr);
+    }
 }
 
 impl Effect for Delay {
@@ -345,7 +383,10 @@ impl Effect for Delay {
     }
     fn set_param(&mut self, index: usize, value: f32) {
         match index {
-            0 => self.time.set_target(value / 1000.0 * self.sr),
+            0 => {
+                self.time_ms = value;
+                self.retime();
+            }
             1 => self.feedback = value / 100.0,
             2 => self.ping_pong = value >= 0.5,
             3 => {
@@ -354,18 +395,23 @@ impl Effect for Delay {
                     t.set(FilterKind::LowPass, value, 0.7, self.sr.max(1.0));
                 }
             }
+            4 => {
+                self.sync = (value.round() as usize).min(DELAY_SYNC.len() - 1);
+                self.retime();
+            }
             _ => {}
         }
     }
     fn set_sample_rate(&mut self, sample_rate: f32) {
         self.sr = sample_rate;
-        let len = (2.0 * sample_rate) as usize + 4;
+        let len = (DELAY_MAX_SECONDS * sample_rate) as usize + 4;
         self.lines = [
             vec![0.0; len].into_boxed_slice(),
             vec![0.0; len].into_boxed_slice(),
         ];
         // Glides slowly, so turning TIME bends the pitch like tape, never clicks.
         self.time.set_time(0.2, sample_rate);
+        self.retime();
         let tone = if self.tone_hz > 0.0 {
             self.tone_hz
         } else {
@@ -403,6 +449,14 @@ impl Effect for Delay {
             *r = out[1];
         }
     }
+    fn set_tempo(&mut self, bpm: f32) {
+        if bpm != self.bpm {
+            self.bpm = bpm;
+            if self.sync > 0 {
+                self.retime();
+            }
+        }
+    }
     fn reset(&mut self) {
         self.lines.iter_mut().for_each(|l| l.fill(0.0));
         self.tone.iter_mut().for_each(Biquad::reset);
@@ -412,16 +466,73 @@ impl Effect for Delay {
 
 // ---------------------------------------------------------------- Limiter
 
-/// A brickwall peak limiter: instant attack, smooth release, never above the
-/// ceiling (a final clamp catches what the envelope cannot). No lookahead, so
-/// no latency.
+/// Lookahead the limiter's gain has to reach its target before a peak.
+const LOOKAHEAD_SECONDS: f32 = 0.0015;
+/// Samples `TruePeak` lags its input: its interpolator's half length.
+const TRUE_PEAK_LAG: usize = 6;
+
+/// The minimum of the last `w` values pushed (a monotonic queue in a fixed ring).
+#[derive(Default)]
+struct MinWindow {
+    at: Box<[u64]>,
+    value: Box<[f32]>,
+    head: usize,
+    len: usize,
+    count: u64,
+}
+
+impl MinWindow {
+    fn new(w: usize) -> Self {
+        Self {
+            at: vec![0; w].into_boxed_slice(),
+            value: vec![0.0; w].into_boxed_slice(),
+            ..Self::default()
+        }
+    }
+
+    fn push(&mut self, v: f32) -> f32 {
+        let w = self.at.len();
+        // Values not smaller than `v` can never be the minimum again.
+        while self.len > 0 && self.value[(self.head + self.len - 1) % w] >= v {
+            self.len -= 1;
+        }
+        let back = (self.head + self.len) % w;
+        (self.at[back], self.value[back]) = (self.count, v);
+        self.len += 1;
+        // Drop what has left the window.
+        while self.at[self.head] + w as u64 <= self.count {
+            self.head = (self.head + 1) % w;
+            self.len -= 1;
+        }
+        self.count += 1;
+        self.value[self.head]
+    }
+
+    fn reset(&mut self) {
+        (self.head, self.len, self.count) = (0, 0, 0);
+    }
+}
+
+/// A true-peak lookahead limiter. Each sample's required gain (ceiling over its
+/// 4x-interpolated peak) is held for the whole lookahead, released, then
+/// averaged over the lookahead, so the gain glides down and is already at or
+/// below the target when the peak leaves the delay. A final clamp catches the
+/// rest. Latency: 1.5 ms plus the true-peak detector's lag.
 #[derive(Default)]
 pub struct Limiter {
     sr: f32,
     input: Smoother,
     ceiling: f32,
     release: f32,
-    gain: f32,
+    env: f32,
+    peaks: [crate::TruePeak; 2],
+    hold: MinWindow,
+    /// The last `lookahead + 1` envelope values and their sum.
+    average: Box<[f32]>,
+    sum: f64,
+    avg_pos: usize,
+    delay: [Box<[f32]>; 2],
+    delay_pos: usize,
 }
 
 impl Limiter {
@@ -447,32 +558,150 @@ impl Effect for Limiter {
     fn set_sample_rate(&mut self, sample_rate: f32) {
         self.sr = sample_rate;
         self.input.set_time(GLIDE, sample_rate);
-        self.gain = 1.0;
+        let lookahead = (LOOKAHEAD_SECONDS * sample_rate).round().max(1.0) as usize;
+        // The hold also covers the detector's lag, so a peak it reports late is
+        // still held over the sample it belongs to.
+        self.hold = MinWindow::new(lookahead + TRUE_PEAK_LAG + 1);
+        self.average = vec![1.0; lookahead + 1].into_boxed_slice();
+        let delay = lookahead + TRUE_PEAK_LAG;
+        self.delay = [
+            vec![0.0; delay].into_boxed_slice(),
+            vec![0.0; delay].into_boxed_slice(),
+        ];
+        self.reset();
+    }
+    fn latency(&self) -> u32 {
+        self.delay[0].len() as u32
     }
     fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
+        let (n, m) = (self.delay[0].len(), self.average.len());
+        if n == 0 {
+            return;
+        }
+        let c = self.ceiling;
         for (l, r) in left.iter_mut().zip(right.iter_mut()) {
             let g_in = self.input.tick();
             let (xl, xr) = (*l * g_in, *r * g_in);
-            let peak = xl.abs().max(xr.abs());
-            let want = if peak > self.ceiling {
-                self.ceiling / peak
+            let peak = self.peaks[0]
+                .process(&[xl])
+                .max(self.peaks[1].process(&[xr]));
+            let want = if peak > c { c / peak } else { 1.0 };
+            let held = self.hold.push(want);
+            // Down at once, back up at the release rate: never above `held`.
+            self.env = if held < self.env {
+                held
             } else {
-                1.0
+                held + (self.env - held) * self.release
             };
-            // Down at once, back up at the release rate.
-            self.gain = if want < self.gain {
-                want
-            } else {
-                want + (self.gain - want) * self.release
-            };
-            let c = self.ceiling;
-            *l = (xl * self.gain).clamp(-c, c);
-            *r = (xr * self.gain).clamp(-c, c);
+            self.sum += f64::from(self.env) - f64::from(self.average[self.avg_pos]);
+            self.average[self.avg_pos] = self.env;
+            self.avg_pos = (self.avg_pos + 1) % m;
+            let gain = (self.sum / m as f64) as f32;
+            let i = self.delay_pos;
+            let (dl, dr) = (self.delay[0][i], self.delay[1][i]);
+            (self.delay[0][i], self.delay[1][i]) = (xl, xr);
+            self.delay_pos = (i + 1) % n;
+            *l = (dl * gain).clamp(-c, c);
+            *r = (dr * gain).clamp(-c, c);
         }
     }
     fn reset(&mut self) {
-        self.gain = 1.0;
+        self.env = 1.0;
         self.input.settle();
+        self.peaks.iter_mut().for_each(crate::TruePeak::reset);
+        self.hold.reset();
+        self.average.fill(1.0);
+        self.sum = self.average.len() as f64;
+        self.avg_pos = 0;
+        self.delay.iter_mut().for_each(|d| d.fill(0.0));
+        self.delay_pos = 0;
+    }
+}
+
+// ---------------------------------------------------------------- Phaser
+
+/// A classic phaser: a chain of first-order all-passes swept by an LFO (the
+/// right side a quarter turn on), with feedback, mixed half and half with the
+/// input so the notches form. The node's MIX sets how much of that is heard.
+#[derive(Default)]
+pub struct Phaser {
+    sr: f32,
+    phase: f32,
+    rate: f32,
+    depth: f32,
+    center: f32,
+    feedback: f32,
+    stages: usize,
+    /// Per side: each stage's state, and the last output for the feedback.
+    state: [[f32; Phaser::MAX_STAGES]; 2],
+    last: [f32; 2],
+    coef: [f32; 2],
+}
+
+impl Phaser {
+    const MAX_STAGES: usize = 12;
+    const PARAMS: [ParamSpec; 5] = [
+        spec("RATE", 0.05, 10.0, 0.5),
+        spec("DEPTH", 0.0, 100.0, 70.0),
+        freq("CENTER", 100.0, 5_000.0, 800.0),
+        spec("FEEDBACK", 0.0, 90.0, 30.0),
+        spec("STAGES", 2.0, 12.0, 6.0),
+    ];
+}
+
+impl Effect for Phaser {
+    fn params(&self) -> &'static [ParamSpec] {
+        &Self::PARAMS
+    }
+    fn set_param(&mut self, index: usize, value: f32) {
+        match index {
+            0 => self.rate = value,
+            1 => self.depth = value / 100.0,
+            2 => self.center = value,
+            3 => self.feedback = value / 100.0,
+            // Even counts: odd ones leave a phase-inverted sweep.
+            4 => self.stages = ((value / 2.0).round() as usize * 2).clamp(2, Self::MAX_STAGES),
+            _ => {}
+        }
+    }
+    fn set_sample_rate(&mut self, sample_rate: f32) {
+        self.sr = sample_rate;
+    }
+    fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
+        let sr = self.sr.max(1.0);
+        let step = TAU * self.rate / sr;
+        for (i, (l, r)) in left.iter_mut().zip(right.iter_mut()).enumerate() {
+            // The sweep moves slowly: retune every 8 samples.
+            if i % 8 == 0 {
+                for (side, c) in self.coef.iter_mut().enumerate() {
+                    let lfo = (self.phase + side as f32 * FRAC_PI_4 * 2.0).sin();
+                    // Two octaves either way at full depth.
+                    let f =
+                        (self.center * 2f32.powf(2.0 * self.depth * lfo)).clamp(20.0, 0.45 * sr);
+                    let t = (std::f32::consts::PI * f / sr).tan();
+                    *c = (t - 1.0) / (t + 1.0);
+                }
+            }
+            for (side, s) in [l, r].into_iter().enumerate() {
+                let (a, x) = (self.coef[side], *s);
+                let mut y = x + self.last[side] * self.feedback;
+                for z in &mut self.state[side][..self.stages] {
+                    let out = a * y + *z;
+                    *z = y - a * out;
+                    y = out;
+                }
+                if y.abs() < 1e-15 {
+                    y = 0.0;
+                }
+                self.last[side] = y;
+                *s = 0.5 * (x + y);
+            }
+            self.phase = (self.phase + step) % TAU;
+        }
+    }
+    fn reset(&mut self) {
+        self.state = [[0.0; Self::MAX_STAGES]; 2];
+        self.last = [0.0; 2];
     }
 }
 
@@ -895,6 +1124,69 @@ mod tests {
         );
         assert!(peak(&l) <= db_to_gain(-1.0) + 1e-6);
         assert!(peak(&l) > db_to_gain(-1.5), "and gets close to it");
+    }
+
+    #[test]
+    fn limiter_holds_the_true_peak_and_reports_its_lookahead() {
+        let fx = effect("canary.limiter", SR).unwrap();
+        let latency = fx.latency() as usize;
+        assert_eq!(
+            latency,
+            72 + TRUE_PEAK_LAG,
+            "1.5 ms at 48 kHz plus the detector"
+        );
+        // Near a quarter of the rate, a 45° phase hides the peak between samples.
+        let x: Vec<f32> = (0..48_000)
+            .map(|i| 0.9 * (TAU * 11_990.0 * i as f32 / SR + FRAC_PI_4).sin())
+            .collect();
+        let (l, _) = run("canary.limiter", &[(0, 6.0), (1, -1.0)], &x);
+        let mut tp = crate::TruePeak::default();
+        let true_peak = tp.process(&l[4_800..]);
+        assert!(
+            gain_to_db(true_peak) < -0.9,
+            "{} dBTP",
+            gain_to_db(true_peak)
+        );
+        // Below the ceiling it is a clean delay by its latency.
+        let quiet = sine(1_000.0, 0.1, 4_800);
+        let (l, _) = run("canary.limiter", &[], &quiet);
+        let err = l[latency..]
+            .iter()
+            .zip(&quiet)
+            .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+        assert!(err < 1e-6, "{err}");
+    }
+
+    #[test]
+    fn synced_delay_follows_the_tempo() {
+        let mut click = vec![0.0; 48_000];
+        click[0] = 1.0;
+        let mut fx = effect("canary.delay", SR).unwrap();
+        // 1/8 (index 6) at 150 BPM: 0.2 s.
+        fx.set_tempo(150.0);
+        fx.set_param(4, 6.0);
+        fx.set_param(3, 20_000.0);
+        fx.reset();
+        let (mut l, mut r) = (click.clone(), click);
+        fx.process(&mut l, &mut r);
+        let echo: f32 = l[9_570..9_650].iter().sum();
+        assert!(echo > 0.9, "echo at 9600 samples: {echo}");
+        assert!(l[..9_500].iter().all(|s| s.abs() < 1e-3));
+    }
+
+    #[test]
+    fn phaser_notch_sweeps_with_its_lfo() {
+        // A steady tone rises and falls in level as the notches pass over it.
+        let (l, _) = run(
+            "canary.phaser",
+            &[(0, 2.0), (1, 100.0), (2, 1_000.0)],
+            &sine(1_000.0, 0.5, 48_000),
+        );
+        let levels: Vec<f32> = l[4_800..].chunks(480).map(peak).collect();
+        let (lo, hi) = levels
+            .iter()
+            .fold((f32::MAX, 0.0f32), |(a, b), &v| (a.min(v), b.max(v)));
+        assert!(hi > 0.45 && lo < 0.2, "{lo} {hi}");
     }
 
     #[test]

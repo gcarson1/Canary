@@ -55,10 +55,17 @@ pub trait Effect: Send {
     }
     /// Clears signal state and jumps every gliding knob to its value.
     fn reset(&mut self);
+    /// Samples the output lags the input (lookahead). Fixed once the sample rate
+    /// is set, so the graph can size its dry delay and PDC once.
+    fn latency(&self) -> u32 {
+        0
+    }
+    /// The song tempo, called before each block; for tempo-synced effects.
+    fn set_tempo(&mut self, _bpm: f32) {}
 }
 
 /// The built-in effects by id, for the device picker: (id, display name).
-pub const EFFECTS: [(&str, &str); 13] = [
+pub const EFFECTS: [(&str, &str); 14] = [
     ("canary.eq", "EQ"),
     ("canary.compressor", "Compressor"),
     ("canary.limiter", "Limiter"),
@@ -70,6 +77,7 @@ pub const EFFECTS: [(&str, &str); 13] = [
     ("canary.reverb", "Reverb"),
     ("canary.delay", "Delay"),
     ("canary.chorus", "Chorus / Flanger"),
+    ("canary.phaser", "Phaser"),
     ("canary.crusher", "Bitcrusher"),
     ("canary.utility", "Utility"),
 ];
@@ -88,6 +96,7 @@ pub fn effect(id: &str, sample_rate: f32) -> Option<Box<dyn Effect>> {
         "canary.reverb" => Box::new(crate::fx::Reverb::default()),
         "canary.delay" => Box::new(crate::fx::Delay::default()),
         "canary.chorus" => Box::new(crate::fx::Chorus::default()),
+        "canary.phaser" => Box::new(crate::fx::Phaser::default()),
         "canary.crusher" => Box::new(crate::fx::Crusher::default()),
         "canary.utility" => Box::new(crate::fx::Utility::default()),
         _ => return None,

@@ -90,6 +90,10 @@ pub struct EffectNode {
     /// The values last handed to `effect`; NaN forces the first update.
     seen: Box<[f32]>,
     dry: [Box<[f32]>; 2],
+    /// Delays the dry signal by the effect's latency, so MIX, MATCH and DELTA
+    /// compare it with the wet signal it became.
+    dry_line: [Box<[f32]>; 2],
+    dry_pos: usize,
     mix: f32,
     /// 1 normally, 0 in delta; ramps like `mix`.
     keep: f32,
@@ -112,12 +116,15 @@ impl EffectNode {
     ) -> (Self, Arc<ParamBank>) {
         let specs = effect.params().iter().chain(&COMMON).copied().collect();
         let params = Arc::new(ParamBank::new(specs));
+        let latency = effect.latency() as usize;
         let coef = |seconds: f32| 1.0 - (-1.0 / (seconds * sample_rate)).exp();
         let node = Self {
             seen: vec![f32::NAN; effect.params().len()].into_boxed_slice(),
             effect,
             params: params.clone(),
             dry: std::array::from_fn(|_| vec![0.0; max_block].into_boxed_slice()),
+            dry_line: std::array::from_fn(|_| vec![0.0; latency].into_boxed_slice()),
+            dry_pos: 0,
             mix: 1.0,
             keep: 1.0,
             matched: false,
@@ -132,6 +139,10 @@ impl EffectNode {
 }
 
 impl AudioNode for EffectNode {
+    fn latency_samples(&self) -> u32 {
+        self.dry_line[0].len() as u32
+    }
+
     /// Writes the shared parameter, so the rack's dial follows the automation.
     fn automate(&mut self, id: u32, value: f64) {
         self.params.set(id as usize, value as f32);
@@ -160,6 +171,7 @@ impl AudioNode for EffectNode {
             // Start at the loaded values instead of gliding from the defaults.
             self.effect.reset();
         }
+        self.effect.set_tempo(context.musical.bpm as f32);
         let common = |i: usize| self.params.get(own + i).unwrap_or(COMMON[i].default);
         let mix = common(0) / 100.0;
         let matching = common(1) >= 0.5;
@@ -189,6 +201,17 @@ impl AudioNode for EffectNode {
                     dry[..n].fill(0.0);
                 }
             }
+        }
+        let len = self.dry_line[0].len();
+        if len > 0 {
+            for (dry, line) in self.dry.iter_mut().zip(&mut self.dry_line) {
+                let mut pos = self.dry_pos;
+                for d in &mut dry[..n] {
+                    std::mem::swap(d, &mut line[pos]);
+                    pos = (pos + 1) % len;
+                }
+            }
+            self.dry_pos = (self.dry_pos + n) % len;
         }
         // Inputs 2 and 3, when the plan wires them, are the sidechain key.
         match inputs {
@@ -233,6 +256,7 @@ impl AudioNode for EffectNode {
 
     fn reset(&mut self) {
         self.effect.reset();
+        self.dry_line.iter_mut().for_each(|l| l.fill(0.0));
         self.dry_ms = 0.0;
         self.wet_ms = 0.0;
         self.gain = 1.0;
@@ -373,5 +397,34 @@ mod tests {
         assert_eq!(c, [0.0; 4]);
         node.process(&[&input], &mut [&mut a], &[], &mut Vec::new(), &ctx(4));
         assert_eq!(a, [0.0; 4]);
+    }
+
+    #[test]
+    fn dry_is_delayed_by_the_effects_latency() {
+        // A limiter below its ceiling is a pure delay: at half MIX the dry half
+        // must line up with it, not comb against it.
+        let fx = effect("canary.limiter", SR).unwrap();
+        let (mut node, params) = EffectNode::new(fx, SR, 64);
+        let latency = node.latency_samples() as usize;
+        assert!(latency > 0);
+        params.set(3, 50.0); // MIX, after the limiter's 3 params
+        let input: Vec<f32> = (0..4_096).map(|i| 0.1 * (i as f32 * 0.05).sin()).collect();
+        let mut out = Vec::new();
+        for block in input.chunks(64) {
+            let (mut l, mut r) = ([0.0f32; 64], [0.0f32; 64]);
+            node.process(
+                &[block, block],
+                &mut [&mut l, &mut r],
+                &[],
+                &mut Vec::new(),
+                &ctx(64),
+            );
+            out.extend_from_slice(&l);
+        }
+        let err = out[latency + 128..]
+            .iter()
+            .zip(&input[128..])
+            .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+        assert!(err < 1e-5, "{err}");
     }
 }

@@ -49,11 +49,13 @@ pub fn instantiate(id: &str, sample_rate: f32, max_block: usize) -> Result<Insta
             log: p.log,
         })
         .collect();
+    let latency = node.latency_samples();
     Ok((
         Box::new(Builtin {
             params,
             infos,
             instrument,
+            latency,
         }),
         node,
     ))
@@ -64,6 +66,8 @@ struct Builtin {
     infos: Vec<ParamInfo>,
     /// The synth: no audio input, plays MIDI.
     instrument: bool,
+    /// Fixed for the instance (lookahead), so PDC is sized once.
+    latency: u32,
 }
 
 impl Hosted for Builtin {
@@ -97,7 +101,7 @@ impl Hosted for Builtin {
         Ok(())
     }
     fn latency_samples(&self) -> u32 {
-        0
+        self.latency
     }
     fn has_audio_input(&self) -> bool {
         !self.instrument

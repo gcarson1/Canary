@@ -10,24 +10,25 @@ use std::ffi::{c_void, CStr};
 use std::ptr::{self, NonNull};
 use std::sync::Arc;
 
-use daw_core::{MidiEvent, ProcessContext};
+use daw_core::{MidiEvent, Musical, ProcessContext};
 use daw_graph::{AudioNode, MAX_CHANNELS};
 use objc2::encode::{Encode, Encoding};
 use objc2::rc::{Allocated, Retained};
 use objc2::runtime::{AnyClass, AnyObject};
 use objc2::{msg_send, sel};
 use objc2_audio_toolbox::{
-    kAudioUnitProperty_ClassInfo, kAudioUnitProperty_CocoaUI, kAudioUnitProperty_Latency,
-    kAudioUnitProperty_MaximumFramesPerSlice, kAudioUnitProperty_ParameterInfo,
-    kAudioUnitProperty_ParameterList, kAudioUnitProperty_SetRenderCallback,
-    kAudioUnitProperty_StreamFormat, kAudioUnitScope_Global, kAudioUnitScope_Input,
-    kAudioUnitScope_Output, kAudioUnitType_Effect, kAudioUnitType_MusicDevice,
-    kAudioUnitType_MusicEffect, AURenderCallbackStruct, AudioComponent, AudioComponentCopyName,
-    AudioComponentDescription, AudioComponentFindNext, AudioComponentGetDescription,
-    AudioComponentInstanceDispose, AudioComponentInstanceNew, AudioUnit, AudioUnitGetParameter,
-    AudioUnitGetProperty, AudioUnitGetPropertyInfo, AudioUnitInitialize, AudioUnitParameterInfo,
-    AudioUnitParameterOptions, AudioUnitRender, AudioUnitRenderActionFlags, AudioUnitReset,
-    AudioUnitSetParameter, AudioUnitSetProperty, AudioUnitUninitialize, MusicDeviceMIDIEvent,
+    kAudioUnitProperty_ClassInfo, kAudioUnitProperty_CocoaUI, kAudioUnitProperty_HostCallbacks,
+    kAudioUnitProperty_Latency, kAudioUnitProperty_MaximumFramesPerSlice,
+    kAudioUnitProperty_ParameterInfo, kAudioUnitProperty_ParameterList,
+    kAudioUnitProperty_SetRenderCallback, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Global,
+    kAudioUnitScope_Input, kAudioUnitScope_Output, kAudioUnitType_Effect,
+    kAudioUnitType_MusicDevice, kAudioUnitType_MusicEffect, AURenderCallbackStruct, AudioComponent,
+    AudioComponentCopyName, AudioComponentDescription, AudioComponentFindNext,
+    AudioComponentGetDescription, AudioComponentInstanceDispose, AudioComponentInstanceNew,
+    AudioUnit, AudioUnitGetParameter, AudioUnitGetProperty, AudioUnitGetPropertyInfo,
+    AudioUnitInitialize, AudioUnitParameterInfo, AudioUnitParameterOptions, AudioUnitRender,
+    AudioUnitRenderActionFlags, AudioUnitReset, AudioUnitSetParameter, AudioUnitSetProperty,
+    AudioUnitUninitialize, HostCallbackInfo, MusicDeviceMIDIEvent,
 };
 use objc2_core_audio_types::{
     kAudioFormatFlagIsFloat, kAudioFormatFlagIsNonInterleaved, kAudioFormatFlagIsPacked,
@@ -226,6 +227,139 @@ struct InputFeed {
     channels: [Cell<*const f32>; MAX_CHANNELS],
     count: Cell<usize>,
     frames: Cell<usize>,
+    /// The host's transport for this render, read by the unit's host callbacks.
+    time: Cell<HostTime>,
+}
+
+/// What the AU host callbacks report: the block's musical position, transport
+/// state, and whether it moved discontinuously since the unit last asked.
+#[derive(Clone, Copy, Default)]
+struct HostTime {
+    musical: Musical,
+    playing: bool,
+    sample: f64,
+    sample_rate: f64,
+    changed: bool,
+}
+
+/// Writes `value` through `out` if the unit asked for it (non-null).
+///
+/// # Safety
+/// `out` is null or valid for a write of `T`.
+unsafe fn put<T>(out: *mut T, value: T) {
+    // SAFETY: the caller's contract.
+    if let Some(out) = unsafe { out.as_mut() } {
+        *out = value;
+    }
+}
+
+/// The unit's feed (hostUserData) during a render; None outside one.
+///
+/// # Safety
+/// `data` is the node's `InputFeed` pointer, set as hostUserData.
+unsafe fn host_time(data: *mut c_void) -> Option<HostTime> {
+    // SAFETY: the caller's contract; the feed outlives the unit.
+    let feed = unsafe { data.cast::<InputFeed>().as_ref()? };
+    Some(feed.time.get())
+}
+
+unsafe extern "C-unwind" fn beat_and_tempo(
+    data: *mut c_void,
+    beat: *mut f64,
+    tempo: *mut f64,
+) -> i32 {
+    // SAFETY: called by the unit inside AudioUnitRender with our user data.
+    let Some(t) = (unsafe { host_time(data) }) else {
+        return -10863; // kAudioUnitErr_CannotDoInCurrentContext
+    };
+    // SAFETY: out pointers from the unit, each null or valid.
+    unsafe {
+        put(beat, t.musical.beats);
+        put(tempo, t.musical.bpm);
+    }
+    0
+}
+
+unsafe extern "C-unwind" fn musical_time(
+    data: *mut c_void,
+    to_next_beat: *mut u32,
+    numerator: *mut f32,
+    denominator: *mut u32,
+    downbeat: *mut f64,
+) -> i32 {
+    // SAFETY: as in `beat_and_tempo`.
+    let Some(t) = (unsafe { host_time(data) }) else {
+        return -10863;
+    };
+    let m = t.musical;
+    let to_next = (m.beats.ceil() - m.beats) * 60.0 / m.bpm.max(1.0) * t.sample_rate;
+    // SAFETY: as in `beat_and_tempo`.
+    unsafe {
+        put(to_next_beat, to_next.round() as u32);
+        put(numerator, f32::from(m.numerator));
+        put(denominator, u32::from(m.denominator));
+        put(downbeat, m.bar_start);
+    }
+    0
+}
+
+/// Fills the transport state; `changed` reports a jump once.
+///
+/// # Safety
+/// As `beat_and_tempo`.
+unsafe fn transport(
+    data: *mut c_void,
+    playing: *mut u8,
+    changed: *mut u8,
+    sample: *mut f64,
+    cycling: *mut u8,
+) -> i32 {
+    // SAFETY: the caller's contract.
+    let Some(feed) = (unsafe { data.cast::<InputFeed>().as_ref() }) else {
+        return -10863;
+    };
+    let mut t = feed.time.get();
+    // SAFETY: as in `beat_and_tempo`.
+    unsafe {
+        put(playing, u8::from(t.playing));
+        put(changed, u8::from(t.changed));
+        put(sample, t.sample);
+        put(cycling, 0);
+    }
+    t.changed = false;
+    feed.time.set(t);
+    0
+}
+
+unsafe extern "C-unwind" fn transport_state(
+    data: *mut c_void,
+    playing: *mut u8,
+    changed: *mut u8,
+    sample: *mut f64,
+    cycling: *mut u8,
+    _start: *mut f64,
+    _end: *mut f64,
+) -> i32 {
+    // SAFETY: as in `beat_and_tempo`.
+    unsafe { transport(data, playing, changed, sample, cycling) }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe extern "C-unwind" fn transport_state2(
+    data: *mut c_void,
+    playing: *mut u8,
+    recording: *mut u8,
+    changed: *mut u8,
+    sample: *mut f64,
+    cycling: *mut u8,
+    _start: *mut f64,
+    _end: *mut f64,
+) -> i32 {
+    // SAFETY: as in `beat_and_tempo`.
+    unsafe {
+        put(recording, 0);
+        transport(data, playing, changed, sample, cycling)
+    }
 }
 
 // SAFETY: the pointers are only set and read within one `AuNode::process` call on
@@ -461,7 +595,23 @@ impl AuPlugin {
             channels: std::array::from_fn(|_| Cell::new(ptr::null())),
             count: Cell::new(0),
             frames: Cell::new(0),
+            time: Cell::new(HostTime::default()),
         });
+        // Tempo, bar position and transport for synced delays, LFOs and arps.
+        let callbacks = HostCallbackInfo {
+            hostUserData: Arc::as_ptr(&feed).cast_mut().cast(),
+            beatAndTempoProc: Some(beat_and_tempo),
+            musicalTimeLocationProc: Some(musical_time),
+            transportStateProc: Some(transport_state),
+            transportStateProc2: Some(transport_state2),
+        };
+        // Optional for a unit: one that refuses still plays, unsynced.
+        let _ = unit.set(
+            kAudioUnitProperty_HostCallbacks,
+            kAudioUnitScope_Global,
+            0,
+            &callbacks,
+        );
         if kind != AuKind::Instrument {
             unit.set(
                 kAudioUnitProperty_StreamFormat,
@@ -516,6 +666,8 @@ impl AuPlugin {
             sample_time: 0.0,
             latency,
             kind,
+            was_playing: false,
+            sample_time_next: 0.0,
         };
         Ok((plugin, node))
     }
@@ -788,6 +940,9 @@ pub struct AuNode {
     sample_time: f64,
     latency: u32,
     kind: AuKind,
+    /// Transport as of the last block, to report jumps to the unit.
+    was_playing: bool,
+    sample_time_next: f64,
 }
 
 impl AudioNode for AuNode {
@@ -814,6 +969,18 @@ impl AudioNode for AuNode {
             outputs.iter_mut().for_each(|o| o.fill(0.0));
             return;
         }
+        let moved = context.playing != self.was_playing
+            || (context.playing && context.playhead as f64 != self.sample_time_next);
+        let changed = self.feed.time.get().changed || moved;
+        self.feed.time.set(HostTime {
+            musical: context.musical,
+            playing: context.playing,
+            sample: context.playhead as f64,
+            sample_rate: f64::from(context.sample_rate),
+            changed,
+        });
+        self.was_playing = context.playing;
+        self.sample_time_next = context.playhead as f64 + n as f64;
         // Pre-zeroed silence stands in for missing inputs (untrusted plugin).
         self.feed.count.set(inputs.len().min(2));
         self.feed.frames.set(n);
@@ -892,6 +1059,61 @@ impl AudioNode for AuNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_callbacks_report_tempo_position_and_jumps_once() {
+        let feed = InputFeed {
+            channels: std::array::from_fn(|_| Cell::new(ptr::null())),
+            count: Cell::new(0),
+            frames: Cell::new(0),
+            time: Cell::new(HostTime {
+                musical: Musical {
+                    bpm: 120.0,
+                    beats: 4.5,
+                    bar_start: 4.0,
+                    bar: 1,
+                    numerator: 3,
+                    denominator: 4,
+                },
+                playing: true,
+                sample: 108_000.0,
+                sample_rate: 48_000.0,
+                changed: true,
+            }),
+        };
+        let data = ptr::from_ref(&feed).cast_mut().cast::<c_void>();
+        let (mut beat, mut tempo) = (0.0, 0.0);
+        // SAFETY: valid out pointers and our feed as user data.
+        assert_eq!(unsafe { beat_and_tempo(data, &mut beat, &mut tempo) }, 0);
+        assert_eq!((beat, tempo), (4.5, 120.0));
+        let (mut next, mut num, mut den, mut down) = (0u32, 0.0f32, 0u32, 0.0);
+        // SAFETY: as above.
+        unsafe { musical_time(data, &mut next, &mut num, &mut den, &mut down) };
+        // Half a beat at 120 BPM and 48 kHz.
+        assert_eq!((next, num, den, down), (12_000, 3.0, 4, 4.0));
+        let (mut playing, mut rec, mut changed, mut sample, mut cyc) = (0u8, 9u8, 0u8, 0.0, 9u8);
+        let (b, f) = (ptr::null_mut::<u8>(), ptr::null_mut::<f64>());
+        // SAFETY: as above; the unit may pass null for what it does not want.
+        unsafe {
+            transport_state2(
+                data,
+                &mut playing,
+                &mut rec,
+                &mut changed,
+                &mut sample,
+                &mut cyc,
+                f,
+                f,
+            )
+        };
+        assert_eq!(
+            (playing, rec, changed, sample, cyc),
+            (1, 0, 1, 108_000.0, 0)
+        );
+        // SAFETY: as above.
+        unsafe { transport_state(data, b, &mut changed, f, b, f, f) };
+        assert_eq!(changed, 0, "a jump is reported once");
+    }
 
     const DELAY: &str = "aufx:dely:appl";
     const DLS: &str = "aumu:dls :appl";

@@ -92,7 +92,8 @@ The UI follows Styles.md whichever framework is chosen.
 - [x] Automation lanes: track gain/pan and any plugin or built-in parameter, breakpoints with curve shapes, applied per block on the audio thread (`ExecutionPlan::automate`, `AudioNode::automate`: TrackNode, built-in effects, sampler attack/release/gain, CLAP, VST3, AU). AUTO [GAIN][PAN] in the tool strip, or right-click a rack dial, shows the lane on the selected track's playlist row: click adds a snapped point, drag moves it, Option-drag bends a segment, right-click removes
 - [ ] Automation recording from the rack (latch/touch) and mute automation
 - [x] Transport info to plugins: every node's `ProcessContext::musical` carries tempo, quarter-note position, bar and time signature from the tempo/meter maps (`ExecutionPlan::set_tempo_map`, `daw_core::musical_at`); CLAP gets a transport event, VST3 a `ProcessContext`
-- [ ] Transport info for Audio Units (host callbacks) and loop positions; ARA content access for the tempo map
+- [x] Transport info for Audio Units: host callbacks report tempo, beat, bar, meter, play state and jumps
+- [ ] Loop positions in plugin transport info; ARA content access for the tempo map
 - [ ] Plugin delay compensation for sequenced instruments (notes scheduled early by the instrument path's latency)
 
 ### Phase 8: Mixer and Routing

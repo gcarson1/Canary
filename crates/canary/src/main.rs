@@ -55,6 +55,8 @@ fn has_extension(path: &Path, list: &[&str]) -> bool {
 }
 
 /// A finished background load.
+type Transcribed = (ClipRef, bool, Vec<daw_dsp::transcribe::Detected>);
+
 /// A stretch render finished on a worker thread.
 struct Stretched {
     track: usize,
@@ -161,6 +163,9 @@ struct App {
     export_restore: Option<(MonitorMode, bool)>,
     /// The last export's format conversion, still running.
     converting: Option<thread::JoinHandle<Vec<String>>>,
+    /// Finished audio-to-MIDI analyses: the clip, drums or not, what was found.
+    transcribe_tx: mpsc::Sender<Transcribed>,
+    transcribe_rx: mpsc::Receiver<Transcribed>,
     /// The preset each device last loaded, so PRESET steps to the next.
     preset_at: HashMap<u64, PathBuf>,
     /// Clips (track, index) with a stretch render running.
@@ -265,6 +270,7 @@ impl App {
         let (loads_tx, loads_rx) = mpsc::channel();
         let (stretch_tx, stretch_rx) = mpsc::channel();
         let (preview_tx, preview_rx) = mpsc::channel();
+        let (transcribe_tx, transcribe_rx) = mpsc::channel();
         let (master, monitor) = MasterNode::new(config.sample_rate as f32);
         let (preview_node, preview) = PreviewNode::new();
         let mut app = Self {
@@ -330,6 +336,8 @@ impl App {
             converting: None,
             stretching: HashSet::new(),
             preset_at: HashMap::new(),
+            transcribe_tx,
+            transcribe_rx,
             stretch_tx,
             stretch_rx,
             title: String::new(),
@@ -1196,6 +1204,11 @@ impl App {
                 device,
                 save,
             } => self.preset(track, device, save),
+            Request::AudioToMidi {
+                track,
+                index,
+                drums,
+            } => self.audio_to_midi(track, index, drums),
             Request::Stretch {
                 track,
                 index,
@@ -1309,6 +1322,147 @@ impl App {
                     self.autosaved = None;
                 }
             }
+        }
+    }
+
+    /// Analyses clip `index` on `track` on a worker thread for a melody or drum
+    /// hits; `receive_transcriptions` puts the notes on a new track.
+    fn audio_to_midi(&mut self, track: usize, index: usize, drums: bool) {
+        let project = self.history.project();
+        let Some(clip) = project
+            .tracks
+            .get(track)
+            .and_then(|t| t.clips.get(index))
+            .cloned()
+        else {
+            return;
+        };
+        let Some(audio) = self.audio.get(&clip.source).cloned() else {
+            return self.error("that clip's audio is still loading".into());
+        };
+        self.ws.status = Some(Status {
+            text: if drums {
+                "FINDING DRUM HITS"
+            } else {
+                "FINDING NOTES"
+            }
+            .into(),
+            error: false,
+        });
+        let (tx, rate) = (self.transcribe_tx.clone(), self.view.sample_rate as f32);
+        thread::spawn(move || {
+            // The window as it plays, mono.
+            let range = clip.offset as usize..(clip.offset + clip.length) as usize;
+            let mut mono: Vec<f32> = range
+                .filter(|&f| f < audio.frames())
+                .map(|f| {
+                    let n = audio.num_channels();
+                    (0..n).map(|c| audio.channel(c)[f]).sum::<f32>() / n as f32 * clip.gain
+                })
+                .collect();
+            if clip.reverse {
+                mono.reverse();
+            }
+            let found = if drums {
+                daw_dsp::transcribe::drums(&mono, rate)
+            } else {
+                daw_dsp::transcribe::melody(&mono, rate)
+            };
+            let _ = tx.send((clip, drums, found));
+        });
+    }
+
+    /// Puts each finished analysis on a new track: a pattern holding the notes,
+    /// placed where the clip starts, played by the built-in synth (or sampler
+    /// for drums).
+    fn receive_transcriptions(&mut self) {
+        while let Ok((clip, drums, found)) = self.transcribe_rx.try_recv() {
+            if found.is_empty() {
+                self.error(
+                    if drums {
+                        "no drum hits found"
+                    } else {
+                        "no clear notes found"
+                    }
+                    .into(),
+                );
+                continue;
+            }
+            let project = self.history.project();
+            let start_tick = project.ticks_at(clip.start);
+            let tick = |frame: usize| project.ticks_at(clip.start + frame as u64) - start_tick;
+            let notes: Vec<daw_project::Note> = found
+                .iter()
+                .map(|d| {
+                    let start = tick(d.start);
+                    daw_project::Note {
+                        start,
+                        length: (tick(d.start + d.length) - start).max(1),
+                        key: d.key,
+                        velocity: d.velocity,
+                    }
+                })
+                .collect();
+            let bar = project.bar_tick(1).max(1);
+            let end = notes.iter().map(|n| n.end()).max().unwrap_or(1);
+            let length = (end.div_ceil(bar) * bar).min(daw_project::MAX_TICKS);
+            let id = project.new_pattern_id();
+            let index = project.tracks.len();
+            let stem = clip
+                .source
+                .file_stem()
+                .map_or_else(|| "Audio".into(), |s| s.to_string_lossy().into_owned());
+            let name = format!("{stem} {}", if drums { "Drums" } else { "MIDI" });
+            let batch = Action::Batch(vec![
+                Action::InsertPattern {
+                    index: project.patterns.len(),
+                    pattern: daw_project::Pattern {
+                        id,
+                        name: name.clone(),
+                        length,
+                    },
+                },
+                Action::InsertTrack {
+                    index,
+                    track: Track::new(name.clone()),
+                },
+                Action::SetNotes {
+                    track: index,
+                    pattern: id,
+                    notes,
+                },
+                Action::InsertPatternClip {
+                    track: index,
+                    index: 0,
+                    clip: daw_project::PatternClip {
+                        pattern: id,
+                        start: start_tick,
+                        length,
+                        offset: 0,
+                    },
+                },
+            ]);
+            if let Err(e) = self.history.apply(batch) {
+                self.error(format!("could not add the notes: {e}"));
+                continue;
+            }
+            let instrument = if drums { "Sampler" } else { "Synth" };
+            if let Some(choice) = self
+                .devices
+                .choices
+                .iter()
+                .position(|c| c.format == "CANARY" && c.name == instrument)
+            {
+                self.handle(Request::AddDevice {
+                    track: index,
+                    choice,
+                });
+            }
+            self.ws.selected_track = Some(index);
+            self.ws.status = Some(Status {
+                text: format!("{} → NEW TRACK {:02}", name.to_uppercase(), index + 1),
+                error: false,
+            });
         }
     }
 
@@ -2035,6 +2189,7 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         self.receive_loads();
         self.receive_stretches();
+        self.receive_transcriptions();
         self.check_streams();
         self.sync_midi_inputs();
         self.preview.collect();

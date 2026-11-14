@@ -144,6 +144,13 @@ pub enum Request {
         device: usize,
         save: bool,
     },
+    /// Turn clip `index` on `track` into notes on a new track: a melody, or
+    /// with `drums`, drum hits.
+    AudioToMidi {
+        track: usize,
+        index: usize,
+        drums: bool,
+    },
     /// Audition a file from the browser (`None` stops).
     Preview(Option<PathBuf>),
     /// Open this output device (None: the system default) at this buffer size
@@ -786,6 +793,7 @@ impl Workspace {
             let mut flip = false;
             let mut semis = 0.0;
             let mut take = 0i32;
+            let mut midi = None;
             for e in &i.events {
                 if let egui::Event::Key {
                     key,
@@ -808,15 +816,24 @@ impl Workspace {
                         // A render per press; a held key must not start dozens.
                         Key::OpenBracket if !repeat => semis -= 1.0,
                         Key::CloseBracket if !repeat => semis += 1.0,
+                        // M turns the clip into MIDI notes, Shift+M into drum hits.
+                        Key::M if !repeat => midi = Some(modifiers.shift),
                         _ => {}
                     }
                 }
             }
-            (db, flip, semis, take)
+            (db, flip, semis, take, midi)
         });
-        if let (Page::Playlist, Some((ti, ci)), (db, flip, semis, take)) =
+        if let (Page::Playlist, Some((ti, ci)), (db, flip, semis, take, midi)) =
             (self.page, self.selected_clip, clip_keys)
         {
+            if let Some(drums) = midi {
+                out.push(Request::AudioToMidi {
+                    track: ti,
+                    index: ci,
+                    drums,
+                });
+            }
             let clip = inputs
                 .history
                 .project()

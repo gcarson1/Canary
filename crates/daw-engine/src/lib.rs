@@ -13,8 +13,8 @@ pub use midi::{connect_midi, midi_input_ports, MidiConnection, MidiError, MidiSe
 pub use output::{output_devices, start_output, start_output_at, OutputChoice, OutputError};
 pub use peaks::cached_waveform;
 pub use record::{
-    bounce_tap, recorder, start_input, BounceTap, InputError, RecordError, RecordInput, Recorder,
-    Take,
+    bounce_tap, input_devices, recorder, start_input, BounceTap, InputError, RecordError,
+    RecordInput, Recorder, Take,
 };
 pub use stream::{Fault, StreamFaults};
 pub use transport::Transport;

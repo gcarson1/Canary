@@ -358,7 +358,23 @@ impl From<cpal::Error> for InputError {
     }
 }
 
-/// Opens the default input device (CoreAudio on macOS) next to the output stream
+/// The input devices' names, the default one first.
+pub fn input_devices() -> Vec<String> {
+    let host = cpal::default_host();
+    let name = |d: cpal::Device| d.description().ok().map(|d| d.name().to_string());
+    let default = host.default_input_device().and_then(name);
+    let mut names: Vec<String> = host
+        .input_devices()
+        .map(|ds| ds.filter_map(name).collect())
+        .unwrap_or_default();
+    if let Some(i) = default.and_then(|d| names.iter().position(|n| *n == d)) {
+        let d = names.remove(i);
+        names.insert(0, d);
+    }
+    names
+}
+
+/// Opens an input device (CoreAudio on macOS) next to the output stream
 /// and feeds a recorder. `sample_rate` is the output's; the input is asked for
 /// it and must run at it. Stream errors go to `faults`. Capture stops when the
 /// returned `Stream` is dropped. On macOS the first call asks the user for
@@ -366,10 +382,18 @@ impl From<cpal::Error> for InputError {
 pub fn start_input(
     sample_rate: u32,
     playhead: Arc<AtomicU64>,
+    device: Option<&str>,
     faults: StreamFaults,
 ) -> Result<(Recorder, cpal::Stream, cpal::StreamConfig), InputError> {
-    let device = cpal::default_host()
-        .default_input_device()
+    let host = cpal::default_host();
+    // The named input if it is still there, else the system default.
+    let named = device.and_then(|want| {
+        host.input_devices()
+            .ok()?
+            .find(|d| d.description().is_ok_and(|desc| desc.name() == want))
+    });
+    let device = named
+        .or_else(|| host.default_input_device())
         .ok_or(InputError::NoDevice)?;
     let default = device.default_input_config()?;
     let ranges: Vec<_> = device.supported_input_configs()?.collect();

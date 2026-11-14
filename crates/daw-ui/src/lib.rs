@@ -152,6 +152,8 @@ pub enum Request {
         device: Option<String>,
         buffer: Option<u32>,
     },
+    /// Record from this input device (None: the system default).
+    SetInput(Option<String>),
     /// Write `track`'s notes in the current pattern to a MIDI file.
     ExportMidi {
         track: usize,
@@ -193,6 +195,10 @@ pub struct AudioView {
     pub device: Option<String>,
     /// Frames per callback chosen, `None` for the device's own.
     pub buffer: Option<u32>,
+    /// Input devices for recording, the system default first.
+    pub inputs: Vec<String>,
+    /// The input chosen, `None` for the system default.
+    pub input: Option<String>,
 }
 
 /// Buffer sizes the audio panel offers.
@@ -1025,7 +1031,8 @@ impl Workspace {
             ui.scope_id().with("audio-panel"),
         ));
         let row_h = 1.75 * u;
-        let rows = audio.devices.len().max(1) as f32 + 1.0;
+        // Outputs, the buffer row, the INPUT label, then inputs.
+        let rows = audio.devices.len().max(1) as f32 + 2.0 + audio.inputs.len().max(1) as f32;
         let width = 18.0 * u;
         let panel = m.snap_rect(Rect::from_min_size(
             Pos2::new(anchor.max.x - width, anchor.max.y + 0.75 * u),
@@ -1036,7 +1043,7 @@ impl Workspace {
         p.text(
             Pos2::new(panel.min.x + 0.75 * u, panel.min.y + u),
             Align2::LEFT_CENTER,
-            "AUDIO OUTPUT // ESC TO CLOSE",
+            "AUDIO // ESC TO CLOSE",
             m.mono(0.625),
             t.muted,
         );
@@ -1112,6 +1119,50 @@ impl Workspace {
                 pick = Some((audio.device.clone(), size));
             }
             x = cell.max.x + 0.25 * u;
+        }
+        // Recording inputs.
+        y = row.max.y;
+        p.hline(panel.x_range(), m.snap(y), m.hair(t.line));
+        p.text(
+            Pos2::new(panel.min.x + 0.75 * u, y + row_h / 2.0),
+            Align2::LEFT_CENTER,
+            "RECORD INPUT",
+            m.mono(0.5625),
+            t.faint,
+        );
+        y += row_h;
+        if audio.inputs.is_empty() {
+            p.text(
+                Pos2::new(panel.min.x + 0.75 * u, y + row_h / 2.0),
+                Align2::LEFT_CENTER,
+                "NO INPUT DEVICES",
+                m.mono(0.625),
+                t.faint,
+            );
+        }
+        for (i, name) in audio.inputs.iter().enumerate() {
+            let row = Rect::from_x_y_ranges(panel.x_range(), y..=m.snap(y + row_h));
+            let resp = ui.interact(row, ui.scope_id().with(("audio-in", i)), Sense::click());
+            let on = audio.input.as_deref().map_or(i == 0, |d| d == name);
+            if on {
+                p.rect_filled(row, 0.0, t.sel);
+            }
+            let label: String = name.chars().take(34).collect();
+            p.text(
+                Pos2::new(row.min.x + 0.75 * u, row.center().y),
+                Align2::LEFT_CENTER,
+                label.to_uppercase(),
+                m.mono(0.625),
+                if resp.hovered() || on {
+                    t.text
+                } else {
+                    t.muted
+                },
+            );
+            if resp.clicked() && !on {
+                out.push(Request::SetInput((i > 0).then(|| name.clone())));
+            }
+            y = row.max.y;
         }
         if let Some((device, buffer)) = pick {
             out.push(Request::SetAudio { device, buffer });

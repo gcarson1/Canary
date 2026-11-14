@@ -50,6 +50,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (mut recorder, _input, input_config) = daw_engine::start_input(
         config.sample_rate,
         handle.playhead_clock(),
+        None,
         Default::default(),
     )?;
     println!(

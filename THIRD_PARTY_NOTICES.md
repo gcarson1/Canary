@@ -20,6 +20,12 @@ Their factory data (Surge XT patches and wavetables, OB-Xf patches and themes) i
 | --- | --- | --- |
 | fft-convolver 0.4 | MIT | Partitioned convolution for `canary.convolver` |
 
+## Ported source
+
+| Project | License | Copyright | Where |
+| --- | --- | --- | --- |
+| CloudSeedCore | MIT | Copyright (c) 2024 Ghost Note Audio / Ghost Note Engineering Ltd | `crates/daw-dsp/src/cloudseed.rs` (Rust port of the reverb core) |
+
 ## Vendored source
 
 | Project | License | Where |

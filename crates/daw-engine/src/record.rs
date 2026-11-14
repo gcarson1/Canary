@@ -426,6 +426,8 @@ pub fn start_input(
 pub struct FileTap {
     writer: Arc<std::sync::Mutex<Option<OfflineWav>>>,
     end: u64,
+    /// Set by `finish`: the tap then returns before touching the lock.
+    done: Arc<AtomicBool>,
 }
 
 type OfflineWav = hound::WavWriter<std::io::BufWriter<std::fs::File>>;
@@ -433,6 +435,7 @@ type OfflineWav = hound::WavWriter<std::io::BufWriter<std::fs::File>>;
 /// Finishes a `FileTap`'s file once rendering is done.
 pub struct FileTapDone {
     writer: Arc<std::sync::Mutex<Option<OfflineWav>>>,
+    done: Arc<AtomicBool>,
     failed: Arc<AtomicBool>,
     path: PathBuf,
 }
@@ -454,16 +457,19 @@ pub fn file_tap(
         path, spec,
     )?)));
     let failed = Arc::new(AtomicBool::new(false));
+    let done = Arc::new(AtomicBool::new(false));
     Ok((
         Box::new(FileTapWriter {
             tap: FileTap {
                 writer: writer.clone(),
                 end,
+                done: done.clone(),
             },
             failed: failed.clone(),
         }),
         FileTapDone {
             writer,
+            done,
             failed,
             path: path.to_path_buf(),
         },
@@ -477,7 +483,10 @@ struct FileTapWriter {
 
 impl daw_graph::Tap for FileTapWriter {
     fn write(&mut self, left: &[f32], right: &[f32], context: &daw_core::ProcessContext) {
-        if !context.playing || context.playhead >= self.tap.end {
+        if self.tap.done.load(Ordering::Acquire)
+            || !context.playing
+            || context.playhead >= self.tap.end
+        {
             return;
         }
         let n = left
@@ -507,6 +516,7 @@ impl FileTapDone {
 
     /// Closes the file; an error if any write failed.
     pub fn finish(self) -> Result<(), String> {
+        self.done.store(true, Ordering::Release);
         let w = self
             .writer
             .lock()

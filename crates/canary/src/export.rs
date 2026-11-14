@@ -1,6 +1,8 @@
-//! Exporting the mix (and stems): the song plays through, plan taps write each
-//! output to a 32-bit float WAV, and other formats are made from it with
-//! macOS's `afconvert` on a worker thread.
+//! Exporting the mix (and stems): plan taps write each output to a 32-bit
+//! float WAV, and other formats are made from it with macOS's `afconvert` on a
+//! worker thread. Offline (the usual way), a worker borrows the engine from the
+//! device callback and renders as fast as it can; if the engine cannot be
+//! borrowed, the song plays through in real time into recorders instead.
 
 use std::path::{Path, PathBuf};
 use std::process::Command as Process;
@@ -8,18 +10,32 @@ use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
-use daw_engine::{recorder, RecordInput, Recorder};
+use daw_engine::{recorder, FileTapDone, RecordInput, Recorder};
 use daw_ui::ExportFormat;
 
 /// Seconds past the song's end, so reverb and delay tails ring out.
 pub const TAIL_SECONDS: u64 = 2;
 
-/// One file being written: where, its recorder, and how many frames its output
-/// lags the dry signal (plugin delay), trimmed off the front when it is done.
+/// One file being written: where, what writes it, and how many frames its
+/// output lags the dry signal (plugin delay), trimmed off the front when done.
 pub struct Output {
     pub path: PathBuf,
-    pub recorder: Recorder,
+    pub writer: Writer,
     pub skip: u64,
+}
+
+/// What fills an output's file.
+pub enum Writer {
+    /// Real time: a recorder's disk-writer thread drains the tap's ring.
+    Live(Recorder),
+    /// Offline: the tap writes the file itself (set once the plan is built).
+    File(Option<FileTapDone>),
+}
+
+/// What the next plan taps for an output.
+pub enum TapSource {
+    Live(RecordInput),
+    File,
 }
 
 pub struct Export {
@@ -29,8 +45,10 @@ pub struct Export {
     pub master: Output,
     /// (track index, file) per stem.
     pub stems: Vec<(usize, Output)>,
-    /// Recorder inputs for the next plan to tap: `None` is the master.
-    pub taps: Vec<(Option<usize>, RecordInput)>,
+    /// What the next plan taps, per output: `None` is the master.
+    pub taps: Vec<(Option<usize>, TapSource)>,
+    /// Rendering offline on a worker (when the engine could be borrowed).
+    pub offline: bool,
     /// Play has been sent, once the plan carrying the taps was delivered.
     pub play_sent: bool,
     /// The transport has been seen rolling since Play was sent.
@@ -54,10 +72,13 @@ impl Export {
         sample_rate: u32,
         end: u64,
         format: ExportFormat,
-        playhead: Arc<AtomicU64>,
+        // The engine's playhead clock for a real-time export; `None` renders
+        // offline into file taps.
+        playhead: Option<Arc<AtomicU64>>,
     ) -> Result<Self, String> {
+        let offline = playhead.is_none();
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-        let mut made: Vec<(Output, RecordInput)> = Vec::new();
+        let mut made: Vec<(Output, TapSource)> = Vec::new();
         let files = std::iter::once(format!("{}.wav", clean(name))).chain(
             stems
                 .iter()
@@ -66,21 +87,35 @@ impl Export {
         );
         for file in files {
             let path = dir.join(file);
-            let (mut rec, input) = recorder(2, sample_rate, playhead.clone());
+            if offline {
+                // The file is made with the tap, when the plan is built.
+                let writer = Writer::File(None);
+                made.push((
+                    Output {
+                        path,
+                        writer,
+                        skip: 0,
+                    },
+                    TapSource::File,
+                ));
+                continue;
+            }
+            let clock = playhead.clone().expect("real time has a clock");
+            let (mut rec, input) = recorder(2, sample_rate, clock);
             if let Err(e) = rec.start(&path) {
-                for (mut out, _) in made {
-                    let _ = out.recorder.stop();
-                    let _ = std::fs::remove_file(&out.path);
+                for (out, _) in made {
+                    out.discard();
                 }
                 return Err(format!("{}: {e}", path.display()));
             }
+            let writer = Writer::Live(rec);
             made.push((
                 Output {
                     path,
-                    recorder: rec,
+                    writer,
                     skip: 0,
                 },
-                input,
+                TapSource::Live(input),
             ));
         }
         let mut made = made.into_iter();
@@ -97,6 +132,7 @@ impl Export {
             master,
             stems: outputs,
             taps,
+            offline,
             play_sent: false,
             started: false,
         })
@@ -124,7 +160,19 @@ impl Export {
         let mut files = Vec::new();
         let mut error = None;
         for out in self.outputs_mut() {
-            match out.recorder.stop() {
+            let stopped = match &mut out.writer {
+                Writer::Live(rec) => rec.stop().map_err(|e| e.to_string()),
+                Writer::File(done) => match done.take() {
+                    Some(done) => done.finish().map(|()| daw_engine::Take {
+                        path: out.path.clone(),
+                        start_sample: 0,
+                        frames: 0,
+                        dropped_frames: 0,
+                    }),
+                    None => Err("never written".into()),
+                },
+            };
+            match stopped {
                 Ok(take) if take.dropped_frames > 0 => {
                     error.get_or_insert(format!(
                         "{}: the disk fell behind and {} frames were lost",
@@ -181,11 +229,25 @@ impl Export {
     }
 
     /// Stops the writers and deletes the partial files.
-    pub fn abort(mut self) {
-        for out in self.outputs_mut() {
-            let _ = out.recorder.stop();
-            let _ = std::fs::remove_file(&out.path);
+    pub fn abort(self) {
+        std::iter::once(self.master)
+            .chain(self.stems.into_iter().map(|s| s.1))
+            .for_each(Output::discard);
+    }
+}
+
+impl Output {
+    /// Stops writing and deletes the file.
+    fn discard(mut self) {
+        match &mut self.writer {
+            Writer::Live(rec) => drop(rec.stop()),
+            Writer::File(done) => {
+                if let Some(done) = done.take() {
+                    let _ = done.finish();
+                }
+            }
         }
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -241,6 +303,38 @@ mod tests {
         assert_eq!(exts.len(), 4);
         assert!(afconvert_args(ExportFormat::Wav32).is_none());
         assert_eq!(clean("a/b:c"), "a-b-c");
+    }
+
+    #[test]
+    fn an_offline_export_finishes_its_file_taps_and_trims_their_delay() {
+        let dir = std::env::temp_dir().join(format!("canary-offline-{}", std::process::id()));
+        let mut e = Export::start(&dir, "Song", &[], 48_000, 8, ExportFormat::Wav32, None).unwrap();
+        assert!(
+            e.offline && !dir.join("Song.wav").exists(),
+            "files come with the taps"
+        );
+        // What rebuild does: a file tap for the master, two frames of delay.
+        let (mut tap, done) = daw_engine::file_tap(&e.master.path, 48_000, 10).unwrap();
+        e.master.skip = 2;
+        e.master.writer = Writer::File(Some(done));
+        let ctx = daw_core::ProcessContext {
+            playing: true,
+            num_samples: 10,
+            ..Default::default()
+        };
+        let ramp: Vec<f32> = (0..10).map(|i| i as f32).collect();
+        tap.write(&ramp, &ramp, &ctx);
+        drop(tap);
+        let (path, job) = e.finish().unwrap();
+        assert!(job.join().unwrap().is_empty());
+        let s: Vec<f32> = hound::WavReader::open(&path)
+            .unwrap()
+            .into_samples::<f32>()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(s.len(), 16, "eight frames after the delay");
+        assert_eq!(&s[..2], &[2.0, 2.0]);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

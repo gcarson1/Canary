@@ -29,25 +29,31 @@ fn yin(frame: &[f32], sample_rate: f32, lo: f32, hi: f32) -> Option<f32> {
     if tau_min >= tau_max {
         return None;
     }
-    // Difference function, then its cumulative mean normalized form.
-    let mut d = vec![0.0f32; tau_max + 1];
-    for (tau, slot) in d.iter_mut().enumerate().skip(1) {
-        *slot = (0..w).map(|j| (frame[j] - frame[j + tau]).powi(2)).sum();
-    }
-    let mut running = 0.0;
+    // Difference function and its cumulative mean normalized form, lag by lag,
+    // stopping once the first dip under the threshold has bottomed out (most
+    // periods are short, so this skips most of the work).
     let mut cmnd = vec![1.0f32; tau_max + 1];
+    let mut running = 0.0;
+    let mut dip: Option<usize> = None;
     for tau in 1..=tau_max {
-        running += d[tau];
+        let d: f32 = (0..w).map(|j| (frame[j] - frame[j + tau]).powi(2)).sum();
+        running += d;
         cmnd[tau] = if running > 0.0 {
-            d[tau] * tau as f32 / running
+            d * tau as f32 / running
         } else {
             1.0
         };
+        match dip {
+            None if tau >= tau_min && cmnd[tau] < THRESHOLD => dip = Some(tau),
+            Some(t) if cmnd[tau] < cmnd[t] => dip = Some(tau),
+            // Rising again: the bottom and its right neighbour are known.
+            Some(_) => break,
+            None => {}
+        }
     }
-    // The first dip under the threshold, followed to its bottom.
-    let mut tau = (tau_min..tau_max).find(|&t| cmnd[t] < THRESHOLD)?;
-    while tau + 1 < tau_max && cmnd[tau + 1] < cmnd[tau] {
-        tau += 1;
+    let tau = dip?;
+    if tau + 1 > tau_max {
+        return Some(sample_rate / tau as f32);
     }
     // Parabolic interpolation around the dip for a finer period.
     let (a, b, c) = (cmnd[tau - 1], cmnd[tau], cmnd[tau + 1]);
@@ -73,11 +79,16 @@ fn velocity(level: f32) -> u8 {
 
 /// The notes of a monophonic line (voice, bass, lead) in `samples`.
 pub fn melody(samples: &[f32], sample_rate: f32) -> Vec<Detected> {
+    // Window and hop scale with the rate, so the lowest pitch (50 Hz) fits at
+    // 96 or 192 kHz too.
+    let scale = (sample_rate / 48_000.0).max(0.25);
+    let window = (WINDOW as f32 * scale) as usize;
+    let hop = ((HOP as f32 * scale) as usize).max(1);
     let mut keys: Vec<Option<(u8, f32)>> = Vec::new();
     let mut at = 0;
-    while at + 2 * WINDOW <= samples.len() {
-        let frame = &samples[at..at + 2 * WINDOW];
-        let level = rms(&frame[..WINDOW]);
+    while at + 2 * window <= samples.len() {
+        let frame = &samples[at..at + 2 * window];
+        let level = rms(&frame[..window]);
         let key = (level > GATE)
             .then(|| yin(frame, sample_rate, 50.0, 1_500.0))
             .flatten()
@@ -88,7 +99,7 @@ pub fn melody(samples: &[f32], sample_rate: f32) -> Vec<Detected> {
             })
             .map(|k| (k, level));
         keys.push(key);
-        at += HOP;
+        at += hop;
     }
     // Runs of the same key become notes.
     let mut notes = Vec::new();
@@ -106,8 +117,8 @@ pub fn melody(samples: &[f32], sample_rate: f32) -> Vec<Detected> {
         }
         if j - i >= MIN_HOPS {
             notes.push(Detected {
-                start: i * HOP,
-                length: (j - i) * HOP,
+                start: i * hop,
+                length: (j - i) * hop,
                 key,
                 velocity: velocity(loudest),
             });
@@ -194,6 +205,12 @@ mod tests {
             melody(&vec![0.0; 48_000], SR).is_empty(),
             "silence has no notes"
         );
+        // A low E at 96 kHz still fits the (scaled) window.
+        let e2: Vec<f32> = (0..96_000)
+            .map(|i| 0.4 * (TAU * 82.41 * i as f32 / 96_000.0).sin())
+            .collect();
+        let keys: Vec<u8> = melody(&e2, 96_000.0).iter().map(|n| n.key).collect();
+        assert_eq!(keys, [40]);
     }
 
     #[test]

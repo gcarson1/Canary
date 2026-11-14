@@ -12,7 +12,7 @@ mod take;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{env, fs, thread};
@@ -161,6 +161,13 @@ struct App {
     autosaved: Option<u64>,
     /// The monitor mode and A/B reference to put back after an export.
     export_restore: Option<(MonitorMode, bool)>,
+    /// An offline export render on a worker, and the flag that stops it.
+    rendering: Option<(
+        thread::JoinHandle<Box<daw_engine::AudioEngine>>,
+        Arc<AtomicBool>,
+    )>,
+    /// A file tap could not be made: the export is called off next frame.
+    export_failed: bool,
     /// The last export's format conversion, still running.
     converting: Option<thread::JoinHandle<Vec<String>>>,
     /// Finished audio-to-MIDI analyses: the clip, drums or not, what was found.
@@ -334,6 +341,8 @@ impl App {
             autosaved: None,
             export_restore: None,
             converting: None,
+            rendering: None,
+            export_failed: false,
             stretching: HashSet::new(),
             preset_at: HashMap::new(),
             transcribe_tx,
@@ -955,7 +964,9 @@ impl App {
             // Each output lags by its path's plugin delay: record that much
             // longer, then trim it off the front.
             plan.compensate();
-            for (who, input) in e.taps.drain(..) {
+            let rate = self.view.sample_rate;
+            let mut failed = None;
+            for (who, source) in e.taps.drain(..) {
                 let step = match who {
                     None => Some(master_step),
                     Some(i) => out_step.get(i).copied().flatten(),
@@ -966,10 +977,27 @@ impl App {
                     None => Some(&mut e.master),
                     Some(i) => e.stems.iter_mut().find(|s| s.0 == i).map(|s| &mut s.1),
                 };
-                if let Some(out) = out {
-                    out.skip = skip;
+                let Some(out) = out else { continue };
+                out.skip = skip;
+                match source {
+                    export::TapSource::Live(input) => {
+                        plan.tap(step, daw_engine::bounce_tap(input, MAX_BLOCK, e.end + skip));
+                    }
+                    export::TapSource::File => {
+                        match daw_engine::file_tap(&out.path, rate, e.end + skip) {
+                            Ok((tap, done)) => {
+                                plan.tap(step, tap);
+                                out.writer = export::Writer::File(Some(done));
+                            }
+                            Err(err) => failed = Some(format!("{}: {err}", out.path.display())),
+                        }
+                    }
                 }
-                plan.tap(step, daw_engine::bounce_tap(input, MAX_BLOCK, e.end + skip));
+            }
+            if let Some(err) = failed {
+                self.error(format!("cannot export: {err}"));
+                // The plan still goes out; the export is called off next frame.
+                self.export_failed = true;
             }
         }
         let tracks = &self.history.project().tracks[..count];
@@ -1421,7 +1449,19 @@ impl App {
                 .file_stem()
                 .map_or_else(|| "Audio".into(), |s| s.to_string_lossy().into_owned());
             let name = format!("{stem} {}", if drums { "Drums" } else { "MIDI" });
-            let batch = Action::Batch(vec![
+            // The instrument joins the same edit, so one undo takes it all back.
+            let instrument = if drums { "Sampler" } else { "Synth" };
+            let choice = self
+                .devices
+                .choices
+                .iter()
+                .position(|c| c.format == "CANARY" && c.name == instrument);
+            let uid = self.history.new_device_uid();
+            let rate = self.view.sample_rate as f32;
+            let device =
+                choice.and_then(|c| self.devices.create(c, uid, index, rate, MAX_BLOCK).ok());
+            let project = self.history.project();
+            let mut actions = vec![
                 Action::InsertPattern {
                     index: project.patterns.len(),
                     pattern: daw_project::Pattern {
@@ -1449,22 +1489,20 @@ impl App {
                         offset: 0,
                     },
                 },
-            ]);
-            if let Err(e) = self.history.apply(batch) {
+            ];
+            if let Some(device) = device.clone() {
+                actions.push(Action::InsertDevice {
+                    track: index,
+                    index: 0,
+                    device,
+                });
+            }
+            if let Err(e) = self.history.apply(Action::Batch(actions)) {
+                if let Some(d) = device {
+                    self.devices.discard(d.uid);
+                }
                 self.error(format!("could not add the notes: {e}"));
                 continue;
-            }
-            let instrument = if drums { "Sampler" } else { "Synth" };
-            if let Some(choice) = self
-                .devices
-                .choices
-                .iter()
-                .position(|c| c.format == "CANARY" && c.name == instrument)
-            {
-                self.handle(Request::AddDevice {
-                    track: index,
-                    choice,
-                });
             }
             self.ws.selected_track = Some(index);
             self.ws.status = Some(Status {
@@ -1715,7 +1753,11 @@ impl App {
             rate,
             end,
             self.ws.export_format,
-            self.engine.playhead_clock(),
+            // Offline when the engine can be lent from the device callback.
+            self.engine
+                .lending
+                .is_none()
+                .then(|| self.engine.playhead_clock()),
         );
         match started {
             Ok(e) => {
@@ -1737,6 +1779,8 @@ impl App {
 
     /// Stops an export, deletes its partial files and puts the monitor back.
     fn abort_export(&mut self, text: String, error: bool) {
+        self.export_failed = false;
+        self.end_render();
         if let Some(e) = self.export.take() {
             let _ = self.engine.commands.push(Command::Stop);
             e.abort();
@@ -1744,6 +1788,25 @@ impl App {
         }
         self.restore_monitor();
         self.ws.status = Some(Status { text, error });
+    }
+
+    /// Stops an offline render, if one runs, and gives the engine back to the
+    /// device callback.
+    fn end_render(&mut self) {
+        if let Some((job, stop)) = self.rendering.take() {
+            stop.store(true, Ordering::Relaxed);
+            match job.join() {
+                Ok(engine) => {
+                    // Stopped before it goes home, so the export's file taps
+                    // never write from the device callback.
+                    let _ = self.engine.commands.push(Command::Stop);
+                    if let Some(l) = self.engine.lending.as_mut() {
+                        l.give_back(engine);
+                    }
+                }
+                Err(_) => self.error("the export render failed".into()),
+            }
+        }
     }
 
     fn restore_monitor(&mut self) {
@@ -1764,15 +1827,69 @@ impl App {
                 Err(_) => self.error("conversion thread failed".into()),
             }
         }
+        if let Some(l) = self.engine.lending.as_mut() {
+            l.tend();
+        }
+        if std::mem::take(&mut self.export_failed) {
+            return self.abort_export("EXPORT FAILED".into(), true);
+        }
         let Some(e) = self.export.as_mut() else {
             return;
         };
         if !e.play_sent {
             if e.taps.is_empty() && self.queued.is_none() {
-                let _ = self.engine.commands.push(Command::Play);
+                if e.offline {
+                    // Borrow the engine and render on a worker as fast as it goes;
+                    // the device plays silence meanwhile.
+                    let lent = self
+                        .engine
+                        .lending
+                        .as_mut()
+                        .and_then(|l| l.borrow(Duration::from_millis(500)));
+                    let Some(mut engine) = lent else {
+                        return self.abort_export(
+                            "EXPORT FAILED · THE AUDIO DEVICE IS NOT RUNNING".into(),
+                            true,
+                        );
+                    };
+                    // Only now does it roll: the file taps never run on the callback.
+                    let _ = self.engine.commands.push(Command::Play);
+                    let end = e.record_end();
+                    let stop = Arc::new(AtomicBool::new(false));
+                    let stopping = stop.clone();
+                    let job = thread::spawn(move || {
+                        let mut block = vec![0.0f32; 2 * 1024];
+                        loop {
+                            engine.process(&mut block, 2);
+                            let t = engine.transport();
+                            let done = t.playhead() >= end || !t.is_playing();
+                            if done || stopping.load(Ordering::Relaxed) {
+                                return engine;
+                            }
+                        }
+                    });
+                    self.rendering = Some((job, stop));
+                } else {
+                    let _ = self.engine.commands.push(Command::Play);
+                }
                 e.play_sent = true;
             }
             return;
+        }
+        if e.offline {
+            let finished = self.rendering.as_ref().is_none_or(|r| r.0.is_finished());
+            if !finished {
+                let end = e.record_end().max(1);
+                let pct = (self.view.playhead * 100 / end).min(99);
+                self.ws.status = Some(Status {
+                    text: format!("RENDERING {pct}% · EXPORT AGAIN TO ABORT"),
+                    error: false,
+                });
+                return;
+            }
+            self.end_render();
+            let _ = self.engine.commands.push(Command::Stop);
+            return self.finish_export();
         }
         // A playhead from before the seek to 0 does not count as rolling.
         if self.view.playing && self.view.playhead < e.end {
@@ -1793,8 +1910,15 @@ impl App {
             });
             return;
         }
-        let e = self.export.take().expect("checked above");
         let _ = self.engine.commands.push(Command::Stop);
+        self.finish_export();
+    }
+
+    /// Closes the export's files and starts their conversion.
+    fn finish_export(&mut self) {
+        let Some(e) = self.export.take() else {
+            return;
+        };
         self.built = None;
         self.restore_monitor();
         match e.finish() {

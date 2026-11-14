@@ -73,7 +73,10 @@ impl Lending {
     /// Asks the callback for the engine and waits up to `wait` for it (a
     /// callback or two). `None` if the device is not running callbacks.
     pub fn borrow(&mut self, wait: std::time::Duration) -> Option<Box<AudioEngine>> {
-        let _ = self.ask.push(());
+        // A request from a timed-out borrow may still be queued: one is enough.
+        if !self.stale {
+            let _ = self.ask.push(());
+        }
         let until = std::time::Instant::now() + wait;
         loop {
             if let Ok(engine) = self.out.pop() {
@@ -121,7 +124,7 @@ mod tests {
         let mut block = vec![0.0; 128];
         // Ask, then let the "callback" run once to hand it over.
         let _ = lending.ask.push(());
-        renderer.process(&mut block, 2);
+        assert_no_alloc::assert_no_alloc(|| renderer.process(&mut block, 2));
         let mut engine = lending.borrow(Duration::from_millis(10)).expect("lent");
         handle.commands.push(Command::Play).unwrap();
         let mut big = vec![0.0; 4_096];
@@ -135,20 +138,20 @@ mod tests {
         );
         // Meanwhile the callback plays silence.
         block.fill(1.0);
-        renderer.process(&mut block, 2);
+        assert_no_alloc::assert_no_alloc(|| renderer.process(&mut block, 2));
         assert!(block.iter().all(|&s| s == 0.0));
         lending.give_back(engine);
-        renderer.process(&mut block, 2);
+        assert_no_alloc::assert_no_alloc(|| renderer.process(&mut block, 2));
         assert!(renderer.engine.is_some(), "back home");
         assert!(
             lending.borrow(Duration::from_millis(2)).is_none(),
             "no callback ran"
         );
         // The callback sees the stale request later; `tend` sends it home.
-        renderer.process(&mut block, 2);
+        assert_no_alloc::assert_no_alloc(|| renderer.process(&mut block, 2));
         assert!(renderer.engine.is_none());
         lending.tend();
-        renderer.process(&mut block, 2);
+        assert_no_alloc::assert_no_alloc(|| renderer.process(&mut block, 2));
         assert!(renderer.engine.is_some());
     }
 }

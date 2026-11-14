@@ -596,6 +596,37 @@ fn dragging_a_clip_moves_it_across_lanes_and_delete_mid_drag_is_safe() {
 }
 
 #[test]
+fn shift_click_selects_clips_and_delete_removes_them_together() {
+    let mut h = rig();
+    h.run();
+    // Track 0's two clips: at 0 (under x 500) and at 192 000 (480pt further).
+    click(&mut h, egui::Pos2::new(500.0, 165.0));
+    let second = egui::Pos2::new(980.0, 165.0);
+    h.hover_at(second);
+    h.run();
+    h.event(egui::Event::ModifiersChanged(egui::Modifiers::SHIFT));
+    for pressed in [true, false] {
+        h.event(egui::Event::PointerButton {
+            pos: second,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::SHIFT,
+        });
+        h.run();
+    }
+    h.event(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
+    h.key_press(egui::Key::Delete);
+    h.run();
+    let tracks = &h.state().history.project().tracks;
+    assert!(tracks[0].clips.is_empty(), "{:?}", tracks[0].clips);
+    assert_eq!(tracks[1].clips.len(), 1, "other tracks untouched");
+    // One undo brings both back.
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    h.run();
+    assert_eq!(h.state().history.project().tracks[0].clips.len(), 2);
+}
+
+#[test]
 fn picker_adds_a_device_and_dials_set_params() {
     // Rack: x 280..1100, y 520..900 (45% of the body), header 32pt. The two
     // devices are 16u = 256pt wide, so + DEVICE (96 x 24) starts at x 804, y 564.

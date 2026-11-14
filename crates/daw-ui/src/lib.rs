@@ -267,6 +267,12 @@ pub struct Workspace {
     /// mixer strip): only then does Delete take the whole track.
     pub track_focused: bool,
     pub selected_clip: Option<(usize, usize)>,
+    /// More audio clips selected with it (Shift-click, Cmd+A): they move,
+    /// delete and duplicate together. Valid for `group_revision` only.
+    pub(crate) clip_group: Vec<(usize, usize)>,
+    pub(crate) group_revision: u64,
+    /// This frame's edit keeps the group's indices valid (a group move).
+    pub(crate) group_keep: bool,
     /// A pattern clip on the playlist: (row, index).
     pub selected_pattern_clip: Option<(usize, usize)>,
     pub status: Option<Status>,
@@ -326,6 +332,9 @@ impl Default for Workspace {
             snap: Snap::Sixteenth,
             selected_track: None,
             step_paint: None,
+            clip_group: Vec::new(),
+            group_revision: 0,
+            group_keep: false,
             browser_scroll: 0.0,
             manifest_scroll: 0.0,
             track_focused: false,
@@ -526,6 +535,13 @@ impl Workspace {
                 Edit::Redo => drop(inputs.history.redo()),
                 Edit::Gesture(action, id) => drop(inputs.history.apply_gesture(action, id)),
             }
+        }
+        // A group outlives only its own moves: any other edit may have shifted
+        // the indices it holds.
+        if std::mem::take(&mut self.group_keep) {
+            self.group_revision = inputs.history.revision();
+        } else if self.group_revision != inputs.history.revision() {
+            self.clip_group.clear();
         }
         // A wheel turning a dial is one gesture until the scroll stops.
         if !ui.input(|i| i.pointer.any_down() || i.smooth_scroll_delta != Vec2::ZERO) {
@@ -742,9 +758,24 @@ impl Workspace {
                     self.selected_pattern_clip = None;
                     Some(Action::RemovePatternClip { track, index })
                 }
-                (None, Some((track, index)), _) => {
+                (None, Some(primary), _) => {
                     self.selected_clip = None;
-                    Some(Action::RemoveClip { track, index })
+                    // Highest index first per track, so each removal leaves the
+                    // others' indices alone.
+                    let mut all: Vec<(usize, usize)> = std::mem::take(&mut self.clip_group);
+                    all.push(primary);
+                    all.sort_unstable();
+                    all.dedup();
+                    let removals: Vec<Action> = all
+                        .into_iter()
+                        .rev()
+                        .map(|(track, index)| Action::RemoveClip { track, index })
+                        .collect();
+                    Some(if removals.len() == 1 {
+                        removals.into_iter().next().expect("one")
+                    } else {
+                        Action::Batch(removals)
+                    })
                 }
                 (None, None, Some(index)) if self.track_focused => {
                     self.selected_track = None;
@@ -871,7 +902,7 @@ impl Workspace {
         });
         let project = inputs.history.project();
         for (key, mods) in keys {
-            if mods.command && key != Key::D {
+            if mods.command && !matches!(key, Key::D | Key::A) {
                 continue;
             }
             match key {
@@ -893,6 +924,19 @@ impl Workspace {
                         }
                         self.edit(Action::SetTrackProps { index: i, props });
                     }
+                }
+                // Cmd+A: every audio clip on the playlist.
+                Key::A if mods.command && self.page == Page::Playlist => {
+                    let all: Vec<(usize, usize)> = project
+                        .tracks
+                        .iter()
+                        .enumerate()
+                        .flat_map(|(t, tr)| (0..tr.clips.len()).map(move |c| (t, c)))
+                        .collect();
+                    self.selected_clip = all.first().copied();
+                    self.selected_pattern_clip = None;
+                    self.clip_group = all.into_iter().skip(1).collect();
+                    self.group_revision = inputs.history.revision();
                 }
                 Key::D if mods.command && self.page == Page::Playlist => {
                     let action = match (self.selected_pattern_clip, self.selected_clip) {

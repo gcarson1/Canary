@@ -659,6 +659,12 @@ pub(crate) fn show(
         ws.timeline.drag = None;
     }
     let mut hit = None;
+    // A selection moving with the dragged clip: by how many samples.
+    let group_delta = ws.timeline.drag.as_ref().and_then(|d| {
+        let original = project.tracks.get(d.track)?.clips.get(d.index)?;
+        (d.grab == Grab::Body && !ws.clip_group.is_empty())
+            .then(|| d.preview.start as i64 - original.start as i64)
+    });
     for (ti, track) in project.tracks.iter().enumerate() {
         for (ci, clip) in track.clips.iter().enumerate() {
             let dragging = ws
@@ -666,8 +672,16 @@ pub(crate) fn show(
                 .drag
                 .as_ref()
                 .is_some_and(|d| (d.track, d.index) == (ti, ci));
-            let (shown, lane_i) = match &ws.timeline.drag {
-                Some(d) if dragging => (&d.preview, d.to_track),
+            let moved;
+            let (shown, lane_i) = match (&ws.timeline.drag, group_delta) {
+                (Some(d), _) if dragging => (&d.preview, d.to_track),
+                (_, Some(dx)) if ws.clip_group.contains(&(ti, ci)) => {
+                    moved = ClipRef {
+                        start: clip.start.saturating_add_signed(dx),
+                        ..clip.clone()
+                    };
+                    (&moved, ti)
+                }
                 _ => (clip, ti),
             };
             let lane = lane_rect(lane_i, &ws.timeline);
@@ -697,6 +711,9 @@ pub(crate) fn show(
                 continue;
             }
             draw_clip(ws, &clip_p, m, rect, shown, inputs);
+            if ws.clip_group.contains(&(ti, ci)) {
+                clip_p.rect_stroke(rect, 0.0, m.hair(t.accent_amber), StrokeKind::Inside);
+            }
             if ws.selected_clip == Some((ti, ci)) {
                 clip_p.rect_stroke(rect, 0.0, m.hair(t.accent_amber), StrokeKind::Inside);
                 // Fade handles: drag these squares (the title strip's corners).
@@ -913,6 +930,17 @@ pub(crate) fn show(
         let at = probe.map(|p| ws.timeline.sample_at(lanes, p.x));
         if let (Some((ti, ci, grab)), Some(at)) = (hit, at) {
             let clip = project.tracks[ti].clips[ci].clone();
+            // Dragging a clip of the selection moves the whole selection;
+            // any other clip drags alone.
+            let member = ws.selected_clip == Some((ti, ci)) || ws.clip_group.contains(&(ti, ci));
+            if member && grab == Grab::Body {
+                if let Some(prev) = ws.selected_clip.filter(|&c| c != (ti, ci)) {
+                    ws.clip_group.retain(|&c| c != (ti, ci));
+                    ws.clip_group.push(prev);
+                }
+            } else {
+                ws.clip_group.clear();
+            }
             ws.selected_clip = Some((ti, ci));
             ws.selected_track = Some(ti);
             ws.timeline.drag = Some(Drag {
@@ -965,7 +993,10 @@ pub(crate) fn show(
                 Grab::Body => {
                     d.preview.start = snap_f(at - d.offset, drag_snap, project) as u64;
                     let lane = ((pos.y - lanes.min.y + ws.timeline.scroll_y) / lane_h).floor();
-                    d.to_track = (lane.max(0.0) as usize).min(project.tracks.len() - 1);
+                    // A selection moves in time only; one clip may change lanes.
+                    if ws.clip_group.is_empty() {
+                        d.to_track = (lane.max(0.0) as usize).min(project.tracks.len() - 1);
+                    }
                 }
                 Grab::End if d.stretching => {
                     let to = snap_f(at, drag_snap, project) as u64;
@@ -1007,7 +1038,28 @@ pub(crate) fn show(
             }
         }
         if let Some(d) = ws.timeline.drag.take() {
-            let action = if d.to_track == d.track {
+            let action = if let Some(dx) = group_delta {
+                // The whole selection, in place: indices stay valid.
+                let mut moves = vec![Action::SetClip {
+                    track: d.track,
+                    index: d.index,
+                    clip: d.preview,
+                }];
+                for &(t, c) in &ws.clip_group {
+                    if let Some(clip) = project.tracks.get(t).and_then(|tr| tr.clips.get(c)) {
+                        moves.push(Action::SetClip {
+                            track: t,
+                            index: c,
+                            clip: ClipRef {
+                                start: clip.start.saturating_add_signed(dx),
+                                ..clip.clone()
+                            },
+                        });
+                    }
+                }
+                ws.group_keep = true;
+                Action::Batch(moves)
+            } else if d.to_track == d.track {
                 Action::SetClip {
                     track: d.track,
                     index: d.index,
@@ -1058,10 +1110,27 @@ pub(crate) fn show(
                 }
             }
             (Some((ti, ci, _)), _, _) => {
-                ws.selected_clip = Some((ti, ci));
+                if ui.input(|i| i.modifiers.shift) {
+                    // Shift-click adds the clip to the selection, or takes it out.
+                    if let Some(i) = ws.clip_group.iter().position(|&c| c == (ti, ci)) {
+                        ws.clip_group.remove(i);
+                    } else if ws.selected_clip == Some((ti, ci)) {
+                        ws.selected_clip = ws.clip_group.pop();
+                    } else {
+                        ws.clip_group.extend(ws.selected_clip);
+                        ws.selected_clip = Some((ti, ci));
+                    }
+                    ws.group_revision = inputs.history.revision();
+                } else {
+                    ws.clip_group.clear();
+                    ws.selected_clip = Some((ti, ci));
+                }
                 ws.selected_track = Some(ti);
             }
-            (None, _, _) => ws.selected_clip = None,
+            (None, _, _) => {
+                ws.selected_clip = None;
+                ws.clip_group.clear();
+            }
         }
     }
 

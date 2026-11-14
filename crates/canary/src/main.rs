@@ -120,7 +120,9 @@ struct App {
     sent_metronome: bool,
     /// Live MIDI to the selected track's instrument: pads and the keyboard.
     midi: Option<Arc<Mutex<MidiSender>>>,
-    midi_in: Option<MidiConnection>,
+    /// Every MIDI input port, by name, kept in step with what is plugged in.
+    midi_in: Vec<(String, MidiConnection)>,
+    last_midi_scan: Option<Instant>,
     /// A plan the engine's queue had no room for; sent before any new one.
     queued: Option<Box<ExecutionPlan>>,
     devices: Devices,
@@ -220,12 +222,6 @@ impl App {
         let (mut engine, output, config) =
             daw_engine::start_output_at(4096, wanted, faults.clone()).map_err(|e| e.to_string())?;
         let midi = engine.midi.take().map(|m| Arc::new(Mutex::new(m)));
-        // The first MIDI input, if any; a missing or busy port only loses the keyboard.
-        let midi_in = midi.clone().and_then(|m| {
-            daw_engine::connect_midi(m, 0)
-                .inspect_err(|e| eprintln!("MIDI input: {e}"))
-                .ok()
-        });
         let mut history = if let Some(saved) = saved {
             saved
         } else if template.exists() {
@@ -295,7 +291,8 @@ impl App {
             meters: Vec::new(),
             sent_metronome: false,
             midi,
-            midi_in,
+            midi_in: Vec::new(),
+            last_midi_scan: None,
             queued: None,
             devices: Devices::scan(),
             recorder: None,
@@ -504,6 +501,35 @@ impl App {
         }
     }
 
+    /// Connects every MIDI input port and drops ones unplugged, every few
+    /// seconds, so a keyboard plugged in while Canary runs just plays.
+    fn sync_midi_inputs(&mut self) {
+        if self
+            .last_midi_scan
+            .is_some_and(|at| at.elapsed() < Duration::from_secs(3))
+        {
+            return;
+        }
+        self.last_midi_scan = Some(Instant::now());
+        let Some(sender) = self.midi.clone() else {
+            return;
+        };
+        let Ok(ports) = daw_engine::midi_input_ports() else {
+            return;
+        };
+        self.midi_in.retain(|(name, _)| ports.contains(name));
+        for (index, name) in ports.iter().enumerate() {
+            if self.midi_in.iter().any(|(n, _)| n == name) {
+                continue;
+            }
+            // A busy port only loses that keyboard.
+            match daw_engine::connect_midi(sender.clone(), index) {
+                Ok(c) => self.midi_in.push((name.clone(), c)),
+                Err(e) => eprintln!("MIDI input {name}: {e}"),
+            }
+        }
+    }
+
     /// An audio or MIDI take is running.
     fn taking(&self) -> bool {
         self.midi_take.is_some()
@@ -611,11 +637,9 @@ impl App {
         self.preview_node = Some(Box::new(preview_node));
         self.preview = preview;
         self.midi = self.engine.midi.take().map(|m| Arc::new(Mutex::new(m)));
-        self.midi_in = None;
-        self.midi_in = self
-            .midi
-            .clone()
-            .and_then(|m| daw_engine::connect_midi(m, 0).ok());
+        // Inputs feed the old engine's sender: connect them all again.
+        self.midi_in.clear();
+        self.last_midi_scan = None;
         self.live.clear();
         self.queued = None;
         self.built = None;
@@ -1833,6 +1857,7 @@ impl eframe::App for App {
         self.receive_loads();
         self.receive_stretches();
         self.check_streams();
+        self.sync_midi_inputs();
         self.preview.collect();
         while let Ok((path, audio)) = self.preview_rx.try_recv() {
             // Only the latest file asked for; earlier ones just drop.

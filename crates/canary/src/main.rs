@@ -81,7 +81,9 @@ struct App {
     samples_dir: PathBuf,
     files: Vec<PathBuf>,
     engine: EngineHandle,
-    _output: cpal::Stream,
+    output: cpal::Stream,
+    /// The output device was lost; when the next restart attempt is due.
+    audio_lost: Option<Instant>,
     view: EngineView,
     audio: HashMap<PathBuf, Arc<SampleData>>,
     /// Sampler files already sent to load, so a failed one is not retried forever.
@@ -118,7 +120,7 @@ struct App {
     sent_metronome: bool,
     /// Live MIDI to the selected track's instrument: pads and the keyboard.
     midi: Option<Arc<Mutex<MidiSender>>>,
-    _midi_in: Option<MidiConnection>,
+    midi_in: Option<MidiConnection>,
     /// A plan the engine's queue had no room for; sent before any new one.
     queued: Option<Box<ExecutionPlan>>,
     devices: Devices,
@@ -128,8 +130,9 @@ struct App {
     midi_take: Option<take::MidiTake>,
     /// Quit was asked mid-take: close once the take is in the project.
     quitting: bool,
-    /// Errors the audio streams reported.
+    /// Errors the output and input streams reported.
     faults: daw_engine::StreamFaults,
+    input_faults: daw_engine::StreamFaults,
     /// A mix export in progress.
     export: Option<export::Export>,
     /// The preview node until the first plan inserts it, and its control.
@@ -261,7 +264,8 @@ impl App {
             files: audio_files(&samples_dir),
             samples_dir,
             engine,
-            _output: output,
+            output,
+            audio_lost: None,
             view: EngineView {
                 sample_rate: config.sample_rate,
                 ..EngineView::default()
@@ -289,13 +293,14 @@ impl App {
             meters: Vec::new(),
             sent_metronome: false,
             midi,
-            _midi_in: midi_in,
+            midi_in,
             queued: None,
             devices: Devices::scan(),
             recorder: None,
             midi_take: None,
             quitting: false,
             faults: faults.clone(),
+            input_faults: daw_engine::StreamFaults::default(),
             export: None,
             last_autosave: Instant::now(),
             autosaved: None,
@@ -507,17 +512,105 @@ impl App {
         {
             self.toggle_record();
         }
-        match self.faults.take() {
-            Some(daw_engine::Fault::Lost) => {
-                if self.taking() {
-                    self.toggle_record();
-                }
-                self.error("AUDIO DEVICE LOST · SAVE AND RESTART CANARY".into());
+        use daw_engine::Fault;
+        let input = self.input_faults.take();
+        let output = self.faults.take();
+        if input == Some(Fault::Lost) || output == Some(Fault::Lost) {
+            if self.taking() {
+                self.toggle_record();
             }
-            Some(daw_engine::Fault::Dropout) => self.error("AUDIO DROPOUT".into()),
-            Some(daw_engine::Fault::Other) => self.error("AUDIO DEVICE ERROR".into()),
-            None => {}
+            self.recorder = None;
         }
+        match (output, input) {
+            (Some(Fault::Lost), _) => {
+                self.error("AUDIO DEVICE LOST · RECONNECTING".into());
+                self.audio_lost = Some(Instant::now());
+            }
+            (_, Some(Fault::Lost)) => self.error("INPUT DEVICE LOST".into()),
+            (Some(Fault::Dropout), _) | (_, Some(Fault::Dropout)) => {
+                self.error("AUDIO DROPOUT".into())
+            }
+            (Some(Fault::Other), _) | (_, Some(Fault::Other)) => {
+                self.error("AUDIO DEVICE ERROR".into())
+            }
+            (None, None) => {}
+        }
+        // Try the default output again every second until one opens.
+        if self
+            .audio_lost
+            .is_some_and(|at| at.elapsed() >= Duration::from_secs(1))
+        {
+            match self.restart_audio() {
+                Ok(()) => {
+                    self.audio_lost = None;
+                    self.ws.status = Some(Status {
+                        text: "AUDIO DEVICE RECONNECTED".into(),
+                        error: false,
+                    });
+                }
+                Err(e) => {
+                    // Said once per loss, not every second.
+                    if self.ws.status.as_ref().is_none_or(|s| !s.text.contains(&e)) {
+                        self.error(format!("AUDIO DEVICE LOST · {e}"));
+                    }
+                    self.audio_lost = Some(Instant::now());
+                }
+            }
+        }
+    }
+
+    /// Opens the default output again at the project's rate and moves the
+    /// session onto a fresh engine: the old stream (and every node in it) is
+    /// dropped, plugins are made again from their state, and the next sync
+    /// sends a whole new plan.
+    fn restart_audio(&mut self) -> Result<(), String> {
+        let rate = self.view.sample_rate;
+        let faults = daw_engine::StreamFaults::default();
+        let (engine, output, config) =
+            daw_engine::start_output_at(4096, Some(rate), faults.clone())
+                .map_err(|e| e.to_string())?;
+        if config.sample_rate != rate {
+            return Err(format!(
+                "the output runs at {} Hz, not {rate} Hz",
+                config.sample_rate
+            ));
+        }
+        if self.export.is_some() {
+            self.abort_export("EXPORT ABORTED".into(), true);
+        }
+        let _ = self.gather_state();
+        // Every node goes before the plugin handles they belong to: the dead
+        // stream's engine (the arena), then the old handle's queues (plans
+        // not applied or not collected) and any plan waiting to be sent.
+        drop(std::mem::replace(&mut self.output, output));
+        self.engine.collect_garbage();
+        drop(std::mem::replace(&mut self.engine, engine));
+        self.queued = None;
+        self.devices.engine_lost();
+        let playhead = self.view.playhead;
+        self.faults = faults;
+        let _ = self.engine.commands.push(Command::Seek(playhead));
+        let (master, monitor) = MasterNode::new(rate as f32);
+        monitor.set_mode(self.monitor.mode());
+        monitor.set_reference(self.monitor.reference());
+        self.master = Some(Box::new(master));
+        self.monitor = monitor;
+        let (preview_node, preview) = PreviewNode::new();
+        self.preview_node = Some(Box::new(preview_node));
+        self.preview = preview;
+        self.midi = self.engine.midi.take().map(|m| Arc::new(Mutex::new(m)));
+        self.midi_in = None;
+        self.midi_in = self
+            .midi
+            .clone()
+            .and_then(|m| daw_engine::connect_midi(m, 0).ok());
+        self.live.clear();
+        self.queued = None;
+        self.built = None;
+        self.built_loop = None;
+        self.built_reference = None;
+        self.sent_metronome = !self.ws.metronome;
+        Ok(())
     }
 
     fn error(&mut self, text: String) {
@@ -637,6 +730,7 @@ impl App {
             .into_iter()
             .filter(|&i| i < count)
             .collect();
+        let looping = loop_range(project, playback, self.export.is_some());
         let mut out_step: Vec<Option<StepId>> = vec![None; count];
         let mut bus_in: Vec<Vec<StepId>> = vec![Vec::new(); count];
         let mut steps = Vec::with_capacity(count);
@@ -812,7 +906,6 @@ impl App {
         self.built = Some(self.history.revision());
         self.built_selected = self.ws.selected_track;
         // PAT mode loops the pattern; jump into it if the playhead is past its end.
-        let looping = loop_range(self.history.project(), playback, self.export.is_some());
         // A loop that changed (mode, pattern length, tempo) may now end behind the
         // playhead, which the transport would never wrap: move it in.
         if looping != self.built_loop {
@@ -1541,7 +1634,7 @@ impl App {
             match daw_engine::start_input(
                 self.view.sample_rate,
                 self.engine.playhead_clock(),
-                self.faults.clone(),
+                self.input_faults.clone(),
             ) {
                 Ok((recorder, stream, _)) => self.recorder = Some((recorder, stream)),
                 Err(e) => return self.error(format!("cannot record: {e}")),

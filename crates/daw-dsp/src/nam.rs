@@ -552,8 +552,9 @@ struct Lanczos {
     ring: [f32; RING],
     /// Input samples pushed so far.
     pushed: u64,
-    /// Time of the next output, in input samples.
-    next: f64,
+    /// Outputs pulled so far; output `k` is at input time `k * step` (computed,
+    /// not accumulated, so it never drifts).
+    pulled: u64,
     step: f64,
     /// Kernel scale: 1, or 1 / step when downsampling.
     scale: f64,
@@ -566,7 +567,7 @@ impl Lanczos {
         Self {
             ring: [0.0; RING],
             pushed: 0,
-            next: 0.0,
+            pulled: 0,
             step,
             scale,
             width: LOBES / scale,
@@ -580,7 +581,7 @@ impl Lanczos {
 
     /// The next output, once enough input has arrived.
     fn pull(&mut self) -> Option<f32> {
-        let t = self.next;
+        let t = self.pulled as f64 * self.step;
         let newest = self.pushed as f64 - 1.0;
         if t + self.width > newest {
             return None;
@@ -594,7 +595,7 @@ impl Lanczos {
             sum += w * f64::from(self.ring[i as usize % RING]);
             weights += w;
         }
-        self.next += self.step;
+        self.pulled += 1;
         // Normalized, so the passband gain is exactly 1.
         Some(if weights.abs() > 1e-9 {
             (sum / weights) as f32
@@ -875,6 +876,9 @@ mod tests {
             Some(48_000.0),
             Some(96_000.0),
             Some(22_050.0),
+            Some(11_025.0),
+            Some(11_100.0),
+            Some(176_400.0),
         ] {
             let mut rate = Rate::new(project, capture);
             // A 1 kHz tone through an identity "model" comes back as itself,

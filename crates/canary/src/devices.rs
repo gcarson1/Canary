@@ -40,6 +40,9 @@ struct Retired {
     plan: Option<u64>,
     /// Its node never reached the engine: nothing to wait for.
     unsent: bool,
+    /// Its node's id, and whether `apply_changes` put its removal in a plan.
+    id: NodeId,
+    handed: bool,
     /// Its ARA document and extension, released once the handle is gone.
     ara: Option<(usize, NonNull<c_void>)>,
 }
@@ -269,7 +272,11 @@ impl Devices {
     /// Plan `n` (`EngineHandle::plans_sent`) carried the removals handed out by
     /// the last `apply_changes`. Call after each successful send.
     pub fn sent(&mut self, n: u64) {
-        for r in self.retired.iter_mut().filter(|r| r.plan.is_none()) {
+        for r in self
+            .retired
+            .iter_mut()
+            .filter(|r| r.handed && r.plan.is_none())
+        {
             r.plan = Some(n);
         }
     }
@@ -278,7 +285,11 @@ impl Devices {
     /// in the engine: keep those handles for good rather than risk dropping a
     /// plugin under a node that still runs.
     pub fn send_failed(&mut self) {
-        for r in self.retired.iter_mut().filter(|r| r.plan.is_none()) {
+        for r in self
+            .retired
+            .iter_mut()
+            .filter(|r| r.handed && r.plan.is_none())
+        {
             r.plan = Some(u64::MAX);
         }
     }
@@ -287,6 +298,16 @@ impl Devices {
     pub fn apply_changes(&mut self, plan: &mut ExecutionPlan) {
         for id in self.removing.drain(..) {
             plan.remove(id);
+            // The newest handle with this id: an id freed and reused leaves
+            // an older one already handed.
+            if let Some(r) = self
+                .retired
+                .iter_mut()
+                .rev()
+                .find(|r| r.id == id && !r.handed)
+            {
+                r.handed = true;
+            }
         }
         for live in self.live.values_mut() {
             if let Some(node) = live.node.take() {
@@ -297,6 +318,11 @@ impl Devices {
 
     /// Schedules `track`'s instrument, if it has one, taking live MIDI when
     /// `live_midi` (the selected track). Its step feeds the track node.
+    /// Adds `track`'s instrument to `plan` and returns its step.
+    // shortcut: the step reports 0 to PDC (the track node sums its clips with
+    // it, which delaying would put early), so a latent instrument plays its
+    // notes that much late. Leading sequenced notes needs the engine's note
+    // renderer to look ahead across loop wraps without releasing at the wrap.
     pub fn instrument_step(
         &self,
         plan: &mut ExecutionPlan,
@@ -314,9 +340,6 @@ impl Devices {
         if live_midi {
             plan.route_midi(step);
         }
-        // shortcut: instruments only play live MIDI, which PDC does not compensate,
-        // and the track node sums its clips with the instrument; delaying the
-        // others would put this track's clips early. Revisit with sequenced notes.
         plan.set_latency(step, 0);
         Some(step)
     }
@@ -379,6 +402,8 @@ impl Devices {
             hosted: live.hosted,
             plan: None,
             unsent,
+            id: live.id,
+            handed: false,
             ara,
         });
     }
@@ -483,6 +508,36 @@ impl Devices {
             self.retire(uid);
         }
         self.removed_state.clear();
+        self.failed.clear();
+    }
+
+    /// The engine that held every device node is gone (its stream died and was
+    /// dropped, nodes with it): keep each plugin's state, drop the handles, and
+    /// let the next `sync` make every device again for the new engine.
+    pub fn engine_lost(&mut self) {
+        let uids: Vec<u64> = self.live.keys().copied().collect();
+        for uid in uids {
+            self.close_editor(uid);
+        }
+        for (uid, mut live) in std::mem::take(&mut self.live) {
+            if let Ok(state) = live.hosted.save_state() {
+                self.removed_state.insert(uid, state);
+            }
+            self.free.push(live.id.0);
+            let ara = live.ara.zip(live.hosted.ara_extension());
+            drop(live.node.take()); // an unsent node before its handle
+            drop(live);
+            if let Some(((doc, _), ext)) = ara {
+                self.ara[doc].release(ext);
+            }
+        }
+        for r in std::mem::take(&mut self.retired) {
+            drop(r.hosted);
+            if let Some((doc, ext)) = r.ara {
+                self.ara[doc].release(ext);
+            }
+        }
+        self.removing.clear();
         self.failed.clear();
     }
 
@@ -818,6 +873,18 @@ mod tests {
             "plan 7's removed nodes still in the engine"
         );
         d.idle(|n| n <= 7);
+        assert!(d.retired.is_empty());
+
+        // A removal made after a plan was built rides the next plan, not that one.
+        d.sync(&project(&[3]), 48_000.0, 64);
+        send(&mut d, &mut live);
+        d.sync(&project(&[]), 48_000.0, 64);
+        d.sent(9);
+        d.idle(|_| true);
+        assert_eq!(d.retired.len(), 1, "not in plan 9: still running");
+        send(&mut d, &mut live);
+        d.sent(10);
+        d.idle(|n| n <= 10);
         assert!(d.retired.is_empty());
     }
 

@@ -1280,3 +1280,18 @@ fn shift_dragging_the_ruler_draws_a_loop_and_l_toggles_it() {
     h.run();
     assert!(!h.state().history.project().loop_on);
 }
+
+#[test]
+fn n_turns_the_selected_clip_into_notes_without_muting() {
+    let mut h = rig();
+    h.run();
+    click(&mut h, egui::Pos2::new(700.0, 230.0)); // the pad clip on row 2
+    h.key_press(egui::Key::N);
+    h.run();
+    assert!(h.state().requests.contains(&Request::AudioToMidi {
+        track: 1,
+        index: 0,
+        drums: false
+    }));
+    assert!(!h.state().history.project().tracks[1].mute);
+}

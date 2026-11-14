@@ -816,8 +816,9 @@ impl Workspace {
                         // A render per press; a held key must not start dozens.
                         Key::OpenBracket if !repeat => semis -= 1.0,
                         Key::CloseBracket if !repeat => semis += 1.0,
-                        // M turns the clip into MIDI notes, Shift+M into drum hits.
-                        Key::M if !repeat => midi = Some(modifiers.shift),
+                        // N turns the clip into notes, Shift+N into drum hits
+                        // (M is mute).
+                        Key::N if !repeat => midi = Some(modifiers.shift),
                         _ => {}
                     }
                 }

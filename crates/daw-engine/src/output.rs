@@ -4,7 +4,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::SampleFormat;
 
 use crate::stream::{pick_config, StreamFaults};
-use crate::{engine, EngineHandle};
+use crate::{lendable_engine, EngineHandle};
 
 #[derive(Debug)]
 pub enum OutputError {
@@ -116,7 +116,9 @@ pub fn start_output_at(
     }
     let channels = config.channels as usize;
 
-    let (handle, mut audio) = engine(queue_capacity, config.sample_rate as f32);
+    let (mut handle, lending, mut audio) =
+        lendable_engine(queue_capacity, config.sample_rate as f32);
+    handle.lending = Some(lending);
     let stream = device.build_output_stream(
         config,
         move |data: &mut [f32], _| audio.process(data, channels),

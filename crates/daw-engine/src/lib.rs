@@ -1,5 +1,6 @@
 //! Real-time thread coordinator: audio streams, lock-free queues, plan swapping, disk streaming and garbage collection.
 
+mod lend;
 mod load;
 mod midi;
 mod output;
@@ -8,13 +9,14 @@ mod record;
 mod stream;
 mod transport;
 
+pub use lend::{lendable_engine, Lending, Renderer};
 pub use load::{load_audio, resample, write_wav, LoadError};
 pub use midi::{connect_midi, midi_input_ports, MidiConnection, MidiError, MidiSender};
 pub use output::{output_devices, start_output, start_output_at, OutputChoice, OutputError};
 pub use peaks::cached_waveform;
 pub use record::{
-    bounce_tap, input_devices, recorder, start_input, BounceTap, InputError, RecordError,
-    RecordInput, Recorder, Take,
+    bounce_tap, file_tap, input_devices, recorder, start_input, BounceTap, FileTapDone, InputError,
+    RecordError, RecordInput, Recorder, Take,
 };
 pub use stream::{Fault, StreamFaults};
 pub use transport::Transport;
@@ -58,6 +60,9 @@ pub struct EngineHandle {
     collected: u64,
     /// `ExecutionPlan::latency` of the last plan sent.
     plan_latency: u32,
+    /// Borrows the engine from the device callback for offline rendering; set
+    /// by `start_output`.
+    pub lending: Option<Lending>,
 }
 
 #[derive(Debug)]
@@ -175,6 +180,7 @@ pub fn engine(capacity: usize, sample_rate: f32) -> (EngineHandle, AudioEngine) 
             sent: 0,
             collected: 0,
             plan_latency: 0,
+            lending: None,
         },
         AudioEngine {
             commands: command_rx,

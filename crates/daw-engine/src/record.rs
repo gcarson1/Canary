@@ -419,6 +419,109 @@ pub fn start_input(
     Ok((recorder, stream, config))
 }
 
+/// A tap that writes a step's stereo output straight to a WAV file. For
+/// offline rendering only: it does file I/O and takes a lock, so it must never
+/// run on the real-time callback (the export renders on a worker thread with
+/// the engine borrowed, and only starts the transport once it has it).
+pub struct FileTap {
+    writer: Arc<std::sync::Mutex<Option<OfflineWav>>>,
+    end: u64,
+}
+
+type OfflineWav = hound::WavWriter<std::io::BufWriter<std::fs::File>>;
+
+/// Finishes a `FileTap`'s file once rendering is done.
+pub struct FileTapDone {
+    writer: Arc<std::sync::Mutex<Option<OfflineWav>>>,
+    failed: Arc<AtomicBool>,
+    path: PathBuf,
+}
+
+/// A tap writing 32-bit float stereo to `path` while the transport rolls, up to
+/// timeline sample `end`, and the handle that finishes the file.
+pub fn file_tap(
+    path: &std::path::Path,
+    sample_rate: u32,
+    end: u64,
+) -> Result<(Box<dyn daw_graph::Tap>, FileTapDone), hound::Error> {
+    let spec = hound::WavSpec {
+        channels: 2,
+        sample_rate,
+        bits_per_sample: 32,
+        sample_format: hound::SampleFormat::Float,
+    };
+    let writer = Arc::new(std::sync::Mutex::new(Some(hound::WavWriter::create(
+        path, spec,
+    )?)));
+    let failed = Arc::new(AtomicBool::new(false));
+    Ok((
+        Box::new(FileTapWriter {
+            tap: FileTap {
+                writer: writer.clone(),
+                end,
+            },
+            failed: failed.clone(),
+        }),
+        FileTapDone {
+            writer,
+            failed,
+            path: path.to_path_buf(),
+        },
+    ))
+}
+
+struct FileTapWriter {
+    tap: FileTap,
+    failed: Arc<AtomicBool>,
+}
+
+impl daw_graph::Tap for FileTapWriter {
+    fn write(&mut self, left: &[f32], right: &[f32], context: &daw_core::ProcessContext) {
+        if !context.playing || context.playhead >= self.tap.end {
+            return;
+        }
+        let n = left
+            .len()
+            .min(right.len())
+            .min((self.tap.end - context.playhead) as usize);
+        let Ok(mut guard) = self.tap.writer.lock() else {
+            return;
+        };
+        let Some(w) = guard.as_mut() else { return };
+        for i in 0..n {
+            if w.write_sample(left[i])
+                .and_then(|()| w.write_sample(right[i]))
+                .is_err()
+            {
+                self.failed.store(true, Ordering::Relaxed);
+                return;
+            }
+        }
+    }
+}
+
+impl FileTapDone {
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    /// Closes the file; an error if any write failed.
+    pub fn finish(self) -> Result<(), String> {
+        let w = self
+            .writer
+            .lock()
+            .map_err(|_| "writer poisoned".to_string())?
+            .take();
+        if let Some(w) = w {
+            w.finalize().map_err(|e| e.to_string())?;
+        }
+        if self.failed.load(Ordering::Relaxed) {
+            return Err(format!("{}: a write failed", self.path.display()));
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -554,5 +657,34 @@ mod tests {
         input.push(&[0.5; 3]);
         assert_eq!(rec.stop().unwrap().frames, 3);
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn a_file_tap_writes_only_while_rolling_and_up_to_its_end() {
+        let dir = std::env::temp_dir().join(format!("canary-filetap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.wav");
+        let (mut tap, done) = file_tap(&path, 48_000, 6).unwrap();
+        let ctx = |playhead, playing| daw_core::ProcessContext {
+            playhead,
+            playing,
+            num_samples: 4,
+            ..Default::default()
+        };
+        tap.write(&[1.0; 4], &[2.0; 4], &ctx(0, false));
+        tap.write(&[1.0; 4], &[2.0; 4], &ctx(0, true));
+        tap.write(&[3.0; 4], &[4.0; 4], &ctx(4, true)); // only 2 frames fit
+        drop(tap);
+        done.finish().unwrap();
+        let s: Vec<f32> = hound::WavReader::open(&path)
+            .unwrap()
+            .into_samples::<f32>()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            s,
+            [1.0, 2.0, 1.0, 2.0, 1.0, 2.0, 1.0, 2.0, 3.0, 4.0, 3.0, 4.0]
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

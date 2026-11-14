@@ -31,6 +31,11 @@ pub const ID: &str = "dev.canary.test-gain";
 pub const GAIN: u32 = 1;
 pub const LATENCY: u32 = 32;
 pub static LIVE: AtomicUsize = AtomicUsize::new(0);
+/// Audio ports per direction instances made from now on declare: the main one,
+/// then extra stereo ports (a sidechain in, a second bus out).
+pub static PORTS: AtomicUsize = AtomicUsize::new(1);
+/// The loudest input sample any port past the main one has received.
+pub static EXTRA_INPUT_PEAK: AtomicU64 = AtomicU64::new(0);
 /// Editor calls in order, for the editor lifecycle test.
 pub static GUI_LOG: Mutex<Vec<&str>> = Mutex::new(Vec::new());
 pub const GUI_SIZE: GuiSize = GuiSize {
@@ -78,6 +83,7 @@ impl PluginShared<'_> for Shared {}
 
 pub struct Main<'a> {
     shared: &'a Shared,
+    ports: u32,
 }
 
 impl<'a> PluginMainThread<'a, Shared> for Main<'a> {}
@@ -118,7 +124,10 @@ impl DefaultPluginFactory for TestGain {
         _host: HostMainThreadHandle<'a>,
         shared: &'a Shared,
     ) -> Result<Main<'a>, PluginError> {
-        Ok(Main { shared })
+        Ok(Main {
+            shared,
+            ports: PORTS.load(Ordering::SeqCst) as u32,
+        })
     }
 }
 
@@ -144,7 +153,7 @@ impl<'a> PluginAudioProcessor<'a, Shared, Main<'a>> for Processor<'a> {
         self.shared.apply(events.input);
         let gain = self.shared.gain() as f32;
         let start = self.held;
-        for mut port in &mut audio {
+        for (index, mut port) in (&mut audio).into_iter().enumerate() {
             let Some(pairs) = port.channels()?.into_f32() else {
                 continue;
             };
@@ -152,6 +161,10 @@ impl<'a> PluginAudioProcessor<'a, Shared, Main<'a>> for Processor<'a> {
                 let ChannelPair::InputOutput(input, output) = pair else {
                     continue;
                 };
+                if index > 0 {
+                    let peak = input.iter().fold(0.0f64, |m, s| m.max(f64::from(s.abs())));
+                    EXTRA_INPUT_PEAK.fetch_max(peak.to_bits(), Ordering::SeqCst);
+                }
                 let mut held = start;
                 let mut notes = events.input.into_iter().peekable();
                 for (i, (o, s)) in output.iter_mut().zip(input.iter()).enumerate() {
@@ -173,16 +186,20 @@ impl<'a> PluginAudioProcessor<'a, Shared, Main<'a>> for Processor<'a> {
 
 impl PluginAudioPortsImpl for Main<'_> {
     fn count(&self, _is_input: bool) -> u32 {
-        1
+        self.ports
     }
 
     fn get(&self, index: u32, _is_input: bool, writer: &mut AudioPortInfoWriter) {
-        if index == 0 {
+        if index < self.ports {
             writer.set(&AudioPortInfo {
-                id: ClapId::new(0),
-                name: b"Main",
+                id: ClapId::new(index),
+                name: if index == 0 { b"Main" } else { b"Extra" },
                 channel_count: 2,
-                flags: AudioPortFlags::IS_MAIN,
+                flags: if index == 0 {
+                    AudioPortFlags::IS_MAIN
+                } else {
+                    AudioPortFlags::empty()
+                },
                 port_type: Some(AudioPortType::STEREO),
                 in_place_pair: None,
             });

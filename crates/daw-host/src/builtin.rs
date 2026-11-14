@@ -41,9 +41,9 @@ pub fn instantiate(id: &str, sample_rate: f32, max_block: usize) -> Result<Insta
     let infos = params
         .specs()
         .iter()
-        .enumerate()
-        .map(|(i, p)| ParamInfo {
-            id: i as u32,
+        .zip(params.ids())
+        .map(|(p, &id)| ParamInfo {
+            id,
             name: p.name.into(),
             min: p.min.into(),
             max: p.max.into(),

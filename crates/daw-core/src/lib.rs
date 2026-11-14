@@ -7,6 +7,10 @@ use std::sync::Arc;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NodeId(pub u32);
 
+/// Parameter id of a built-in effect's MIX; MATCH and DELTA follow. Fixed, so
+/// automation and state stay on the right knob when an effect gains parameters.
+pub const COMMON_PARAM_ID: u32 = 1000;
+
 /// A raw MIDI message, timestamped within the current block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MidiEvent {

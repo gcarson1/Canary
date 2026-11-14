@@ -5,7 +5,7 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
-use daw_core::{MidiEvent, ProcessContext};
+use daw_core::{MidiEvent, ProcessContext, COMMON_PARAM_ID};
 use daw_dsp::effects::{Effect, ParamSpec};
 
 use crate::AudioNode;
@@ -47,33 +47,60 @@ const MATCH_FLOOR: f32 = 1e-7;
 const MATCH_LIMIT: f32 = 16.0;
 
 /// A built-in device's parameter values, written by the main thread and read by
-/// the audio thread each block. Ids are indexes into `specs`.
+/// the audio thread each block. Each parameter has an id (what automation and
+/// the host use); ids are the indexes into `specs` unless given.
 pub struct ParamBank {
     specs: Vec<ParamSpec>,
+    ids: Box<[u32]>,
     values: Box<[AtomicU32]>,
 }
 
 impl ParamBank {
     pub fn new(specs: Vec<ParamSpec>) -> Self {
+        let ids = (0..specs.len() as u32).collect();
+        Self::with_ids(specs, ids)
+    }
+
+    /// `ids[i]` is the id of `specs[i]`.
+    pub fn with_ids(specs: Vec<ParamSpec>, ids: Box<[u32]>) -> Self {
+        assert_eq!(specs.len(), ids.len());
         let values = specs
             .iter()
             .map(|p| AtomicU32::new(p.default.to_bits()))
             .collect();
-        Self { specs, values }
+        Self { specs, ids, values }
     }
 
     pub fn specs(&self) -> &[ParamSpec] {
         &self.specs
     }
 
+    /// Each spec's id, in the same order.
+    pub fn ids(&self) -> &[u32] {
+        &self.ids
+    }
+
+    /// Where `id` is stored: its own index for the leading ids, else a search.
+    fn index(&self, id: usize) -> Option<usize> {
+        if self.ids.get(id).is_some_and(|&i| i as usize == id) {
+            return Some(id);
+        }
+        self.ids.iter().position(|&i| i as usize == id)
+    }
+
     pub fn get(&self, id: usize) -> Option<f32> {
-        Some(f32::from_bits(self.values.get(id)?.load(Ordering::Relaxed)))
+        let slot = &self.values[self.index(id)?];
+        Some(f32::from_bits(slot.load(Ordering::Relaxed)))
     }
 
     /// Clamps into the parameter's range. False for an unknown id or a value that
     /// is not finite.
     pub fn set(&self, id: usize, value: f32) -> bool {
-        match (self.specs.get(id), self.values.get(id)) {
+        let i = self.index(id);
+        match (
+            i.and_then(|i| self.specs.get(i)),
+            i.and_then(|i| self.values.get(i)),
+        ) {
             (Some(spec), Some(slot)) if value.is_finite() => {
                 let v = value.clamp(spec.min, spec.max);
                 slot.store(v.to_bits(), Ordering::Relaxed);
@@ -114,8 +141,13 @@ impl EffectNode {
         sample_rate: f32,
         max_block: usize,
     ) -> (Self, Arc<ParamBank>) {
-        let specs = effect.params().iter().chain(&COMMON).copied().collect();
-        let params = Arc::new(ParamBank::new(specs));
+        let specs: Vec<ParamSpec> = effect.params().iter().chain(&COMMON).copied().collect();
+        let own = effect.params().len() as u32;
+        let ids = (0..own)
+            .chain(COMMON_PARAM_ID..)
+            .take(specs.len())
+            .collect();
+        let params = Arc::new(ParamBank::with_ids(specs, ids));
         let latency = effect.latency() as usize;
         let coef = |seconds: f32| 1.0 - (-1.0 / (seconds * sample_rate)).exp();
         let node = Self {
@@ -158,7 +190,6 @@ impl AudioNode for EffectNode {
         context: &ProcessContext,
     ) {
         let n = context.num_samples;
-        let own = self.seen.len();
         let first = self.seen.first().is_some_and(|s| s.is_nan());
         for (i, seen) in self.seen.iter_mut().enumerate() {
             let v = self.params.get(i).unwrap_or(*seen);
@@ -172,7 +203,10 @@ impl AudioNode for EffectNode {
             self.effect.reset();
         }
         self.effect.set_tempo(context.musical.bpm as f32);
-        let common = |i: usize| self.params.get(own + i).unwrap_or(COMMON[i].default);
+        let common = |i: usize| {
+            let id = COMMON_PARAM_ID as usize + i;
+            self.params.get(id).unwrap_or(COMMON[i].default)
+        };
         let mix = common(0) / 100.0;
         let matching = common(1) >= 0.5;
         let delta = common(2) >= 0.5;
@@ -317,11 +351,8 @@ mod tests {
     fn level_match_holds_the_dry_loudness() {
         let (mut node, params) = saturator();
         params.set(0, 30.0); // heavy drive: far louder than dry
-        let match_id = params
-            .specs()
-            .iter()
-            .position(|p| p.name == "MATCH")
-            .unwrap();
+        let match_id = COMMON_PARAM_ID as usize + 1;
+        assert_eq!(params.ids()[params.specs().len() - 2], match_id as u32);
         assert_eq!(params.get(match_id), Some(0.0), "off by default");
         params.set(match_id, 1.0);
         let (out, input) = run(&mut node, 0.05);
@@ -344,7 +375,10 @@ mod tests {
     #[test]
     fn dry_mix_passes_input_and_delta_of_dry_is_silent() {
         let (mut node, params) = saturator();
-        let id = |name| params.specs().iter().position(|p| p.name == name).unwrap();
+        let id = |name| {
+            let at = params.specs().iter().position(|p| p.name == name).unwrap();
+            params.ids()[at] as usize
+        };
         params.set(id("MIX"), 0.0);
         let (out, input) = run(&mut node, 0.5);
         assert!((out - input).abs() < 1e-6, "0% wet is the dry signal");
@@ -407,7 +441,7 @@ mod tests {
         let (mut node, params) = EffectNode::new(fx, SR, 64);
         let latency = node.latency_samples() as usize;
         assert!(latency > 0);
-        params.set(3, 50.0); // MIX, after the limiter's 3 params
+        params.set(COMMON_PARAM_ID as usize, 50.0); // MIX
         let input: Vec<f32> = (0..4_096).map(|i| 0.1 * (i as f32 * 0.05).sin()).collect();
         let mut out = Vec::new();
         for block in input.chunks(64) {

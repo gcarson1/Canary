@@ -843,6 +843,22 @@ mod tests {
     }
 
     #[test]
+    fn extra_ports_hear_silence_and_only_the_main_output_is_heard() {
+        let _serial = serial();
+        let entry = entry();
+        test_plugin::PORTS.store(2, Ordering::SeqCst);
+        test_plugin::EXTRA_INPUT_PEAK.store(0, Ordering::SeqCst);
+        let made = ClapPlugin::new(&entry, test_plugin::ID, 48_000.0, 64);
+        test_plugin::PORTS.store(1, Ordering::SeqCst);
+        let (_plugin, mut node) = made.unwrap();
+        // Ones in, gain 1: the main port outputs ones. The extra port's output
+        // (its silent input, so zeros) must not reach the node's outputs.
+        let out = assert_no_alloc(|| run(&mut node, &[]));
+        assert_eq!(out, [1.0; 8]);
+        assert_eq!(test_plugin::EXTRA_INPUT_PEAK.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn block_longer_than_activation_is_silence_not_a_panic() {
         let _serial = serial();
         let entry = entry();

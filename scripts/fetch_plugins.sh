@@ -27,25 +27,36 @@ fetch() {
   }
 }
 
+# A disk image mounted by expand_dmg_pkg; detached however the script ends.
+mnt=""
+cleanup() {
+  if [ -n "$mnt" ]; then
+    hdiutil detach "$mnt" >/dev/null 2>&1 || true
+    rmdir "$mnt" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+
 # expand_dmg_pkg DMG DIR: the installer package inside DMG, expanded to DIR
 # without running it.
 expand_dmg_pkg() {
   mnt=$(mktemp -d)
   rm -rf "$2"
   hdiutil attach -nobrowse -readonly -mountpoint "$mnt" "$1" >/dev/null
-  pkgutil --expand-full "$mnt"/*.pkg "$2" || {
-    hdiutil detach "$mnt" >/dev/null
-    exit 1
-  }
-  hdiutil detach "$mnt" >/dev/null
-  rmdir "$mnt"
+  pkgutil --expand-full "$mnt"/*.pkg "$2"
+  cleanup
+  mnt=""
 }
 
-# place SRC DEST: copies a bundle or folder, keeping code signatures.
+# place SRC DEST: copies a bundle or folder, keeping code signatures. Copies
+# beside DEST then renames, so an interrupted run never leaves half a copy.
 place() {
-  rm -rf "$2"
   mkdir -p "$(dirname "$2")"
-  ditto "$1" "$2"
+  rm -rf "$2.part"
+  ditto "$1" "$2.part"
+  rm -rf "$2"
+  mv "$2.part" "$2"
 }
 
 # Surge XT 1.3.4 (GPL-3.0): synth and effects.

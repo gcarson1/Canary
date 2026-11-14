@@ -21,7 +21,9 @@ pub use notes::{sorted, Note, Pattern, PatternClip, PatternNotes, Playback, MAX_
 pub use tempo::{valid_meters, valid_tempos, BarBeat, MeterChange, TempoChange};
 
 /// Bumped when the file format changes incompatibly.
-const FORMAT_VERSION: u32 = 1;
+/// 2: built-in effects' MIX/MATCH/DELTA have fixed parameter ids
+/// (`daw_core::COMMON_PARAM_ID`); in 1 they followed the effect's own.
+const FORMAT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Project {
@@ -1013,8 +1015,10 @@ impl History {
     pub fn load(path: &Path) -> Result<Self, ProjectError> {
         let bytes = fs::read(path).map_err(ProjectError::Io)?;
         let mut file: ProjectFile = serde_json::from_slice(&bytes).map_err(ProjectError::Format)?;
-        if file.version != FORMAT_VERSION {
-            return Err(ProjectError::Version(file.version));
+        match file.version {
+            1 => migrate_common_params(&mut file.project),
+            FORMAT_VERSION => {}
+            v => return Err(ProjectError::Version(v)),
         }
         // Projects from before routing have no track ids: number them.
         let first = file.project.new_track_id();
@@ -1079,6 +1083,50 @@ impl History {
             return Err(ProjectError::Invalid);
         }
         Ok(Self::new(file.project))
+    }
+}
+
+/// Each built-in effect's own parameter count in format 1, where MIX, MATCH
+/// and DELTA took the ids right after them. Frozen: it describes old files.
+const V1_OWN_PARAMS: [(&str, u32); 15] = [
+    ("canary.eq", 5),
+    ("canary.eq8", 33),
+    ("canary.compressor", 5),
+    ("canary.limiter", 3),
+    ("canary.gate", 4),
+    ("canary.saturator", 2),
+    ("canary.dynamic_eq", 5),
+    ("canary.deesser", 3),
+    ("canary.filter", 4),
+    ("canary.reverb", 4),
+    ("canary.delay", 4),
+    ("canary.chorus", 4),
+    ("canary.phaser", 5),
+    ("canary.crusher", 2),
+    ("canary.utility", 4),
+];
+
+/// Moves format-1 automation of a built-in effect's MIX/MATCH/DELTA to their
+/// fixed ids.
+fn migrate_common_params(project: &mut Project) {
+    let own: std::collections::HashMap<u64, u32> = project
+        .tracks
+        .iter()
+        .flat_map(|t| &t.devices)
+        .filter(|d| d.format == PluginFormat::Builtin)
+        .filter_map(|d| {
+            let (_, n) = V1_OWN_PARAMS.iter().find(|(id, _)| *id == d.id)?;
+            Some((d.uid, *n))
+        })
+        .collect();
+    for lane in project.tracks.iter_mut().flat_map(|t| &mut t.automation) {
+        if let Target::Param { device, id } = &mut lane.target {
+            if let Some(&n) = own.get(&*device) {
+                if (n..n + 3).contains(id) {
+                    *id = daw_core::COMMON_PARAM_ID + (*id - n);
+                }
+            }
+        }
     }
 }
 
@@ -1308,7 +1356,7 @@ mod tests {
 
         let text = fs::read_to_string(&path)
             .unwrap()
-            .replace("\"version\": 1", "\"version\": 99");
+            .replace("\"version\": 2", "\"version\": 99");
         fs::write(&path, text).unwrap();
         assert!(matches!(
             History::load(&path),
@@ -1316,12 +1364,58 @@ mod tests {
         ));
         let text = fs::read_to_string(&path).unwrap();
         let zero_tempo = text
-            .replace("\"version\": 99", "\"version\": 1")
+            .replace("\"version\": 99", "\"version\": 2")
             .replace("\"bpm\": 120.0", "\"bpm\": 0.0");
         fs::write(&path, zero_tempo).unwrap();
         assert!(matches!(History::load(&path), Err(ProjectError::Invalid)));
         fs::write(&path, "{").unwrap();
         assert!(matches!(History::load(&path), Err(ProjectError::Format(_))));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn format_1_mix_automation_moves_to_the_fixed_id() {
+        let dir = std::env::temp_dir().join(format!("canary-v1-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("old.daw");
+        let mut project = Project::default();
+        let mut track = Track::new("Vox");
+        track.devices.push(Device {
+            uid: 7,
+            format: PluginFormat::Builtin,
+            bundle: None,
+            id: "canary.delay".into(),
+            name: "Delay".into(),
+            state: Vec::new(),
+            sidechain: None,
+        });
+        // Format 1: the delay had 4 params, so 4 was MIX; 1 is FEEDBACK.
+        for id in [4, 1] {
+            track.automation.push(Lane {
+                target: Target::Param { device: 7, id },
+                points: Vec::new(),
+            });
+        }
+        project.tracks.push(track);
+        History::new(project).save(&path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        fs::write(&path, text.replace("\"version\": 2", "\"version\": 1")).unwrap();
+        let loaded = History::load(&path).unwrap();
+        let ids: Vec<_> = loaded.project().tracks[0]
+            .automation
+            .iter()
+            .map(|l| l.target)
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                Target::Param {
+                    device: 7,
+                    id: daw_core::COMMON_PARAM_ID
+                },
+                Target::Param { device: 7, id: 1 },
+            ]
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 

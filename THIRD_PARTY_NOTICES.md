@@ -14,6 +14,12 @@ Unmodified official macOS builds, fetched by `scripts/fetch_plugins.sh` (pinned 
 
 Their factory data (Surge XT patches and wavetables, OB-Xf patches and themes) is installed by the fetch script into `~/Library/Application Support/Surge XT` and `~/Library/Application Support/Surge Synth Team/OB-Xf`.
 
+## Rust crates with notable roles
+
+| Crate | License | Use |
+| --- | --- | --- |
+| fft-convolver 0.4 | MIT | Partitioned convolution for `canary.convolver` |
+
 ## Vendored source
 
 | Project | License | Where |

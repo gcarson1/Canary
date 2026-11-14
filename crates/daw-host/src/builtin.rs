@@ -181,6 +181,41 @@ mod tests {
     }
 
     #[test]
+    fn convolver_swaps_and_drains_engines_without_allocating() {
+        use daw_core::ProcessContext;
+        let ctx = ProcessContext {
+            sample_rate: 48_000.0,
+            num_samples: 256,
+            playing: true,
+            ..Default::default()
+        };
+        let (mut handle, mut node) = instantiate("canary.convolver", 48_000.0, 256).unwrap();
+        let input = [0.25f32; 256];
+        let (mut l, mut r) = ([0.0f32; 256], [0.0f32; 256]);
+        let mut block = |node: &mut Box<dyn daw_graph::AudioNode>| {
+            assert_no_alloc::assert_no_alloc(|| {
+                node.process(
+                    &[&input, &input],
+                    &mut [&mut l, &mut r],
+                    &[],
+                    &mut Vec::new(),
+                    &ctx,
+                );
+            });
+        };
+        block(&mut node);
+        // DECAY to its shortest: the worker builds a new engine; the next block
+        // swaps it in and starts the old one draining, then the drain ends.
+        handle.set_param(0, 0.2);
+        block(&mut node);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        for _ in 0..(3 * 48_000 / 256) {
+            block(&mut node);
+        }
+        assert!(l.iter().all(|x| x.is_finite()));
+    }
+
+    #[test]
     fn load_state_skips_junk_and_rejects_non_text() {
         let (mut fx, _) = instantiate("canary.compressor", 48_000.0, 64).unwrap();
         fx.load_state(b"THRESH=-30\nNOPE=1\nRATIO=abc\nno equals")

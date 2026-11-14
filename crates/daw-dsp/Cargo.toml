@@ -7,3 +7,5 @@ license.workspace = true
 
 [dependencies]
 daw-core = { path = "../daw-core" }
+fft-convolver = "0.4"
+rtrb = "0.4"

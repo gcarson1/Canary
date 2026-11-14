@@ -413,6 +413,13 @@ pub(crate) fn show(
                 ws.song = true;
             }
             if let Some(v) = dial(ui, &p, m, ws, area, param, (!was_open).then_some(id)) {
+                if let Some(device) = uid {
+                    let target = daw_project::Target::Param {
+                        device,
+                        id: param.id,
+                    };
+                    ws.record_automation(inputs.history.project(), inputs.engine, track, target, v);
+                }
                 out.push(Request::SetParam {
                     track,
                     device: di,

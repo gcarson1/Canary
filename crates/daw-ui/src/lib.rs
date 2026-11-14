@@ -309,6 +309,11 @@ pub struct Workspace {
     pub count_in: bool,
     /// Audio takes keep only what falls inside the song loop region.
     pub punch: bool,
+    /// AUTO: while playing, moving a dial, pan or fader writes its automation
+    /// lane at the playhead (latch: it overwrites what it passes).
+    pub auto_record: bool,
+    /// The tick each control last wrote in this pass, cleared on release.
+    auto_pass: HashMap<(usize, Target), u64>,
     /// The automation lane drawn over the selected track in the playlist.
     pub automation: Option<Target>,
     pub export_format: ExportFormat,
@@ -374,6 +379,8 @@ impl Default for Workspace {
             metronome: false,
             count_in: false,
             punch: false,
+            auto_record: false,
+            auto_pass: HashMap::new(),
             automation: None,
             export_format: ExportFormat::default(),
             seq: sequencer::View::default(),
@@ -466,6 +473,7 @@ impl Workspace {
         }
         if !ui.input(|i| i.pointer.any_down()) {
             self.step_paint = None;
+            self.auto_pass.clear();
             if let Some((track, key)) = self.held_note.take() {
                 out.push(Request::Note {
                     track,
@@ -634,6 +642,69 @@ impl Workspace {
             length: 4 * PPQ,
         };
         (id, Some(Action::InsertPattern { index: 0, pattern }))
+    }
+
+    /// With AUTO on and the transport playing, writes `value` for `target` on
+    /// `track` at the playhead, wiping what this pass has moved over since its
+    /// last write. A whole pass is one undo step.
+    pub(crate) fn record_automation(
+        &mut self,
+        project: &Project,
+        engine: &EngineView,
+        track: usize,
+        target: Target,
+        value: f64,
+    ) {
+        if !self.auto_record || !engine.playing || !value.is_finite() {
+            return;
+        }
+        let Some(t) = project.tracks.get(track) else {
+            return;
+        };
+        let tick = project.ticks_at(engine.playhead);
+        let value = target
+            .range()
+            .map_or(value, |(lo, hi)| value.max(lo).min(hi));
+        // From the last write of this pass (not across a loop wrap) to now.
+        let from = self
+            .auto_pass
+            .get(&(track, target))
+            .copied()
+            .filter(|&last| last <= tick)
+            .unwrap_or(tick);
+        let mut points: Vec<daw_project::Point> = t
+            .automation
+            .iter()
+            .find(|l| l.target == target)
+            .map_or_else(Vec::new, |l| l.points.clone());
+        // Keep this pass's last write (where the move ramps from); a first
+        // write replaces any point at its tick.
+        points.retain(|p| p.tick < from || (p.tick == from && from < tick) || p.tick > tick);
+        let at = points.partition_point(|p| p.tick < tick);
+        points.insert(
+            at,
+            daw_project::Point {
+                tick,
+                value,
+                curve: 0.0,
+            },
+        );
+        self.auto_pass.insert((track, target), tick);
+        let id = 1 << 63
+            | (track as u64) << 40
+            | match target {
+                Target::Gain => 1,
+                Target::Pan => 2,
+                Target::Param { device, id } => (device << 20).wrapping_add(3) ^ u64::from(id),
+            } & ((1 << 40) - 1);
+        self.edits.push(Edit::Gesture(
+            Action::SetAutomation {
+                track,
+                target,
+                points,
+            },
+            id,
+        ));
     }
 
     /// Queues a project edit for the end of the frame. `notes` as `track`'s notes in the current pattern, creating the
@@ -1398,11 +1469,18 @@ impl Workspace {
         }
         // Metronome, count-in and punch switches.
         let mut x = rec.max.x + 0.75 * u;
-        for (label, id) in [("MET", "met"), ("CNT", "count"), ("PUNCH", "punch")] {
+        let toggles = [
+            ("MET", "met"),
+            ("CNT", "count"),
+            ("PUNCH", "punch"),
+            ("AUTO", "auto"),
+        ];
+        for (label, id) in toggles {
             let on = match id {
                 "met" => self.metronome,
                 "count" => self.count_in,
-                _ => self.punch,
+                "punch" => self.punch,
+                _ => self.auto_record,
             };
             let g = p.layout_no_wrap(label.into(), m.mono(0.625), t.text);
             let rect = m.snap_rect(Rect::from_min_size(
@@ -1427,7 +1505,8 @@ impl Workspace {
                 match id {
                     "met" => self.metronome ^= true,
                     "count" => self.count_in ^= true,
-                    _ => self.punch ^= true,
+                    "punch" => self.punch ^= true,
+                    _ => self.auto_record ^= true,
                 }
             }
             x = rect.max.x + 0.25 * u;
@@ -2286,6 +2365,48 @@ fn file_name(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_writes_points_while_playing_and_overwrites_what_it_passes() {
+        let mut project = Project::default();
+        project.tracks.push(Track::new("T".to_string()));
+        project.tracks[0].automation.push(daw_project::Lane {
+            target: Target::Pan,
+            points: (0..10)
+                .map(|i| daw_project::Point {
+                    tick: i * 100,
+                    value: 0.0,
+                    curve: 0.0,
+                })
+                .collect(),
+        });
+        let mut ws = Workspace::default();
+        let mut engine = EngineView {
+            playing: true,
+            ..EngineView::default()
+        };
+        let points = |ws: &mut Workspace| match ws.edits.pop() {
+            Some(Edit::Gesture(Action::SetAutomation { points, .. }, _)) => points,
+            _ => panic!("no automation written"),
+        };
+        // Off: nothing written.
+        ws.record_automation(&project, &engine, 0, Target::Pan, 0.5);
+        assert!(ws.edits.is_empty());
+        ws.auto_record = true;
+        engine.playhead = project.samples_at(250);
+        ws.record_automation(&project, &engine, 0, Target::Pan, 0.5);
+        let first = points(&mut ws);
+        assert!(first.iter().any(|p| p.tick == 250 && p.value == 0.5));
+        assert_eq!(first.len(), 11, "a point added, none removed yet");
+        project.tracks[0].automation[0].points = first;
+        // Later in the same pass: the points it passed over are gone.
+        engine.playhead = project.samples_at(520);
+        ws.record_automation(&project, &engine, 0, Target::Pan, 9.0);
+        let second = points(&mut ws);
+        let ticks: Vec<u64> = second.iter().map(|p| p.tick).collect();
+        assert_eq!(ticks, [0, 100, 200, 250, 520, 600, 700, 800, 900]);
+        assert_eq!(second[4].value, 1.0, "clamped to the pan range");
+    }
 
     #[test]
     fn option_click_solos_one_track_then_clears() {

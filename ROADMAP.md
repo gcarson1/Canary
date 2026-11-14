@@ -90,7 +90,8 @@ The UI follows Styles.md whichever framework is chosen.
 - [x] Loop region: Shift-drag the playlist ruler to draw it (on at once), L toggles it; SONG mode loops it (`Project::loop_region`/`loop_on`, `Action::SetLoop`)
 - [x] Punch in/out, count-in for audio takes (PUNCH keeps the part of a take inside the song loop region as the clip's window; CNT counts in audio takes too, with nothing recorded during the count-in)
 - [x] Automation lanes: track gain/pan and any plugin or built-in parameter, breakpoints with curve shapes, applied per block on the audio thread (`ExecutionPlan::automate`, `AudioNode::automate`: TrackNode, built-in effects, sampler attack/release/gain, CLAP, VST3, AU). AUTO [GAIN][PAN] in the tool strip, or right-click a rack dial, shows the lane on the selected track's playlist row: click adds a snapped point, drag moves it, Option-drag bends a segment, right-click removes
-- [ ] Automation recording from the rack (latch/touch) and mute automation
+- [x] Automation recording (AUTO in the transport: dials, pan and faders write their lanes while playing, latch, one undo step per pass)
+- [ ] Touch mode, mute automation, and edits to automation without a plan rebuild
 - [x] Transport info to plugins: every node's `ProcessContext::musical` carries tempo, quarter-note position, bar and time signature from the tempo/meter maps (`ExecutionPlan::set_tempo_map`, `daw_core::musical_at`); CLAP gets a transport event, VST3 a `ProcessContext`
 - [x] Transport info for Audio Units: host callbacks report tempo, beat, bar, meter, play state and jumps
 - [ ] Loop positions in plugin transport info; ARA content access for the tempo map

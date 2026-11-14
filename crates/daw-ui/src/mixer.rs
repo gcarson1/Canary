@@ -2,7 +2,7 @@
 //! buses, a pan dial, a ladder fader beside a peak meter, and mute/solo. Fader
 //! and dial drags are one undo step each (`History::apply_gesture`).
 
-use daw_project::{Action, Send, Track, TrackProps};
+use daw_project::{Action, Send, Target, Track, TrackProps};
 use egui::{Align2, Pos2, Rect, Sense, StrokeKind, Vec2};
 
 use crate::rack::{dial, ParamView};
@@ -270,6 +270,7 @@ pub(crate) fn show(
                 Action::SetTrackProps { index: ti, props },
                 gesture(ti, 1),
             ));
+            ws.record_automation(project, inputs.engine, ti, Target::Pan, v);
         }
         y = pan_area.max.y;
 
@@ -323,10 +324,12 @@ pub(crate) fn show(
                 gain: pos_to_gain(pos),
                 ..TrackProps::of(track)
             };
+            let gain = f64::from(props.gain);
             ws.edits.push(Edit::Gesture(
                 Action::SetTrackProps { index: ti, props },
                 gesture(ti, 2),
             ));
+            ws.record_automation(project, inputs.engine, ti, Target::Gain, gain);
         }
         if resp.double_clicked() {
             let props = TrackProps {

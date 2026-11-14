@@ -128,6 +128,8 @@ struct App {
     recorder: Option<(Recorder, cpal::Stream)>,
     /// MIDI being recorded into a pattern.
     midi_take: Option<take::MidiTake>,
+    /// Punch ranges (timeline samples) for takes still loading, by file.
+    punches: HashMap<PathBuf, (u64, u64)>,
     /// Quit was asked mid-take: close once the take is in the project.
     quitting: bool,
     /// Errors the output and input streams reported.
@@ -298,6 +300,7 @@ impl App {
             devices: Devices::scan(),
             recorder: None,
             midi_take: None,
+            punches: HashMap::new(),
             quitting: false,
             faults: faults.clone(),
             input_faults: daw_engine::StreamFaults::default(),
@@ -374,11 +377,20 @@ impl App {
         let Some(audio) = self.audio.get(path) else {
             return;
         };
+        let frames = audio.frames() as u64;
+        // A punched take: only its part inside the punch range.
+        let (start, offset, length) = match self.punches.remove(path) {
+            Some(range) => match punch_window(at, frames, range) {
+                Some(window) => window,
+                None => return self.error("nothing was recorded inside the punch range".into()),
+            },
+            None => (at, 0, frames),
+        };
         let clip = ClipRef {
             source: path.to_path_buf(),
-            start: at,
-            offset: 0,
-            length: audio.frames() as u64,
+            start,
+            offset,
+            length,
             fade_in: 0,
             fade_out: 0,
             gain: 1.0,
@@ -1607,19 +1619,25 @@ impl App {
         while self.engine.midi_log.pop().is_ok() {} // nothing from before the take
         let tracks = self.history.project().tracks.len();
         self.midi_take = Some(take::MidiTake::new(track, tracks, id, length));
-        if self.ws.count_in {
-            // One bar of the meter at the playhead, at the tempo there.
-            let project = self.history.project();
-            let tick = project.ticks_at(self.view.playhead);
-            let meter = project.bar_beat(tick).meter;
-            let beat = project.samples_at(tick + meter.beat_ticks()) - project.samples_at(tick);
-            let _ = self.engine.commands.push(Command::CountIn {
-                frames: beat * u64::from(meter.numerator),
-                beat,
-                beats_per_bar: meter.numerator,
-            });
-        }
+        self.count_in();
         let _ = self.engine.commands.push(Command::Play);
+    }
+
+    /// With CNT on, one bar of the meter at the playhead, at the tempo there,
+    /// before the next Play rolls the timeline.
+    fn count_in(&mut self) {
+        if !self.ws.count_in {
+            return;
+        }
+        let project = self.history.project();
+        let tick = project.ticks_at(self.view.playhead);
+        let meter = project.bar_beat(tick).meter;
+        let beat = project.samples_at(tick + meter.beat_ticks()) - project.samples_at(tick);
+        let _ = self.engine.commands.push(Command::CountIn {
+            frames: beat * u64::from(meter.numerator),
+            beat,
+            beats_per_bar: meter.numerator,
+        });
     }
 
     fn toggle_record(&mut self) {
@@ -1665,6 +1683,12 @@ impl App {
             let start = take
                 .start_sample
                 .saturating_sub(u64::from(self.engine.plan_latency()));
+            // PUNCH keeps only the part inside the song loop region; the rest
+            // stays in the file, outside the clip's window.
+            let region = self.history.project().loop_region;
+            if let Some((from, to)) = region.filter(|_| self.ws.punch) {
+                self.punches.insert(take.path.clone(), (from, to));
+            }
             self.load(take.path, Some((self.ws.selected_track, start)));
         } else {
             let stamp = SystemTime::now()
@@ -1673,6 +1697,7 @@ impl App {
             let path = self.samples_dir.join(format!("Take-{stamp}.wav"));
             match recorder.start(&path) {
                 Ok(()) => {
+                    self.count_in();
                     let _ = self.engine.commands.push(Command::Play);
                 }
                 Err(e) => {
@@ -1971,6 +1996,15 @@ fn into_loop(looping: Option<(u64, u64)>, at: u64) -> Option<u64> {
     (at >= end).then(|| start + (at - start) % (end - start))
 }
 
+/// The part of a take (`frames` long, starting at timeline sample `at`) inside
+/// the punch range `[from, to)`: its timeline start, offset into the file and
+/// length. None when they do not overlap.
+fn punch_window(at: u64, frames: u64, (from, to): (u64, u64)) -> Option<(u64, u64, u64)> {
+    let begin = from.max(at);
+    let end = to.min(at.saturating_add(frames));
+    (begin < end).then(|| (begin, begin - at, end - begin))
+}
+
 /// The transport loop for `playback`: the whole pattern in PAT mode.
 /// An export plays the whole song, so the song loop is off while it runs.
 fn loop_range(
@@ -2027,6 +2061,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn punch_keeps_only_the_take_inside_the_range() {
+        // Take from 1000 for 5000 frames, punch 2000..4000.
+        assert_eq!(
+            punch_window(1_000, 5_000, (2_000, 4_000)),
+            Some((2_000, 1_000, 2_000))
+        );
+        // Range wider than the take: the whole take.
+        assert_eq!(punch_window(1_000, 500, (0, 9_000)), Some((1_000, 0, 500)));
+        assert_eq!(punch_window(1_000, 500, (2_000, 3_000)), None);
+    }
 
     #[test]
     fn playheads_past_a_loop_wrap_into_it() {

@@ -268,8 +268,10 @@ pub struct Workspace {
     pub pattern: Option<u64>,
     /// Click on every beat while playing.
     pub metronome: bool,
-    /// Count in one bar before a MIDI take.
+    /// Count in one bar before a take.
     pub count_in: bool,
+    /// Audio takes keep only what falls inside the song loop region.
+    pub punch: bool,
     /// The automation lane drawn over the selected track in the playlist.
     pub automation: Option<Target>,
     pub export_format: ExportFormat,
@@ -322,6 +324,7 @@ impl Default for Workspace {
             pattern: None,
             metronome: false,
             count_in: false,
+            punch: false,
             automation: None,
             export_format: ExportFormat::default(),
             seq: sequencer::View::default(),
@@ -1049,13 +1052,13 @@ impl Workspace {
         if rec_resp.clicked() {
             out.push(Request::ToggleRecord);
         }
-        // Metronome and count-in switches.
+        // Metronome, count-in and punch switches.
         let mut x = rec.max.x + 0.75 * u;
-        for (label, id) in [("MET", "met"), ("CNT", "count")] {
-            let on = if id == "met" {
-                self.metronome
-            } else {
-                self.count_in
+        for (label, id) in [("MET", "met"), ("CNT", "count"), ("PUNCH", "punch")] {
+            let on = match id {
+                "met" => self.metronome,
+                "count" => self.count_in,
+                _ => self.punch,
             };
             let g = p.layout_no_wrap(label.into(), m.mono(0.625), t.text);
             let rect = m.snap_rect(Rect::from_min_size(
@@ -1077,10 +1080,10 @@ impl Workspace {
                 if on { t.ink_text } else { t.muted },
             );
             if resp.clicked() {
-                if id == "met" {
-                    self.metronome ^= true;
-                } else {
-                    self.count_in ^= true;
+                match id {
+                    "met" => self.metronome ^= true,
+                    "count" => self.count_in ^= true,
+                    _ => self.punch ^= true,
                 }
             }
             x = rect.max.x + 0.25 * u;

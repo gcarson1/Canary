@@ -106,6 +106,7 @@ impl EngineHandle {
 
     /// The playhead at the start of the block now rendering, updated every callback.
     /// Other real-time threads (the input callback) read it without a queue.
+    /// Reads `COUNTING_IN` while a count-in holds the timeline.
     pub fn playhead_clock(&self) -> Arc<AtomicU64> {
         self.playhead.clone()
     }
@@ -130,6 +131,10 @@ impl EngineHandle {
         self.collected + 1 >= n
     }
 }
+
+/// What the playhead clock (`EngineHandle::playhead_clock`) reads while a
+/// count-in runs: the timeline is not moving yet, so a recorder waits.
+pub const COUNTING_IN: u64 = u64::MAX;
 
 /// Audio-thread side. `process` never allocates, locks or blocks.
 pub struct AudioEngine {
@@ -229,8 +234,12 @@ impl AudioEngine {
         }
 
         let channels = channels.max(1);
-        self.playhead
-            .store(self.transport.playhead(), Ordering::Relaxed);
+        let clock = if self.transport.count_in().is_some() {
+            COUNTING_IN
+        } else {
+            self.transport.playhead()
+        };
+        self.playhead.store(clock, Ordering::Relaxed);
         let mut midi = self.midi.drain(output.len() / channels, self.sample_rate);
         match self.plan.as_deref_mut() {
             None => {

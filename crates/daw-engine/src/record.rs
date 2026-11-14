@@ -88,11 +88,15 @@ impl RecordInput {
         if !self.shared.armed.load(Ordering::Acquire) {
             return;
         }
+        // Counting in: nothing is kept until the timeline moves.
+        let playhead = self.playhead.load(Ordering::Relaxed);
+        if playhead == crate::COUNTING_IN {
+            return;
+        }
         let take = self.shared.take.load(Ordering::Acquire);
         if take != self.seen_take {
             self.seen_take = take;
-            let start = self.playhead.load(Ordering::Relaxed);
-            self.shared.start_sample.store(start, Ordering::Relaxed);
+            self.shared.start_sample.store(playhead, Ordering::Relaxed);
         }
         let frames = interleaved.len() / self.channels;
         let fit = frames.min(self.queue.slots() / self.channels);
@@ -431,6 +435,20 @@ mod tests {
         assert_eq!(samples, audio);
         std::fs::remove_file(&take.path).unwrap();
         assert!(matches!(rec.stop(), Err(RecordError::NotRecording)));
+    }
+
+    #[test]
+    fn nothing_is_kept_while_counting_in() {
+        let playhead = Arc::new(AtomicU64::new(crate::COUNTING_IN));
+        let (mut rec, mut input) = recorder(1, 48_000, playhead.clone());
+        let path = temp_wav("count-in");
+        rec.start(&path).unwrap();
+        input.push(&[9.0; 64]); // the count-in bar: dropped
+        playhead.store(1_000, Ordering::Relaxed);
+        input.push(&[1.0; 32]);
+        let take = rec.stop().unwrap();
+        assert_eq!((take.start_sample, take.frames), (1_000, 32));
+        std::fs::remove_file(&take.path).unwrap();
     }
 
     #[test]

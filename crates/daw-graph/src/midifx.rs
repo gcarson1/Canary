@@ -148,8 +148,9 @@ impl AudioNode for ArpNode {
         self.clock = start + per_sample * n as f64;
         let step = 1.0 / f64::from(1u32 << (self.p(0).round().clamp(0.0, 3.0) as u32));
         let gate = f64::from(self.p(3)) / 100.0;
-        // A jump back (seek, loop) puts the grid ahead of us: realign.
-        if self.next > start + step {
+        // A jump either way (seek, loop, play from elsewhere): realign the grid
+        // instead of firing every step in between.
+        if (self.next - start).abs() > step {
             self.next = (start / step).ceil() * step;
         }
         let mut events = midi_in.iter().peekable();
@@ -250,8 +251,9 @@ pub const CHORD_PARAMS: [ParamSpec; 1] = [spec("CHORD", 0.0, 5.0, 0.0)];
 /// Plays a chord on every key: the key is the root.
 pub struct ChordNode {
     params: Arc<ParamBank>,
-    /// The chord each sounding root started, so its note-off ends the same one.
-    started: [u8; 128],
+    /// The chord each sounding root started (by channel), so its note-off ends
+    /// the same one.
+    started: [[u8; 128]; 16],
 }
 
 impl ChordNode {
@@ -260,7 +262,7 @@ impl ChordNode {
         (
             Self {
                 params: params.clone(),
-                started: [0; 128],
+                started: [[0; 128]; 16],
             },
             params,
         )
@@ -287,12 +289,9 @@ impl AudioNode for ChordNode {
                     continue;
                 }
             };
-            let which = if on {
-                chord
-            } else {
-                self.started[usize::from(key)]
-            };
-            self.started[usize::from(key)] = which;
+            let started = &mut self.started[usize::from(e.data[0] & 0x0f)];
+            let which = if on { chord } else { started[usize::from(key)] };
+            started[usize::from(key)] = which;
             for &step in CHORDS[usize::from(which)] {
                 let note = key.saturating_add(step);
                 if note <= 127 {
@@ -334,8 +333,8 @@ pub const SCALE_PARAMS: [ParamSpec; 2] =
 /// Moves every key down to the nearest note of the scale.
 pub struct ScaleNode {
     params: Arc<ParamBank>,
-    /// Where each sounding key was moved to, so its note-off follows.
-    moved: [u8; 128],
+    /// Where each sounding key was moved to (by channel), so its note-off follows.
+    moved: [[u8; 128]; 16],
 }
 
 impl ScaleNode {
@@ -344,7 +343,7 @@ impl ScaleNode {
         (
             Self {
                 params: params.clone(),
-                moved: std::array::from_fn(|k| k as u8),
+                moved: [std::array::from_fn(|k| k as u8); 16],
             },
             params,
         )
@@ -360,7 +359,8 @@ pub fn snap(key: u8, root: u8, scale: &[u8]) -> u8 {
         .find(|&&s| s <= rel)
         .copied()
         .unwrap_or(0);
-    key - (rel - down)
+    // Below the scale's lowest note on the keyboard: stay put rather than wrap.
+    key.saturating_sub(rel - down)
 }
 
 impl AudioNode for ScaleNode {
@@ -377,13 +377,14 @@ impl AudioNode for ScaleNode {
         let scale = SCALES[self.params.get(1).unwrap_or(0.0).round().clamp(0.0, 5.0) as usize];
         for e in midi_in {
             let mut out = *e;
+            let moved = &mut self.moved[usize::from(e.data[0] & 0x0f)];
             match kind(e.data) {
                 Kind::On(key, _) => {
                     let to = snap(key, root, scale);
-                    self.moved[usize::from(key)] = to;
+                    moved[usize::from(key)] = to;
                     out.data[1] = to;
                 }
-                Kind::Off(key) => out.data[1] = self.moved[usize::from(key)],
+                Kind::Off(key) => out.data[1] = moved[usize::from(key)],
                 Kind::Other => {}
             }
             emit(midi_out, out);
@@ -466,6 +467,18 @@ mod tests {
     }
 
     #[test]
+    fn arpeggiator_realigns_after_a_jump_instead_of_bursting() {
+        let (mut arp, _) = ArpNode::new();
+        run(&mut arp, &[ev(0, [0x90, 60, 100])], ctx(6_000, 0.0));
+        // Seek forward ten bars with the key held: one step, not hundreds.
+        let out = run(&mut arp, &[], ctx(6_000, 40.0));
+        assert!(
+            out.iter().filter(|e| e.1[0] == 0x90).count() <= 1,
+            "{out:?}"
+        );
+    }
+
+    #[test]
     fn chord_and_scale_rewrite_notes_and_their_offs() {
         let (mut chord, params) = ChordNode::new();
         params.set(0, 1.0); // minor
@@ -484,6 +497,7 @@ mod tests {
 
         assert_eq!(snap(61, 0, SCALES[0]), 60, "C# down to C in C major");
         assert_eq!(snap(66, 2, SCALES[0]), 66, "F# is in D major");
+        assert_eq!(snap(0, 11, SCALES[0]), 0, "below the lowest B: stays");
         let (mut scale, _) = ScaleNode::new();
         let out = run(
             &mut scale,

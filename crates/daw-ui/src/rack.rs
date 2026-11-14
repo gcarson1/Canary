@@ -219,7 +219,31 @@ pub(crate) fn show(
         if resp.clicked() && !was_open {
             ws.edit(Action::RemoveDevice { track, index: di });
         }
-        let mut title_end = remove.min.x;
+        // PRESET steps through the device's saved presets; Shift-click saves one.
+        let preset = p.text(
+            Pos2::new(remove.min.x - 0.75 * u, top),
+            Align2::RIGHT_CENTER,
+            "PRESET",
+            m.mono(0.625),
+            t.faint,
+        );
+        let resp = ui.interact(
+            preset.expand(0.25 * u),
+            ui.scope_id().with(("preset-device", di)),
+            Sense::click(),
+        );
+        if resp.hovered() {
+            p.hline(preset.x_range(), m.snap(preset.max.y), m.hair(t.muted));
+        }
+        if resp.clicked() && !was_open {
+            out.push(Request::Preset {
+                track,
+                device: di,
+                save: ui.input(|i| i.modifiers.shift),
+            });
+        }
+        let mut title_end = preset.min.x;
+        let remove = preset;
         if device.editor {
             let edit = p.text(
                 Pos2::new(remove.min.x - 0.75 * u, top),

@@ -324,13 +324,10 @@ impl ExecutionPlan {
     /// it on the audio thread when this plan replaces `old`.
     pub fn adopt_notes(&mut self, old: &ExecutionPlan) {
         for step in &mut self.steps {
-            let prev = old
-                .steps
-                .iter()
-                .find(|o| o.node == step.node && !(o.sequence.is_empty() && o.notes.is_idle()));
-            if let Some(prev) = prev {
+            if let Some(prev) = old.steps.iter().find(|o| o.node == step.node) {
+                let same_source = prev.midi_source.is_some() == step.midi_source.is_some();
                 step.notes
-                    .adopt(&prev.notes, prev.sequence == step.sequence);
+                    .adopt(&prev.notes, prev.sequence == step.sequence, same_source);
             }
         }
     }
@@ -525,12 +522,16 @@ impl ExecutionPlan {
             }
             self.midi_out.clear();
             let live = if *takes_midi { midi } else { &[] };
-            let midi_in = if let Some(src) = *midi_source {
-                &done[src].kept_midi[..]
-            } else if sequence.is_empty() && notes.is_idle() {
-                live
+            // A MIDI effect's output stands in for the live input; either way a
+            // pending release (plan swap) still goes through `render`.
+            let input = match *midi_source {
+                Some(src) => &done[src].kept_midi[..],
+                None => live,
+            };
+            let midi_in = if sequence.is_empty() && notes.is_idle() {
+                input
             } else {
-                notes.render(sequence, context, live, &mut self.midi_in);
+                notes.render(sequence, context, input, &mut self.midi_in);
                 &self.midi_in
             };
             node.process(
@@ -909,6 +910,26 @@ mod tests {
             }
         }
         fn reset(&mut self) {}
+    }
+
+    #[test]
+    fn adding_a_midi_effect_sends_the_instrument_all_notes_off_once() {
+        let mut arena = NodeArena::default();
+        let mut before = ExecutionPlan::new(16);
+        before.insert(NodeId(2), Box::new(MidiCount));
+        before.add(NodeId(2), vec![], 1).unwrap();
+        arena.apply(&mut before);
+        let mut after = ExecutionPlan::new(16);
+        after.insert(NodeId(1), Box::new(Doubler));
+        let fx = after.add(NodeId(1), vec![], 1).unwrap();
+        let synth = after.add(NodeId(2), vec![], 1).unwrap();
+        after.midi_from(synth, fx);
+        arena.apply(&mut after);
+        after.adopt_notes(&before);
+        after.process(&mut arena, &ctx(16), &[]);
+        assert_eq!(after.output()[0][0], 16.0, "CC 123 on every channel");
+        after.process(&mut arena, &ctx(16), &[]);
+        assert_eq!(after.output()[0][0], 0.0, "once");
     }
 
     #[test]

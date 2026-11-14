@@ -320,15 +320,15 @@ impl Devices {
         }
     }
 
-    /// Schedules `track`'s instrument, if it has one, taking live MIDI when
-    /// `live_midi` (the selected track). Its step feeds the track node.
-    /// Adds `track`'s instrument to `plan` and returns its step.
-    // shortcut: the step reports 0 to PDC (the track node sums its clips with
-    // it, which delaying would put early), so a latent instrument plays its
-    // notes that much late. Leading sequenced notes needs the engine's note
-    // renderer to look ahead across loop wraps without releasing at the wrap.
+    /// Schedules `track`'s instrument, if it has one, behind its MIDI effects,
+    /// taking live MIDI when `live_midi` (the selected track). Its step feeds the
+    /// track node. Returns (the step taking the notes, the instrument's step,
+    /// its latency).
+    // shortcut: the instrument reports its latency, so PDC lines its output up
+    // with the other tracks; audio clips on its own track (mixed in the same
+    // track node) then play that much early, and live MIDI that much late.
     pub fn instrument_step(
-        &self,
+        &mut self,
         plan: &mut ExecutionPlan,
         track: &Track,
         live_midi: bool,
@@ -364,8 +364,13 @@ impl Devices {
         // sequenced notes are sent that much early (the caller shifts them).
         let latency = instrument.hosted.latency_samples();
         plan.set_latency(step, latency);
+        let uid = *uid;
         if let Some(p) = prev {
             plan.midi_from(step, p);
+        }
+        // Remembered, so `changed` only asks for a new plan when it moves.
+        if let Some(l) = self.live.get_mut(&uid) {
+            l.latency = latency;
         }
         let midi_in = first.unwrap_or(step);
         if live_midi {
@@ -757,6 +762,17 @@ impl Devices {
     }
 
     /// Every live device's current state, for saving.
+    /// One device's state, as a preset saves it.
+    pub fn state(&mut self, uid: u64) -> Option<Vec<u8>> {
+        self.live.get_mut(&uid)?.hosted.save_state().ok()
+    }
+
+    /// Loads `bytes` (a preset) into device `uid`.
+    pub fn load_state(&mut self, uid: u64, bytes: &[u8]) -> Result<(), String> {
+        let l = self.live.get_mut(&uid).ok_or("device is not loaded")?;
+        l.hosted.load_state(bytes).map_err(|e| e.to_string())
+    }
+
     pub fn states(&mut self) -> Vec<(u64, Vec<u8>)> {
         self.live
             .iter_mut()

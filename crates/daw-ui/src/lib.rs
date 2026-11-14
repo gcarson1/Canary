@@ -137,6 +137,13 @@ pub enum Request {
         ratio: f64,
         semitones: f64,
     },
+    /// Load the next saved preset of `track`'s device `device`, or with `save`,
+    /// save its current settings as a new one.
+    Preset {
+        track: usize,
+        device: usize,
+        save: bool,
+    },
     /// Audition a file from the browser (`None` stops).
     Preview(Option<PathBuf>),
     /// Open this output device (None: the system default) at this buffer size

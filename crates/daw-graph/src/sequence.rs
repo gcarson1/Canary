@@ -13,6 +13,10 @@ pub(crate) struct NoteState {
     next: Option<u64>,
     /// Release every held note at the next block (the sequence was replaced).
     flush: bool,
+    /// Send All Notes Off on every channel at the next block: what feeds the
+    /// node changed (a MIDI effect added or removed), so notes it started
+    /// elsewhere would never get their note-offs.
+    all_off: bool,
 }
 
 impl NoteState {
@@ -27,13 +31,14 @@ impl NoteState {
 
     /// Carries state over from the same step in the plan being replaced; held
     /// notes are released next block unless the sequence is unchanged.
-    pub(crate) fn adopt(&mut self, old: &NoteState, same_sequence: bool) {
+    pub(crate) fn adopt(&mut self, old: &NoteState, same_sequence: bool, same_source: bool) {
         *self = *old;
         self.flush |= !same_sequence;
+        self.all_off |= !same_source;
     }
 
     pub(crate) fn is_idle(&self) -> bool {
-        self.held.iter().all(|&h| h == 0)
+        !self.all_off && self.held.iter().all(|&h| h == 0)
     }
 
     /// Writes this block's MIDI into `out` (cleared first): note-offs for held notes
@@ -53,6 +58,17 @@ impl NoteState {
                 out.push(e);
             }
         };
+        if std::mem::take(&mut self.all_off) {
+            for channel in 0..16u8 {
+                push(
+                    out,
+                    MidiEvent {
+                        sample_offset: 0,
+                        data: [0xB0 | channel, 123, 0],
+                    },
+                );
+            }
+        }
         let jumped = !context.playing || self.next != Some(context.playhead) || self.flush;
         if jumped {
             for (channel, held) in self.held.iter_mut().enumerate() {
@@ -182,10 +198,10 @@ mod tests {
         // A plan swap with a different sequence flushes; the same one plays on.
         run(&mut s, &seq, ctx(0, true), &[]);
         let mut same = NoteState::default();
-        same.adopt(&s, true);
+        same.adopt(&s, true, true);
         assert!(run(&mut same, &seq, ctx(100, true), &[]).is_empty());
         let mut changed = NoteState::default();
-        changed.adopt(&s, false);
+        changed.adopt(&s, false, true);
         assert_eq!(run(&mut changed, &seq, ctx(100, true), &[]).len(), 2);
     }
 

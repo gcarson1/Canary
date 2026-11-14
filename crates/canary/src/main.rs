@@ -159,6 +159,8 @@ struct App {
     export_restore: Option<(MonitorMode, bool)>,
     /// The last export's format conversion, still running.
     converting: Option<thread::JoinHandle<Vec<String>>>,
+    /// The preset each device last loaded, so PRESET steps to the next.
+    preset_at: HashMap<u64, PathBuf>,
     /// Clips (track, index) with a stretch render running.
     stretching: HashSet<(usize, usize)>,
     /// Stretched or pitched clip renders coming back from worker threads.
@@ -322,6 +324,7 @@ impl App {
             export_restore: None,
             converting: None,
             stretching: HashSet::new(),
+            preset_at: HashMap::new(),
             stretch_tx,
             stretch_rx,
             title: String::new(),
@@ -821,11 +824,11 @@ impl App {
                     .devices
                     .instrument_step(&mut plan, track, selected, &mut device_steps)
                 {
-                    Some((midi_in, step, latency)) => {
-                        // The notes go to the first MIDI effect, else the instrument,
-                        // early by the instrument's delay so they sound on time.
+                    Some((midi_in, step, _)) => {
+                        // The notes go to the first MIDI effect, else the
+                        // instrument; PDC lines up the instrument's latency.
                         if let Some(seq) = sequences.get(i).filter(|s| !s.is_empty()) {
-                            plan.sequence(midi_in, early(seq, latency, looping));
+                            plan.sequence(midi_in, seq.clone());
                         }
                         vec![step]
                     }
@@ -1169,6 +1172,11 @@ impl App {
                     }
                 }
             }
+            Request::Preset {
+                track,
+                device,
+                save,
+            } => self.preset(track, device, save),
             Request::Stretch {
                 track,
                 index,
@@ -1282,6 +1290,80 @@ impl App {
                     self.autosaved = None;
                 }
             }
+        }
+    }
+
+    /// Saves device `device` on `track` as a new preset (`save`), or loads its
+    /// next saved preset. Presets are state files under `Presets/<device id>/`.
+    fn preset(&mut self, track: usize, device: usize, save: bool) {
+        let Some(d) = self
+            .history
+            .project()
+            .tracks
+            .get(track)
+            .and_then(|t| t.devices.get(device))
+            .cloned()
+        else {
+            return;
+        };
+        let dir = self
+            .samples_dir
+            .join("Presets")
+            .join(d.id.replace(['/', ':'], "-"));
+        let mut files: Vec<PathBuf> = fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|e| e == "preset"))
+            .collect();
+        files.sort();
+        let name = |p: &Path| {
+            p.file_stem()
+                .map_or_else(String::new, |s| s.to_string_lossy().to_uppercase())
+        };
+        if save {
+            let Some(state) = self.devices.state(d.uid) else {
+                return self.error(format!("{} cannot save its state", d.name));
+            };
+            let path = (1..)
+                .map(|n| dir.join(format!("Preset {n:02}.preset")))
+                .find(|p| !p.exists())
+                .expect("some number is free");
+            match fs::create_dir_all(&dir).and_then(|()| fs::write(&path, state)) {
+                Ok(()) => {
+                    self.ws.status = Some(Status {
+                        text: format!("SAVED {}", name(&path)),
+                        error: false,
+                    })
+                }
+                Err(e) => self.error(format!("preset not saved: {e}")),
+            }
+            return;
+        }
+        if files.is_empty() {
+            return self.error("no presets yet · SHIFT-CLICK PRESET SAVES ONE".into());
+        }
+        // The one after the last loaded on this device, wrapping round.
+        let last = self.preset_at.get(&d.uid);
+        let next = last
+            .and_then(|l| files.iter().position(|f| f == l))
+            .map_or(0, |i| (i + 1) % files.len());
+        let path = files[next].clone();
+        match fs::read(&path)
+            .map_err(|e| e.to_string())
+            .and_then(|bytes| self.devices.load_state(d.uid, &bytes))
+        {
+            Ok(()) => {
+                self.history.mark_dirty();
+                self.autosaved = None;
+                self.ws.status = Some(Status {
+                    text: format!("{} · {}", d.name.to_uppercase(), name(&path)),
+                    error: false,
+                });
+                self.preset_at.insert(d.uid, path);
+            }
+            Err(e) => self.error(format!("preset not loaded: {e}")),
         }
     }
 
@@ -2071,24 +2153,6 @@ fn routing(project: &daw_project::Project) -> Vec<Routing> {
         .collect()
 }
 
-/// `seq` moved `by` samples earlier, for an instrument with that much delay.
-/// Inside a loop, events pushed before its start wrap to its end; elsewhere they
-/// clamp at 0.
-fn early(seq: &[SeqEvent], by: u32, looping: Option<(u64, u64)>) -> Vec<SeqEvent> {
-    let by = u64::from(by);
-    seq.iter()
-        .map(|e| {
-            let at = match looping {
-                Some((start, end)) if e.at >= start && e.at < start + by && end - start > by => {
-                    end - (start + by - e.at)
-                }
-                _ => e.at.saturating_sub(by),
-            };
-            SeqEvent { at, ..*e }
-        })
-        .collect()
-}
-
 /// The metronome's beats as timeline samples (`data[0] == 1` on downbeats):
 /// the pattern's in PAT mode, else the song's and 64 bars past its end.
 fn metronome_clicks(project: &daw_project::Project, playback: Playback) -> Vec<SeqEvent> {
@@ -2246,20 +2310,6 @@ mod tests {
         // Range wider than the take: the whole take.
         assert_eq!(punch_window(1_000, 500, (0, 9_000)), Some((1_000, 0, 500)));
         assert_eq!(punch_window(1_000, 500, (2_000, 3_000)), None);
-    }
-
-    #[test]
-    fn instrument_notes_go_early_wrapping_inside_a_loop() {
-        let ev = |at| SeqEvent {
-            at,
-            data: [0x90, 60, 100],
-        };
-        let seq = [ev(0), ev(50), ev(500)];
-        let at = |v: Vec<SeqEvent>| v.iter().map(|e| e.at).collect::<Vec<_>>();
-        assert_eq!(at(early(&seq, 100, None)), [0, 0, 400]);
-        // A 1 000-sample loop: the first two wrap to just before its end.
-        assert_eq!(at(early(&seq, 100, Some((0, 1_000)))), [900, 950, 400]);
-        assert_eq!(at(early(&seq, 0, Some((0, 1_000)))), [0, 50, 500]);
     }
 
     #[test]

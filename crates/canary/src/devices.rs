@@ -269,7 +269,7 @@ impl Devices {
     pub fn changed(&self) -> bool {
         !self.removing.is_empty()
             || self.live.values().any(|l| {
-                l.node.is_some() || (!l.instrument && l.hosted.latency_samples() != l.latency)
+                l.node.is_some() || (!l.midi_fx && l.hosted.latency_samples() != l.latency)
             })
     }
 
@@ -333,7 +333,7 @@ impl Devices {
         track: &Track,
         live_midi: bool,
         steps: &mut HashMap<u64, StepId>,
-    ) -> Option<(StepId, StepId)> {
+    ) -> Option<(StepId, StepId, u32)> {
         let live: Vec<(u64, &Live)> = track
             .devices
             .iter()
@@ -360,7 +360,10 @@ impl Devices {
         }
         let step = plan.add(instrument.id, vec![], 2).ok()?;
         steps.insert(*uid, step);
-        plan.set_latency(step, 0);
+        // The instrument's own delay is compensated like any plugin's; its
+        // sequenced notes are sent that much early (the caller shifts them).
+        let latency = instrument.hosted.latency_samples();
+        plan.set_latency(step, latency);
         if let Some(p) = prev {
             plan.midi_from(step, p);
         }
@@ -368,7 +371,7 @@ impl Devices {
         if live_midi {
             plan.route_midi(midi_in);
         }
-        Some((midi_in, step))
+        Some((midi_in, step, latency))
     }
 
     /// Chains `track`'s effects after `step` and returns the last step. Each
@@ -955,7 +958,7 @@ mod tests {
         for selected in [true, false] {
             let mut plan = ExecutionPlan::new(64);
             d.apply_changes(&mut plan);
-            let (midi_in, step) = d
+            let (midi_in, step, _) = d
                 .instrument_step(&mut plan, &p.tracks[0], selected, &mut HashMap::new())
                 .unwrap();
             assert_eq!(midi_in, step, "no MIDI effects: the instrument takes it");
@@ -991,7 +994,7 @@ mod tests {
         let mut plan = ExecutionPlan::new(64);
         d.apply_changes(&mut plan);
         let mut steps = HashMap::new();
-        let (midi_in, synth) = d
+        let (midi_in, synth, _) = d
             .instrument_step(&mut plan, &p.tracks[0], true, &mut steps)
             .unwrap();
         assert_eq!(midi_in, steps[&1], "the chord comes first");

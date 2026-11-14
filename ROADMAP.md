@@ -95,7 +95,7 @@ The UI follows Styles.md whichever framework is chosen.
 - [x] Transport info to plugins: every node's `ProcessContext::musical` carries tempo, quarter-note position, bar and time signature from the tempo/meter maps (`ExecutionPlan::set_tempo_map`, `daw_core::musical_at`); CLAP gets a transport event, VST3 a `ProcessContext`
 - [x] Transport info for Audio Units: host callbacks report tempo, beat, bar, meter, play state and jumps
 - [ ] Loop positions in plugin transport info; ARA content access for the tempo map
-- [ ] Plugin delay compensation for sequenced instruments (notes scheduled early by the instrument path's latency)
+- [x] Plugin delay compensation for sequenced instruments: an instrument reports its latency and its sequenced notes are sent that much early (wrapping inside a loop). Live MIDI still plays late by it
 
 ### Phase 8: Mixer and Routing
 - [x] MIXER view: channel strips with ladder faders (-60..+6 dB, double-click resets), pan dials, per-track peak meters (`TrackParams::report_peak`), M/S, output selector and send rows; drags are one undo step each (`History::apply_gesture`). Insert slots stay in the rack

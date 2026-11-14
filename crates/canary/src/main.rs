@@ -819,10 +819,11 @@ impl App {
                     .devices
                     .instrument_step(&mut plan, track, selected, &mut device_steps)
                 {
-                    Some((midi_in, step)) => {
-                        // The notes go to the first MIDI effect, else the instrument.
+                    Some((midi_in, step, latency)) => {
+                        // The notes go to the first MIDI effect, else the instrument,
+                        // early by the instrument's delay so they sound on time.
                         if let Some(seq) = sequences.get(i).filter(|s| !s.is_empty()) {
-                            plan.sequence(midi_in, seq.clone());
+                            plan.sequence(midi_in, early(seq, latency, looping));
                         }
                         vec![step]
                     }
@@ -2057,6 +2058,24 @@ fn routing(project: &daw_project::Project) -> Vec<Routing> {
         .collect()
 }
 
+/// `seq` moved `by` samples earlier, for an instrument with that much delay.
+/// Inside a loop, events pushed before its start wrap to its end; elsewhere they
+/// clamp at 0.
+fn early(seq: &[SeqEvent], by: u32, looping: Option<(u64, u64)>) -> Vec<SeqEvent> {
+    let by = u64::from(by);
+    seq.iter()
+        .map(|e| {
+            let at = match looping {
+                Some((start, end)) if e.at >= start && e.at < start + by && end - start > by => {
+                    end - (start + by - e.at)
+                }
+                _ => e.at.saturating_sub(by),
+            };
+            SeqEvent { at, ..*e }
+        })
+        .collect()
+}
+
 /// The metronome's beats as timeline samples (`data[0] == 1` on downbeats):
 /// the pattern's in PAT mode, else the song's and 64 bars past its end.
 fn metronome_clicks(project: &daw_project::Project, playback: Playback) -> Vec<SeqEvent> {
@@ -2207,6 +2226,20 @@ mod tests {
         // Range wider than the take: the whole take.
         assert_eq!(punch_window(1_000, 500, (0, 9_000)), Some((1_000, 0, 500)));
         assert_eq!(punch_window(1_000, 500, (2_000, 3_000)), None);
+    }
+
+    #[test]
+    fn instrument_notes_go_early_wrapping_inside_a_loop() {
+        let ev = |at| SeqEvent {
+            at,
+            data: [0x90, 60, 100],
+        };
+        let seq = [ev(0), ev(50), ev(500)];
+        let at = |v: Vec<SeqEvent>| v.iter().map(|e| e.at).collect::<Vec<_>>();
+        assert_eq!(at(early(&seq, 100, None)), [0, 0, 400]);
+        // A 1 000-sample loop: the first two wrap to just before its end.
+        assert_eq!(at(early(&seq, 100, Some((0, 1_000)))), [900, 950, 400]);
+        assert_eq!(at(early(&seq, 0, Some((0, 1_000)))), [0, 50, 500]);
     }
 
     #[test]

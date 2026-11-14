@@ -26,6 +26,8 @@ pub(crate) struct View {
     auto_drag: Option<AutoDrag>,
     /// Playhead last frame, to page only when it crosses the right edge.
     last_playhead: u64,
+    /// A swipe on a take lane: its pass and where it began (timeline sample).
+    comp_drag: Option<(u32, f64)>,
 }
 
 impl Default for View {
@@ -38,6 +40,7 @@ impl Default for View {
             pattern_drag: None,
             auto_drag: None,
             last_playhead: 0,
+            comp_drag: None,
         }
     }
 }
@@ -340,6 +343,145 @@ struct PatternDrag {
     preview: PatternClip,
     to_track: usize,
     revision: u64,
+}
+
+/// The take lanes of the loop recording clip `ci` on track `ti` belongs to,
+/// drawn under its lane over the loop it was recorded round.
+#[allow(clippy::too_many_arguments)]
+fn take_lanes(
+    ws: &mut Workspace,
+    ui: &egui::Ui,
+    m: &Metrics,
+    lanes: Rect,
+    lane: Rect,
+    project: &Project,
+    ti: usize,
+    ci: usize,
+) {
+    let Some(clip) = project.tracks.get(ti).and_then(|t| t.clips.get(ci)) else {
+        return;
+    };
+    let Some(t) = clip.takes.filter(|t| t.len > 0) else {
+        return;
+    };
+    let (theme, u) = (ws.theme, m.u);
+    let into = clip.offset.saturating_sub(t.first) % t.len;
+    let loop_start = clip.start.saturating_sub(into);
+    let loop_end = loop_start + t.len;
+    // The comp: this recording's pieces inside that loop.
+    let pieces: Vec<usize> = project.tracks[ti]
+        .clips
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| {
+            c.source == clip.source
+                && c.takes == clip.takes
+                && c.start >= loop_start
+                && c.start < loop_end
+        })
+        .map(|(i, _)| i)
+        .collect();
+    let row_h = 1.25 * u;
+    let x0 = ws.timeline.x_of(lanes, loop_start as f64).max(lanes.min.x);
+    let x1 = ws.timeline.x_of(lanes, loop_end as f64).min(lanes.max.x);
+    if x0 >= x1 {
+        return;
+    }
+    let p = ui
+        .ctx()
+        .layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            ui.scope_id().with("take-lanes"),
+        ))
+        .with_clip_rect(lanes);
+    let pointer = ui.input(|i| i.pointer.interact_pos());
+    let mut swipe: Option<(u32, (u64, u64))> = None;
+    for k in 0..t.count {
+        let y = lane.max.y + k as f32 * row_h;
+        let row = m.snap_rect(Rect::from_x_y_ranges(x0..=x1, y..=y + row_h));
+        p.rect_filled(row, 0.0, theme.bg_panel);
+        // Where this pass plays now.
+        for &i in &pieces {
+            let c = &project.tracks[ti].clips[i];
+            if t.pass_of(c.offset) == k {
+                let a = ws.timeline.x_of(lanes, c.start as f64).max(x0);
+                let b = ws.timeline.x_of(lanes, (c.start + c.length) as f64).min(x1);
+                if a < b {
+                    let seg = Rect::from_x_y_ranges(a..=b, row.y_range()).shrink(m.px);
+                    p.rect_filled(seg, 0.0, theme.accent_amber);
+                }
+            }
+        }
+        p.rect_stroke(row, 0.0, m.hair(theme.line_2), StrokeKind::Inside);
+        p.text(
+            Pos2::new(row.min.x + 0.375 * u, row.center().y),
+            Align2::LEFT_CENTER,
+            format!("TAKE {}", k + 1),
+            m.mono(0.5),
+            theme.text,
+        );
+        let resp = ui.interact(
+            row,
+            ui.scope_id().with(("take-row", k)),
+            Sense::click_and_drag(),
+        );
+        if resp.drag_started() {
+            let from = ui
+                .input(|i| i.pointer.press_origin())
+                .map_or(row.min.x, |p| p.x);
+            ws.timeline.comp_drag = Some((k, ws.timeline.sample_at(lanes, from)));
+        }
+        if let (Some((pass, from)), Some(pos)) = (ws.timeline.comp_drag, pointer) {
+            if pass == k && resp.dragged() {
+                let (a, b) = (ws.timeline.x_of(lanes, from), pos.x);
+                let span =
+                    Rect::from_x_y_ranges(a.min(b).max(x0)..=a.max(b).min(x1), row.y_range());
+                p.rect_stroke(span, 0.0, m.hair(theme.text), StrokeKind::Inside);
+            }
+        }
+        if resp.drag_stopped() {
+            if let (Some((pass, from)), Some(pos)) = (ws.timeline.comp_drag.take(), pointer) {
+                let to = ws.timeline.sample_at(lanes, pos.x);
+                let (a, b) = (from.min(to), from.max(to));
+                let a = snap_f(a, ws.snap, project).max(0.0) as u64;
+                let b = snap_f(b, ws.snap, project).max(0.0) as u64;
+                if a < b {
+                    swipe = Some((pass, (a, b)));
+                }
+            }
+        } else if resp.clicked() {
+            swipe = Some((k, (loop_start, loop_end)));
+        }
+    }
+    if let Some((pass, range)) = swipe {
+        let old: Vec<ClipRef> = pieces
+            .iter()
+            .map(|&i| project.tracks[ti].clips[i].clone())
+            .collect();
+        let new = daw_project::comp(&old, loop_start, pass, range);
+        if new == old {
+            return;
+        }
+        // Remove the old pieces (highest index first), then add the new ones.
+        let kept = project.tracks[ti].clips.len() - pieces.len();
+        let mut edits: Vec<Action> = pieces
+            .iter()
+            .rev()
+            .map(|&index| Action::RemoveClip { track: ti, index })
+            .collect();
+        edits.extend(
+            new.into_iter()
+                .enumerate()
+                .map(|(i, clip)| Action::InsertClip {
+                    track: ti,
+                    index: kept + i,
+                    clip,
+                }),
+        );
+        ws.clip_group.clear();
+        ws.selected_clip = Some((ti, kept));
+        ws.edit(Action::Batch(edits));
+    }
 }
 
 /// How far a group drag moves the selection: the dragged clip's move, held
@@ -1164,6 +1306,21 @@ pub(crate) fn show(
                 ws.clip_group.clear();
             }
         }
+    }
+
+    // Take lanes under a selected loop recording: one row per pass; swipe a
+    // row (or click it for the whole loop) to play that pass there.
+    if let Some((ti, ci)) = ws.selected_clip {
+        take_lanes(
+            ws,
+            ui,
+            m,
+            lanes,
+            lane_rect(ti, &ws.timeline),
+            project,
+            ti,
+            ci,
+        );
     }
 
     // Playhead over everything in the lanes.

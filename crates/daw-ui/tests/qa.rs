@@ -686,6 +686,37 @@ fn a_selection_moves_together_and_one_undo_puts_it_back() {
 }
 
 #[test]
+fn a_take_lane_click_plays_that_pass_over_the_whole_loop() {
+    let mut h = rig();
+    h.run();
+    // Track 0's first clip as a three-pass loop recording, on pass 1.
+    let mut clip = h.state().history.project().tracks[0].clips[0].clone();
+    clip.takes = Some(daw_project::Takes {
+        first: 0,
+        len: clip.length,
+        count: 3,
+    });
+    h.state_mut()
+        .history
+        .apply(daw_project::Action::SetClip {
+            track: 0,
+            index: 0,
+            clip,
+        })
+        .unwrap();
+    click(&mut h, egui::Pos2::new(500.0, 165.0)); // select it: lanes open
+                                                  // The second take lane, under the track's lane.
+    let lane_bottom = 165.0 + 32.0;
+    click(&mut h, egui::Pos2::new(450.0, lane_bottom + 20.0 * 1.5));
+    let clips = &h.state().history.project().tracks[0].clips;
+    let comp: Vec<_> = clips.iter().filter(|c| c.takes.is_some()).collect();
+    assert_eq!(comp.len(), 1, "{clips:?}");
+    let t = comp[0].takes.unwrap();
+    assert_eq!(t.pass_of(comp[0].offset), 1, "take 2 plays the whole loop");
+    assert_eq!(comp[0].length, t.len);
+}
+
+#[test]
 fn picker_adds_a_device_and_dials_set_params() {
     // Rack: x 280..1100, y 520..900 (45% of the body), header 32pt. The two
     // devices are 16u = 256pt wide, so + DEVICE (96 x 24) starts at x 804, y 564.

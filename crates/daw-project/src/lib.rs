@@ -271,6 +271,75 @@ impl Takes {
     }
 }
 
+/// Samples of fade at a comp's seams, so a switch of pass does not click.
+const COMP_FADE: u64 = 64;
+
+/// A comp's pieces after swiping `swipe` (timeline samples) on pass `pass`:
+/// `pieces` are one loop recording's clips (same source and `takes`) inside
+/// the loop starting at `loop_start`; inside the swipe they all play `pass`
+/// (gaps there are filled), outside they keep theirs. Pieces next to each
+/// other on the same pass merge. Seams get a short fade; outer edges keep the
+/// fades they had.
+pub fn comp(pieces: &[ClipRef], loop_start: u64, pass: u32, swipe: (u64, u64)) -> Vec<ClipRef> {
+    let Some(first) = pieces.first() else {
+        return Vec::new();
+    };
+    let Some(t) = first.takes.filter(|t| pass < t.count && t.len > 0) else {
+        return pieces.to_vec();
+    };
+    let end = loop_start + t.len;
+    let (s0, s1) = (swipe.0.max(loop_start), swipe.1.min(end));
+    // (from, to, pass) intervals, by time.
+    let mut spans: Vec<(u64, u64, u32)> = Vec::new();
+    for p in pieces {
+        let (a, b) = (p.start, p.start + p.length);
+        let k = t.pass_of(p.offset);
+        for (x, y) in [(a, b.min(s0)), (a.max(s1), b)] {
+            if x < y {
+                spans.push((x, y, k));
+            }
+        }
+    }
+    if s0 < s1 {
+        spans.push((s0, s1, pass));
+    }
+    spans.sort_unstable();
+    let mut merged: Vec<(u64, u64, u32)> = Vec::new();
+    for (x, y, k) in spans {
+        match merged.last_mut() {
+            Some(last) if last.2 == k && last.1 == x => last.1 = y,
+            _ => merged.push((x, y, k)),
+        }
+    }
+    let (outer_in, outer_out) = (
+        pieces
+            .iter()
+            .min_by_key(|p| p.start)
+            .map_or(0, |p| p.fade_in),
+        pieces
+            .iter()
+            .max_by_key(|p| p.start + p.length)
+            .map_or(0, |p| p.fade_out),
+    );
+    let n = merged.len();
+    merged
+        .into_iter()
+        .enumerate()
+        .map(|(i, (x, y, k))| {
+            let len = y - x;
+            let fade = COMP_FADE.min(len / 4);
+            ClipRef {
+                start: x,
+                offset: t.first + u64::from(k) * t.len + (x - loop_start),
+                length: len,
+                fade_in: if i == 0 { outer_in.min(len) } else { fade },
+                fade_out: if i + 1 == n { outer_out.min(len) } else { fade },
+                ..first.clone()
+            }
+        })
+        .collect()
+}
+
 /// How a clip's audio was rendered from an original file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Stretch {
@@ -1216,6 +1285,42 @@ pub fn write_file(path: &Path, bytes: &[u8]) -> Result<(), ProjectError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn swiping_a_pass_rewrites_only_that_stretch_of_the_comp() {
+        let t = Takes {
+            first: 0,
+            len: 1_000,
+            count: 3,
+        };
+        // The whole loop (5000..6000) on pass 2.
+        let whole = ClipRef {
+            start: 5_000,
+            offset: 2_000,
+            length: 1_000,
+            takes: Some(t),
+            ..clip(5_000)
+        };
+        let pieces = comp(&[whole], 5_000, 0, (5_200, 5_500));
+        let got: Vec<(u64, u64, u32)> = pieces
+            .iter()
+            .map(|p| (p.start, p.length, t.pass_of(p.offset)))
+            .collect();
+        assert_eq!(got, [(5_000, 200, 2), (5_200, 300, 0), (5_500, 500, 2)]);
+        // Each piece plays its own place in the loop from its pass.
+        assert_eq!(pieces[1].offset, 200);
+        assert_eq!(pieces[2].offset, 2_500);
+        // Swiping pass 2 back over the middle merges it all into one piece.
+        let back = comp(&pieces, 5_000, 2, (5_100, 5_600));
+        assert_eq!(back.len(), 1);
+        assert_eq!(
+            (back[0].start, back[0].length, back[0].offset),
+            (5_000, 1_000, 2_000)
+        );
+        // A swipe past the loop is held to it.
+        let edge = comp(&back, 5_000, 1, (4_000, 5_100));
+        assert_eq!((edge[0].start, edge[0].length), (5_000, 100));
+    }
 
     fn clip(start: u64) -> ClipRef {
         ClipRef {

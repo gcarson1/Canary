@@ -19,7 +19,7 @@ mod notes;
 pub mod smf;
 mod tempo;
 pub use notes::{sorted, Note, Pattern, PatternClip, PatternNotes, Playback, MAX_TICKS, PPQ, STEP};
-pub use tempo::{valid_meters, valid_tempos, BarBeat, MeterChange, TempoChange};
+pub use tempo::{bpm_ok, valid_meters, valid_tempos, BarBeat, MeterChange, TempoChange};
 
 /// Bumped when the file format changes incompatibly.
 /// 2: built-in effects' MIX/MATCH/DELTA have fixed parameter ids
@@ -354,6 +354,16 @@ fn unity() -> f32 {
     1.0
 }
 
+/// Track gain and pan in the ranges their automation uses (0..=2, -1..=1),
+/// so a corrupt file cannot play +120 dB.
+fn props_ok(gain: f32, pan: f32) -> bool {
+    let within = |v: f32, t: Target| {
+        t.range()
+            .is_some_and(|(lo, hi)| v.is_finite() && (lo..=hi).contains(&f64::from(v)))
+    };
+    within(gain, Target::Gain) && within(pan, Target::Pan)
+}
+
 /// A loop region runs forward and stays in range.
 fn loop_ok(region: Option<(u64, u64)>) -> bool {
     region.is_none_or(|(a, b)| a < b && b <= MAX_TICKS)
@@ -609,7 +619,7 @@ impl Action {
         use Action::*;
         Ok(match self {
             SetTempo(bpm) => {
-                if !(bpm.is_finite() && bpm > 0.0) {
+                if !bpm_ok(bpm) {
                     return Err(ActionError::BadTempo);
                 }
                 SetTempo(std::mem::replace(&mut p.bpm, bpm))
@@ -637,7 +647,7 @@ impl Action {
                 }
             }
             SetTrackProps { index, props } => {
-                if !(props.gain.is_finite() && props.pan.is_finite()) {
+                if !props_ok(props.gain, props.pan) {
                     return Err(ActionError::BadValue);
                 }
                 let t = track(p, index)?;
@@ -1006,7 +1016,7 @@ impl History {
                 .tracks
                 .iter()
                 .flat_map(|t| &t.devices)
-                .map(|d| d.uid + 1)
+                .map(|d| d.uid.saturating_add(1))
                 .max()
                 .unwrap_or(0),
         );
@@ -1146,10 +1156,7 @@ impl History {
                 .iter()
                 .flat_map(|t| &t.sends)
                 .all(|s| s.level.is_finite() && (0.0..=2.0).contains(&s.level));
-        let finite = p
-            .tracks
-            .iter()
-            .all(|t| t.gain.is_finite() && t.pan.is_finite());
+        let finite = p.tracks.iter().all(|t| props_ok(t.gain, t.pan));
         // Two devices sharing a uid would put one plugin node in the graph twice.
         let mut uids: Vec<u64> = p
             .tracks
@@ -1180,8 +1187,8 @@ impl History {
                         t.automation[i + 1..].iter().all(|b| a.target != b.target)
                     })
             });
-        if !(p.bpm.is_finite() && p.bpm > 0.0)
-            || p.sample_rate == 0
+        if !bpm_ok(p.bpm)
+            || !(8_000..=768_000).contains(&p.sample_rate)
             || !finite
             || !unique
             || !musical
@@ -1528,6 +1535,20 @@ mod tests {
             .replace("\"bpm\": 120.0", "\"bpm\": 0.0");
         fs::write(&path, zero_tempo).unwrap();
         assert!(matches!(History::load(&path), Err(ProjectError::Invalid)));
+        // A hostile file: absurd tempo, deafening gain, a rate no device has.
+        let good = text.replace("\"version\": 99", "\"version\": 2");
+        for (from, to) in [
+            ("\"bpm\": 120.0", "\"bpm\": 1e300"),
+            ("\"pan\": 0.0", "\"pan\": 50.0"),
+            ("\"sample_rate\": 48000", "\"sample_rate\": 1"),
+        ] {
+            assert!(good.contains(from), "{from}");
+            fs::write(&path, good.replace(from, to)).unwrap();
+            assert!(
+                matches!(History::load(&path), Err(ProjectError::Invalid)),
+                "{to}"
+            );
+        }
         fs::write(&path, "{").unwrap();
         assert!(matches!(History::load(&path), Err(ProjectError::Format(_))));
         fs::remove_dir_all(&dir).unwrap();

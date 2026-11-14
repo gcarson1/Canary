@@ -123,7 +123,7 @@ The UI follows Styles.md whichever framework is chosen.
 
 ### Phase 11: Projects, Export and Polish
 - [x] Export: EXPORT in the top bar plays the song through (to its end plus a 2 s tail) and writes the mix, Shift-click adds a stem per track (post-fader, before buses), through plan taps (`ExecutionPlan::tap`, `daw_engine::bounce_tap`) into 32-bit float WAVs; right-click picks WAV32F, WAV24, AIFF24, FLAC or AAC (converted by macOS `afconvert`). Files land in the samples folder's `Exports`. Clicking EXPORT again aborts
-- [x] Offline export: EXPORT borrows the engine from the device callback (`EngineHandle::lending`, `daw_engine::Renderer`) and a worker renders the song as fast as it can into WAV file taps (`daw_engine::file_tap`), with the same plugins and state; the device plays silence meanwhile. Falls back to the real-time play-through if the engine cannot be borrowed
+- [x] Offline export: EXPORT borrows the engine from the device callback (`EngineHandle::lending`, `daw_engine::Renderer`) and a worker renders the song as fast as it can into WAV file taps (`daw_engine::file_tap`), with the same plugins and state; the device plays silence meanwhile. A render that stops short is discarded
 - [ ] Export a range, dither and sample-rate choice
 - [x] Project template (Cmd+Shift+T saves the project as `Templates/Default.daw`; new projects start from it), autosave every minute to `<project>.autosave.daw` (removed on save; a newer one at startup says so, Cmd+Shift+R recovers it). Still to do: collect-and-save, relative sample paths
 - [x] Audio output device and buffer size (click the kHz readout; kept between sessions), all MIDI inputs (hot-plugged too), theme (Cmd+Shift+L)

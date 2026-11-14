@@ -25,6 +25,9 @@ pub struct Output {
 }
 
 /// What fills an output's file.
+// shortcut: the app always has a lendable engine (start_output sets it), so
+// the real-time `Live` path only runs for an engine made without lending; it is
+// kept for that case and is tested through the recorder's own tests.
 pub enum Writer {
     /// Real time: a recorder's disk-writer thread drains the tap's ring.
     Live(Recorder),

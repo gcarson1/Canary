@@ -11,12 +11,22 @@ fn picked(selected: &[Note], n: &Note) -> bool {
     selected.is_empty() || selected.contains(n)
 }
 
-/// Applies `f` to every picked note; `None` from `f` deletes the note.
+/// Applies `f` to every picked note; `None` from `f` deletes the note. An edit
+/// that would push any note out of range changes nothing (rather than drop it).
 pub fn map_notes(notes: &[Note], selected: &[Note], f: impl Fn(Note) -> Option<Note>) -> Edited {
     let (mut out, mut sel) = (Vec::with_capacity(notes.len()), Vec::new());
     for n in notes {
         if picked(selected, n) {
-            if let Some(m) = f(*n).filter(Note::is_valid) {
+            let m = f(*n);
+            if m.is_some_and(|m| !m.is_valid()) {
+                let kept = if selected.is_empty() {
+                    Vec::new()
+                } else {
+                    selected.to_vec()
+                };
+                return (notes.to_vec(), kept);
+            }
+            if let Some(m) = m {
                 out.push(m);
                 if !selected.is_empty() {
                     sel.push(m);

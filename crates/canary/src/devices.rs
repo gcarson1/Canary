@@ -96,7 +96,10 @@ fn to_project(f: Format) -> PluginFormat {
 
 impl Devices {
     pub fn scan() -> Self {
-        let catalog = Catalog::scan();
+        // A plugin that crashes the scan is skipped from the next launch on.
+        let state = std::env::var_os("HOME")
+            .map(|h| PathBuf::from(h).join("Library/Application Support/Canary"));
+        let catalog = Catalog::scan_guarded(state.as_deref());
         let choices = catalog
             .available
             .iter()

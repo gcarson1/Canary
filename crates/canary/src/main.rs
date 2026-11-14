@@ -1136,7 +1136,11 @@ impl App {
                 self.abort_export("EXPORT ABORTED".into(), false)
             }
             // So is the monitor section the master is recorded after.
-            Request::Play | Request::Seek(_) | Request::Listen(_) | Request::ToggleReference
+            Request::Play
+            | Request::Seek(_)
+            | Request::Listen(_)
+            | Request::ToggleReference
+            | Request::ToggleRecord
                 if self.export.is_some() => {}
             Request::Play => command(self, Command::Play),
             Request::Stop => {
@@ -1458,8 +1462,14 @@ impl App {
                 .position(|c| c.format == "CANARY" && c.name == instrument);
             let uid = self.history.new_device_uid();
             let rate = self.view.sample_rate as f32;
-            let device =
-                choice.and_then(|c| self.devices.create(c, uid, index, rate, MAX_BLOCK).ok());
+            let device = match choice.map(|c| self.devices.create(c, uid, index, rate, MAX_BLOCK)) {
+                Some(Ok(d)) => Some(d),
+                Some(Err(e)) => {
+                    self.error(format!("could not load plugin: {e}"));
+                    None
+                }
+                None => None,
+            };
             let project = self.history.project();
             let mut actions = vec![
                 Action::InsertPattern {
@@ -1780,7 +1790,7 @@ impl App {
     /// Stops an export, deletes its partial files and puts the monitor back.
     fn abort_export(&mut self, text: String, error: bool) {
         self.export_failed = false;
-        self.end_render();
+        self.end_render(u64::MAX);
         if let Some(e) = self.export.take() {
             let _ = self.engine.commands.push(Command::Stop);
             e.abort();
@@ -1792,19 +1802,28 @@ impl App {
 
     /// Stops an offline render, if one runs, and gives the engine back to the
     /// device callback.
-    fn end_render(&mut self) {
-        if let Some((job, stop)) = self.rendering.take() {
-            stop.store(true, Ordering::Relaxed);
-            match job.join() {
-                Ok(engine) => {
-                    // Stopped before it goes home, so the export's file taps
-                    // never write from the device callback.
-                    let _ = self.engine.commands.push(Command::Stop);
-                    if let Some(l) = self.engine.lending.as_mut() {
-                        l.give_back(engine);
-                    }
+    /// Returns true only if a render ran and reached `end`.
+    fn end_render(&mut self, end: u64) -> bool {
+        let Some((job, stop)) = self.rendering.take() else {
+            return false;
+        };
+        stop.store(true, Ordering::Relaxed);
+        match job.join() {
+            Ok(engine) => {
+                let complete = rendered_to(engine.transport().playhead(), end);
+                // Stopped before it goes home, so the export's file taps never
+                // write from the device callback.
+                let _ = self.engine.commands.push(Command::Stop);
+                if let Some(l) = self.engine.lending.as_mut() {
+                    l.give_back(engine);
                 }
-                Err(_) => self.error("the export render failed".into()),
+                complete
+            }
+            Err(_) => {
+                // The engine went down with the worker: open the device again.
+                self.error("the export render failed".into());
+                self.audio_lost = Some(Instant::now() - Duration::from_secs(1));
+                false
             }
         }
     }
@@ -1887,8 +1906,10 @@ impl App {
                 });
                 return;
             }
-            self.end_render();
-            let _ = self.engine.commands.push(Command::Stop);
+            let end = e.record_end();
+            if !self.end_render(end) {
+                return self.abort_export("EXPORT STOPPED EARLY · NOTHING SAVED".into(), true);
+            }
             return self.finish_export();
         }
         // A playhead from before the seek to 0 does not count as rolling.
@@ -2481,6 +2502,11 @@ fn metronome_clicks(project: &daw_project::Project, playback: Playback) -> Vec<S
         .collect()
 }
 
+/// A render reached the export's end (and was not stopped short).
+fn rendered_to(playhead: u64, end: u64) -> bool {
+    playhead >= end
+}
+
 /// Where to put a playhead at `at` so it plays inside `looping`: `None` if it
 /// already is (or there is no loop), else the same spot in the loop, wrapped.
 fn into_loop(looping: Option<(u64, u64)>, at: u64) -> Option<u64> {
@@ -2636,6 +2662,12 @@ mod tests {
         // Range wider than the take: the whole take.
         assert_eq!(punch_window(1_000, 500, (0, 9_000)), Some((1_000, 0, 500)));
         assert_eq!(punch_window(1_000, 500, (2_000, 3_000)), None);
+    }
+
+    #[test]
+    fn a_render_counts_only_if_it_reached_the_end() {
+        assert!(rendered_to(1_000, 1_000));
+        assert!(!rendered_to(999, 1_000), "stopped short: nothing saved");
     }
 
     #[test]

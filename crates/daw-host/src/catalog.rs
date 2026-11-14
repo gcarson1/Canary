@@ -271,10 +271,74 @@ fn bundles(dirs: &[PathBuf], extension: &str) -> Vec<PathBuf> {
     found
 }
 
+/// The scan's crash marker and the bundles it has given up on (see
+/// `Catalog::scan_guarded`).
+struct ScanGuard {
+    marker: PathBuf,
+    skips: Vec<PathBuf>,
+}
+
+impl ScanGuard {
+    fn new(dir: &Path) -> Self {
+        let marker = dir.join("scanning");
+        let list = dir.join("skipped-plugins");
+        let _ = std::fs::create_dir_all(dir);
+        let mut skips: Vec<PathBuf> = std::fs::read_to_string(&list)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(PathBuf::from)
+            .collect();
+        // The last scan never finished: the bundle it was loading is to blame.
+        if let Ok(culprit) = std::fs::read_to_string(&marker) {
+            let culprit = PathBuf::from(culprit.trim());
+            if !culprit.as_os_str().is_empty() && !skips.contains(&culprit) {
+                eprintln!(
+                    "skipping {}: it stopped the last plugin scan",
+                    culprit.display()
+                );
+                skips.push(culprit);
+                let text: String = skips.iter().map(|p| format!("{}\n", p.display())).collect();
+                let _ = std::fs::write(&list, text);
+            }
+            let _ = std::fs::remove_file(&marker);
+        }
+        Self { marker, skips }
+    }
+
+    fn skipped(&self, path: &Path) -> bool {
+        self.skips.iter().any(|s| s == path)
+    }
+
+    /// Names the bundle about to load, or clears the mark when done.
+    fn mark(&self, path: Option<&Path>) {
+        let _ = match path {
+            Some(p) => std::fs::write(&self.marker, p.display().to_string()),
+            None => std::fs::remove_file(&self.marker),
+        };
+    }
+}
+
 impl Catalog {
     /// Lists installed plugins. Loading a bundle runs its code, so a broken plugin
     /// can crash the scan; bundles that fail to load are skipped.
     pub fn scan() -> Self {
+        Self::scan_guarded(None)
+    }
+
+    /// `scan`, crash-safe across launches: before loading each user bundle its
+    /// path goes in `dir/scanning`; a launch that finds the file left there
+    /// (the bundle crashed or hung the last scan) adds that path to
+    /// `dir/skipped-plugins` and never loads it again. Delete a line there to
+    /// try a plugin again.
+    pub fn scan_guarded(dir: Option<&Path>) -> Self {
+        let guard = dir.map(ScanGuard::new);
+        let skip = |path: &Path| guard.as_ref().is_some_and(|g| g.skipped(path));
+        let mark = |path: Option<&Path>| {
+            if let Some(g) = &guard {
+                g.mark(path);
+            }
+        };
         let mut c = Catalog::default();
         c.available.extend(
             crate::builtin::builtins()
@@ -302,6 +366,10 @@ impl Catalog {
             }
         }
         for path in bundles(&folders("CLAP"), "clap") {
+            if skip(&path) {
+                continue;
+            }
+            mark(Some(&path));
             // SAFETY: plugins in the system plugin folders were installed by the user.
             if let Ok(entry) = unsafe { crate::load_bundle(&path) } {
                 // A user's own copy of a bundled plugin would list it twice.
@@ -316,6 +384,10 @@ impl Catalog {
             }
         }
         for path in bundles(&folders("VST3"), "vst3") {
+            if skip(&path) {
+                continue;
+            }
+            mark(Some(&path));
             // SAFETY: as above.
             #[cfg(target_os = "macos")]
             if let Ok(bundle) = unsafe { Vst3Bundle::load(&path) } {
@@ -323,6 +395,7 @@ impl Catalog {
                 c.vst3.insert(path, bundle);
             }
         }
+        mark(None);
         c
     }
 
@@ -464,6 +537,21 @@ impl Catalog {
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bundle_that_stopped_the_last_scan_is_skipped_from_then_on() {
+        let dir = std::env::temp_dir().join(format!("canary-scan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let bad = Path::new("/Library/Audio/Plug-Ins/CLAP/Crashy.clap");
+        let g = ScanGuard::new(&dir);
+        assert!(!g.skipped(bad));
+        g.mark(Some(bad)); // ... and the app dies here
+        let g = ScanGuard::new(&dir);
+        assert!(g.skipped(bad), "the culprit is remembered");
+        g.mark(None);
+        assert!(ScanGuard::new(&dir).skipped(bad), "for good, not just once");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     #[cfg(target_os = "macos")]

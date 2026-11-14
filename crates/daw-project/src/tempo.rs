@@ -38,11 +38,17 @@ impl MeterChange {
 
 /// True for a list sorted by strictly rising tick, every tick after 0 and in range,
 /// every tempo finite and positive.
+/// A usable tempo: 1 to 1000 BPM (what MIDI export can write). Outside it,
+/// tick and sample positions overflow or collapse.
+pub fn bpm_ok(bpm: f64) -> bool {
+    (1.0..=1000.0).contains(&bpm)
+}
+
 pub fn valid_tempos(changes: &[TempoChange]) -> bool {
     changes.windows(2).all(|w| w[0].tick < w[1].tick)
         && changes
             .iter()
-            .all(|c| c.tick > 0 && c.tick <= MAX_TICKS && c.bpm.is_finite() && c.bpm > 0.0)
+            .all(|c| c.tick > 0 && c.tick <= MAX_TICKS && bpm_ok(c.bpm))
 }
 
 /// True for a list starting at bar 0, strictly rising, every meter valid.

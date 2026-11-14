@@ -69,13 +69,16 @@ pub trait Effect: Send {
 }
 
 /// The built-in effects by id, for the device picker: (id, display name).
-pub const EFFECTS: [(&str, &str); 19] = [
+pub const EFFECTS: [(&str, &str); 22] = [
     ("canary.eq", "EQ"),
     ("canary.eq8", "Parametric EQ"),
     ("canary.compressor", "Compressor"),
     ("canary.limiter", "Limiter"),
     ("canary.gate", "Gate"),
     ("canary.saturator", "Saturator"),
+    ("canary.totape", "Tape (ToTape6)"),
+    ("canary.density", "Density"),
+    ("canary.purestdrive", "PurestDrive"),
     ("canary.dynamic_eq", "Dynamic EQ"),
     ("canary.deesser", "De-esser"),
     ("canary.filter", "Filter"),
@@ -96,6 +99,9 @@ pub fn effect(id: &str, sample_rate: f32) -> Option<Box<dyn Effect>> {
     let mut fx: Box<dyn Effect> = match id {
         "canary.compressor" => Box::new(Compressor::default()),
         "canary.saturator" => Box::new(Saturator::default()),
+        "canary.totape" => Box::new(crate::airwindows::ToTape6::default()),
+        "canary.density" => Box::new(crate::airwindows::Density2::default()),
+        "canary.purestdrive" => Box::new(crate::airwindows::PurestDrive::default()),
         "canary.dynamic_eq" => Box::new(DynamicEq::default()),
         "canary.deesser" => Box::new(DeEsser::default()),
         "canary.eq" => Box::new(crate::fx::Eq::default()),

@@ -24,6 +24,7 @@ Their factory data (Surge XT patches and wavetables, OB-Xf patches and themes) i
 
 | Project | License | Copyright | Where |
 | --- | --- | --- | --- |
+| Airwindows (ToTape6, Density2, PurestDrive) | MIT | Copyright (c) 2018 Chris Johnson | `crates/daw-dsp/src/airwindows.rs` |
 | CloudSeedCore | MIT | Copyright (c) 2024 Ghost Note Audio / Ghost Note Engineering Ltd | `crates/daw-dsp/src/cloudseed.rs` (Rust port of the reverb core) |
 
 ## Vendored source

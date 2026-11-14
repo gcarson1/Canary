@@ -1,5 +1,6 @@
 //! Pure signal processing primitives: filters, envelopes, oscillators, delay lines. No OS or UI dependencies.
 
+pub mod airwindows;
 mod click;
 pub mod cloudseed;
 pub mod convolve;

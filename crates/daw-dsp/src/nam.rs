@@ -533,11 +533,167 @@ const PARAMS: [ParamSpec; 2] = [
     },
 ];
 
+/// Lobes of the Lanczos kernel the amp resamples with.
+const LOBES: f64 = 3.0;
+/// Capture rates the amp resamples from: within 4x of the project's either way.
+const MAX_RATIO: f64 = 4.0;
+/// The amp's fixed delay in project samples: the most the two resamplers can
+/// need (3 lobes widened 4x on one side), plus rounding. Also applied when no
+/// resampling is needed, so latency does not depend on the capture.
+const AMP_LATENCY: usize = 28;
+const RING: usize = 64;
+
+/// A streaming Lanczos resampler: push input samples, pull outputs spaced
+/// `step` input samples apart, each `width` input samples late. Fixed arrays,
+/// so it runs on the audio thread. Widened by `step` when it downsamples, so it
+/// also low-passes below the new Nyquist.
+#[derive(Clone, Copy)]
+struct Lanczos {
+    ring: [f32; RING],
+    /// Input samples pushed so far.
+    pushed: u64,
+    /// Time of the next output, in input samples.
+    next: f64,
+    step: f64,
+    /// Kernel scale: 1, or 1 / step when downsampling.
+    scale: f64,
+    width: f64,
+}
+
+impl Lanczos {
+    fn new(step: f64) -> Self {
+        let scale = (1.0 / step).min(1.0);
+        Self {
+            ring: [0.0; RING],
+            pushed: 0,
+            next: 0.0,
+            step,
+            scale,
+            width: LOBES / scale,
+        }
+    }
+
+    fn push(&mut self, x: f32) {
+        self.ring[self.pushed as usize % RING] = x;
+        self.pushed += 1;
+    }
+
+    /// The next output, once enough input has arrived.
+    fn pull(&mut self) -> Option<f32> {
+        let t = self.next;
+        let newest = self.pushed as f64 - 1.0;
+        if t + self.width > newest {
+            return None;
+        }
+        let first = (t - self.width).floor().max(0.0) as u64;
+        let last = (t + self.width).ceil() as u64;
+        let (mut sum, mut weights) = (0.0f64, 0.0f64);
+        for i in first..=last.min(self.pushed - 1) {
+            let x = (t - i as f64) * self.scale;
+            let w = lanczos(x);
+            sum += w * f64::from(self.ring[i as usize % RING]);
+            weights += w;
+        }
+        self.next += self.step;
+        // Normalized, so the passband gain is exactly 1.
+        Some(if weights.abs() > 1e-9 {
+            (sum / weights) as f32
+        } else {
+            0.0
+        })
+    }
+}
+
+fn lanczos(x: f64) -> f64 {
+    if x.abs() < 1e-12 {
+        return 1.0;
+    }
+    if x.abs() >= LOBES {
+        return 0.0;
+    }
+    let px = std::f64::consts::PI * x;
+    LOBES * px.sin() * (px / LOBES).sin() / (px * px)
+}
+
+/// Outputs waiting to be heard, oldest first; fixed size.
+#[derive(Clone, Copy)]
+struct Fifo {
+    buf: [f32; RING],
+    read: usize,
+    len: usize,
+}
+
+impl Fifo {
+    fn push(&mut self, y: f32) {
+        if self.len < RING {
+            self.buf[(self.read + self.len) % RING] = y;
+            self.len += 1;
+        }
+    }
+
+    fn pop(&mut self) -> f32 {
+        if self.len == 0 {
+            return 0.0; // cannot happen with AMP_LATENCY's margin
+        }
+        let y = self.buf[self.read];
+        self.read = (self.read + 1) % RING;
+        self.len -= 1;
+        y
+    }
+}
+
+/// Runs a capture at its own rate inside a project at another: project audio
+/// up/down to the capture's rate, through the model, and back, delayed by
+/// exactly `AMP_LATENCY` project samples.
+#[derive(Clone, Copy)]
+struct Rate {
+    /// `None` when the rates match: the model runs on project samples.
+    resample: Option<(Lanczos, Lanczos)>,
+    out: Fifo,
+}
+
+impl Rate {
+    fn new(project: f32, capture: Option<f32>) -> Self {
+        let ratio = capture.map_or(1.0, |c| f64::from(c) / f64::from(project));
+        let resample =
+            ((ratio - 1.0).abs() > 1e-6).then(|| (Lanczos::new(1.0 / ratio), Lanczos::new(ratio)));
+        Self {
+            resample,
+            // Pre-filled with silence: outputs come out this late.
+            out: Fifo {
+                buf: [0.0; RING],
+                read: 0,
+                len: AMP_LATENCY,
+            },
+        }
+    }
+
+    /// One project sample through `model` (run at the capture's rate).
+    fn tick(&mut self, x: f32, mut model: impl FnMut(f32) -> f32) -> f32 {
+        match &mut self.resample {
+            None => self.out.push(model(x)),
+            Some((up, down)) => {
+                up.push(x);
+                while let Some(m) = up.pull() {
+                    down.push(model(m));
+                    while let Some(y) = down.pull() {
+                        self.out.push(y);
+                    }
+                }
+            }
+        }
+        self.out.pop()
+    }
+}
+
 /// The amp: runs the loaded capture on the mid signal (amps are mono) and
-/// sends it to both sides. Silent until a capture is loaded.
+/// sends it to both sides, at the capture's own rate. Silent until a capture
+/// is loaded.
 pub struct NamAmp {
     input: f32,
     output: f32,
+    sample_rate: f32,
+    rate: Rate,
     model: Option<Box<Model>>,
     incoming: Option<Consumer<Box<Model>>>,
     retired: Option<Producer<Box<Model>>>,
@@ -551,6 +707,8 @@ impl Default for NamAmp {
         Self {
             input: 1.0,
             output: 1.0,
+            sample_rate: 48_000.0,
+            rate: Rate::new(48_000.0, None),
             model: None,
             incoming: Some(incoming),
             retired: Some(retired),
@@ -559,7 +717,6 @@ impl Default for NamAmp {
                 from_audio,
                 path: None,
                 error: None,
-                trained_rate: None,
                 sample_rate: 48_000.0,
             }),
         }
@@ -572,8 +729,7 @@ pub struct NamLoader {
     from_audio: Consumer<Box<Model>>,
     path: Option<PathBuf>,
     error: Option<String>,
-    trained_rate: Option<f32>,
-    /// The rate the amp runs at; a capture trained at another sounds off.
+    /// The rate the amp runs at; captures are resampled to it.
     sample_rate: f32,
 }
 
@@ -594,24 +750,22 @@ impl FileLoader for NamLoader {
             })
             .and_then(|text| Model::from_json(&text))
             .and_then(|model| {
-                self.trained_rate = model.sample_rate;
+                // Resampled to the project's rate, within limits.
+                let ratio = model
+                    .sample_rate
+                    .map_or(1.0, |r| f64::from(r) / f64::from(self.sample_rate));
+                if !(1.0 / MAX_RATIO..=MAX_RATIO).contains(&ratio) {
+                    return Err(format!(
+                        "trained at {} Hz, too far from the project's {} Hz",
+                        model.sample_rate.unwrap_or(0.0),
+                        self.sample_rate
+                    ));
+                }
                 self.to_audio
                     .push(Box::new(model))
                     .map_err(|_| "busy: try again in a moment".to_string())
             });
         self.error = result.as_ref().err().cloned();
-        // Loaded, but say why it may sound wrong (no resampling yet).
-        if let Some(rate) = self
-            .trained_rate
-            .filter(|r| (r - self.sample_rate).abs() > 1.0)
-        {
-            if result.is_ok() {
-                self.error = Some(format!(
-                    "trained at {} Hz, project is {} Hz: tone will be off",
-                    rate, self.sample_rate
-                ));
-            }
-        }
         result
     }
     fn file(&self) -> Option<&Path> {
@@ -637,12 +791,18 @@ impl Effect for NamAmp {
         }
     }
     fn set_sample_rate(&mut self, sample_rate: f32) {
+        self.sample_rate = sample_rate;
+        self.rate = Rate::new(sample_rate, self.model.as_ref().and_then(|m| m.sample_rate));
         if let Some(l) = self.loader.as_mut() {
             l.sample_rate = sample_rate;
         }
     }
+    fn latency(&self) -> u32 {
+        AMP_LATENCY as u32
+    }
     fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
         if let Some(new) = self.incoming.as_mut().and_then(|c| c.pop().ok()) {
+            self.rate = Rate::new(self.sample_rate, new.sample_rate);
             if let (Some(old), Some(back)) = (self.model.replace(new), self.retired.as_mut()) {
                 // Room is kept: the loader drains this before every load.
                 let _ = back.push(old);
@@ -654,7 +814,10 @@ impl Effect for NamAmp {
             return;
         };
         for (l, r) in left.iter_mut().zip(right.iter_mut()) {
-            let y = model.tick(0.5 * (*l + *r) * self.input) * self.output;
+            let y = self
+                .rate
+                .tick(0.5 * (*l + *r) * self.input, |x| model.tick(x))
+                * self.output;
             (*l, *r) = (y, y);
         }
     }
@@ -662,6 +825,10 @@ impl Effect for NamAmp {
         if let Some(m) = &mut self.model {
             m.clear();
         }
+        self.rate = Rate::new(
+            self.sample_rate,
+            self.model.as_ref().and_then(|m| m.sample_rate),
+        );
     }
     fn file_loader(&mut self) -> Option<Box<dyn FileLoader>> {
         self.loader
@@ -697,6 +864,28 @@ mod tests {
             "weights":[{}]}}"#,
             weights.join(",")
         )
+    }
+
+    #[test]
+    fn captures_at_other_rates_are_resampled_with_a_fixed_delay() {
+        let project = 44_100.0f32;
+        for capture in [
+            None,
+            Some(44_100.0),
+            Some(48_000.0),
+            Some(96_000.0),
+            Some(22_050.0),
+        ] {
+            let mut rate = Rate::new(project, capture);
+            // A 1 kHz tone through an identity "model" comes back as itself,
+            // exactly AMP_LATENCY samples late.
+            let x = |n: usize| (2.0 * std::f32::consts::PI * 1_000.0 * n as f32 / project).sin();
+            let out: Vec<f32> = (0..4_000).map(|n| rate.tick(x(n), |m| m)).collect();
+            let err = (1_000..4_000)
+                .map(|n| (out[n] - x(n - AMP_LATENCY)).abs())
+                .fold(0.0f32, f32::max);
+            assert!(err < 0.01, "{capture:?}: {err}");
+        }
     }
 
     #[test]

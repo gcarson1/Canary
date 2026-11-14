@@ -82,6 +82,10 @@ struct App {
     files: Vec<PathBuf>,
     engine: EngineHandle,
     output: cpal::Stream,
+    /// The output device and buffer size asked for (saved beside the samples),
+    /// and what the audio panel shows.
+    audio_choice: daw_engine::OutputChoice,
+    audio_view: daw_ui::AudioView,
     /// The output device was lost; when the next restart attempt is due.
     audio_lost: Option<Instant>,
     view: EngineView,
@@ -221,8 +225,10 @@ impl App {
             .filter(|h| !h.project().tracks.is_empty())
             .map(|h| h.project().sample_rate);
         let faults = daw_engine::StreamFaults::default();
+        let audio_choice = load_audio_choice(&samples_dir);
         let (mut engine, output, config) =
-            daw_engine::start_output_at(4096, wanted, faults.clone()).map_err(|e| e.to_string())?;
+            daw_engine::start_output_at(4096, wanted, &audio_choice, faults.clone())
+                .map_err(|e| e.to_string())?;
         let midi = engine.midi.take().map(|m| Arc::new(Mutex::new(m)));
         let mut history = if let Some(saved) = saved {
             saved
@@ -266,6 +272,12 @@ impl App {
             engine,
             output,
             audio_lost: None,
+            audio_view: daw_ui::AudioView {
+                devices: daw_engine::output_devices(),
+                device: audio_choice.device.clone(),
+                buffer: audio_choice.buffer,
+            },
+            audio_choice,
             view: EngineView {
                 sample_rate: config.sample_rate,
                 ..EngineView::default()
@@ -514,6 +526,7 @@ impl App {
             return;
         }
         self.last_midi_scan = Some(Instant::now());
+        self.audio_view.devices = daw_engine::output_devices();
         let Some(sender) = self.midi.clone() else {
             return;
         };
@@ -608,7 +621,7 @@ impl App {
         let rate = self.view.sample_rate;
         let faults = daw_engine::StreamFaults::default();
         let (engine, output, config) =
-            daw_engine::start_output_at(4096, Some(rate), faults.clone())
+            daw_engine::start_output_at(4096, Some(rate), &self.audio_choice, faults.clone())
                 .map_err(|e| e.to_string())?;
         if config.sample_rate != rate {
             return Err(format!(
@@ -1095,6 +1108,31 @@ impl App {
             Request::ExportMidi { track } => self.export_midi(track),
             Request::ToggleRecord => self.toggle_record(),
             Request::Export { stems } => self.toggle_export(stems),
+            Request::SetAudio { .. } if self.taking() => {
+                self.error("stop recording before switching the output".into());
+            }
+            Request::SetAudio { device, buffer } => {
+                let previous = std::mem::replace(
+                    &mut self.audio_choice,
+                    daw_engine::OutputChoice { device, buffer },
+                );
+                match self.restart_audio() {
+                    Ok(()) => {
+                        self.audio_view.device = self.audio_choice.device.clone();
+                        self.audio_view.buffer = self.audio_choice.buffer;
+                        save_audio_choice(&self.samples_dir, &self.audio_choice);
+                        self.ws.status = Some(Status {
+                            text: "AUDIO OUTPUT CHANGED".into(),
+                            error: false,
+                        });
+                    }
+                    Err(e) => {
+                        // The old output keeps playing.
+                        self.audio_choice = previous;
+                        self.error(format!("cannot switch output: {e}"));
+                    }
+                }
+            }
             Request::Preview(path) => {
                 self.preview_wanted = None;
                 match path {
@@ -1957,6 +1995,7 @@ impl eframe::App for App {
                 plugins: &self.devices.choices,
                 devices: &views,
                 meters: &self.meters,
+                audio: &self.audio_view,
             },
         );
         for request in requests {
@@ -2053,6 +2092,36 @@ fn punch_window(at: u64, frames: u64, (from, to): (u64, u64)) -> Option<(u64, u6
     (begin < end).then(|| (begin, begin - at, end - begin))
 }
 
+/// Where the audio output choice is kept between sessions.
+fn audio_choice_path(samples_dir: &Path) -> PathBuf {
+    samples_dir.join(".canary-audio")
+}
+
+/// The saved output choice (`device=` and `buffer=` lines), or the defaults.
+fn load_audio_choice(samples_dir: &Path) -> daw_engine::OutputChoice {
+    let text = fs::read_to_string(audio_choice_path(samples_dir)).unwrap_or_default();
+    let mut choice = daw_engine::OutputChoice::default();
+    for line in text.lines() {
+        match line.split_once('=') {
+            Some(("device", d)) if !d.is_empty() => choice.device = Some(d.to_string()),
+            Some(("buffer", b)) => choice.buffer = b.parse().ok(),
+            _ => {}
+        }
+    }
+    choice
+}
+
+fn save_audio_choice(samples_dir: &Path, choice: &daw_engine::OutputChoice) {
+    let text = format!(
+        "device={}\nbuffer={}\n",
+        choice.device.as_deref().unwrap_or(""),
+        choice.buffer.map_or(String::new(), |b| b.to_string())
+    );
+    if let Err(e) = fs::write(audio_choice_path(samples_dir), text) {
+        eprintln!("audio settings not saved: {e}");
+    }
+}
+
 /// The transport loop for `playback`: the whole pattern in PAT mode.
 /// An export plays the whole song, so the song loop is off while it runs.
 fn loop_range(
@@ -2109,6 +2178,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_audio_output_choice_round_trips() {
+        let dir = std::env::temp_dir().join(format!("canary-audio-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        assert_eq!(load_audio_choice(&dir), daw_engine::OutputChoice::default());
+        let choice = daw_engine::OutputChoice {
+            device: Some("MacBook Pro Speakers".into()),
+            buffer: Some(256),
+        };
+        save_audio_choice(&dir, &choice);
+        assert_eq!(load_audio_choice(&dir), choice);
+        save_audio_choice(&dir, &daw_engine::OutputChoice::default());
+        assert_eq!(load_audio_choice(&dir), daw_engine::OutputChoice::default());
+        fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn punch_keeps_only_the_take_inside_the_range() {

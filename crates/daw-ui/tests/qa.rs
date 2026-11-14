@@ -10,8 +10,8 @@ use daw_core::SampleData;
 use daw_dsp::WaveformPyramid;
 use daw_project::{Action, ClipRef, History, Note, Pattern, PatternClip, Track, PPQ, STEP};
 use daw_ui::{
-    theme, DeviceView, EngineView, EqView, FileView, Inputs, Page, ParamView, PluginChoice,
-    Request, SampleDrop, SamplerView, Theme, Workspace,
+    theme, AudioView, DeviceView, EngineView, EqView, FileView, Inputs, Page, ParamView,
+    PluginChoice, Request, SampleDrop, SamplerView, Theme, Workspace,
 };
 use egui::epaint::ColorMode;
 use egui::{Color32, Shape, Vec2};
@@ -196,6 +196,7 @@ fn harness(
                         plugins: &plugins(),
                         devices: &[vec![sampler()], devices(), vec![eq(), amp()]].concat(),
                         meters: &[[0.4, 0.5], [0.9, 1.0], [0.0, 0.0], [0.2, 0.25]],
+                        audio: &AudioView::default(),
                     },
                 );
             })
@@ -529,6 +530,7 @@ fn rig_from(mut ws: Workspace, rack: Vec<DeviceView>) -> Harness<'static, Rig> {
                             plugins: &plugins(),
                             devices: &rack,
                             meters: &[],
+                            audio: &AudioView::default(),
                         },
                     );
                     rig.requests.extend(out);

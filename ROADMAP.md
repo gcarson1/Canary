@@ -123,7 +123,8 @@ The UI follows Styles.md whichever framework is chosen.
 - [x] Export: EXPORT in the top bar plays the song through (to its end plus a 2 s tail) and writes the mix, Shift-click adds a stem per track (post-fader, before buses), through plan taps (`ExecutionPlan::tap`, `daw_engine::bounce_tap`) into 32-bit float WAVs; right-click picks WAV32F, WAV24, AIFF24, FLAC or AAC (converted by macOS `afconvert`). Files land in the samples folder's `Exports`. Clicking EXPORT again aborts
 - [ ] Offline export faster than real time, export a range, dither and sample-rate choice
 - [x] Project template (Cmd+Shift+T saves the project as `Templates/Default.daw`; new projects start from it), autosave every minute to `<project>.autosave.daw` (removed on save; a newer one at startup says so, Cmd+Shift+R recovers it). Still to do: collect-and-save, relative sample paths
-- [ ] Preferences: audio device, sample rate and buffer size, all MIDI inputs, theme (dark/daylight), UI scale
+- [x] Audio output device and buffer size (click the kHz readout; kept between sessions), all MIDI inputs (hot-plugged too), theme (Cmd+Shift+L)
+- [ ] Preferences: input device choice, project sample rate change, UI scale
 - [x] Shortcuts: F5 playlist, F6 step sequencer, F7 piano roll, F9 mixer, P draw, C slice, Cmd+Shift+L daylight theme; Cmd+C/X/V for playlist clips (pasted at the playhead on the selected track) and piano-roll notes. Still to do: marquee select in the playlist
 - [x] Browser preview: the arrow at a file row's end auditions it through the master (`daw_graph::PreviewNode`, kept across plans, left out of exports). Still to do: favorites, search across folders
 - [ ] Multi-core DSP: independent branches run on a real-time worker pool

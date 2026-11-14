@@ -139,6 +139,12 @@ pub enum Request {
     },
     /// Audition a file from the browser (`None` stops).
     Preview(Option<PathBuf>),
+    /// Open this output device (None: the system default) at this buffer size
+    /// (None: the device's own).
+    SetAudio {
+        device: Option<String>,
+        buffer: Option<u32>,
+    },
     /// Write `track`'s notes in the current pattern to a MIDI file.
     ExportMidi {
         track: usize,
@@ -167,7 +173,23 @@ pub struct Inputs<'a> {
     pub devices: &'a [DeviceView],
     /// Each track's output peak (linear, left and right), for the mixer meters.
     pub meters: &'a [[f32; 2]],
+    /// Output devices and the one in use, for the audio panel.
+    pub audio: &'a AudioView,
 }
+
+/// The audio output as the transport's rate readout shows and sets it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AudioView {
+    /// Output devices, the system default first.
+    pub devices: Vec<String>,
+    /// The device chosen, `None` for the system default.
+    pub device: Option<String>,
+    /// Frames per callback chosen, `None` for the device's own.
+    pub buffer: Option<u32>,
+}
+
+/// Buffer sizes the audio panel offers.
+pub const BUFFER_SIZES: [u32; 6] = [64, 128, 256, 512, 1024, 2048];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
@@ -304,6 +326,9 @@ pub struct Workspace {
     edits: Vec<Edit>,
     /// The device picker's scroll offset while it is open.
     picker: Option<f32>,
+    /// The audio panel is open (opened from the rate readout); the frame it
+    /// opened, so that click does not close it.
+    audio_open: Option<u64>,
     /// Points the rack is scrolled to the left.
     rack_scroll: f32,
     /// The parametric EQ band whose dials the rack shows.
@@ -358,6 +383,7 @@ impl Default for Workspace {
             clip_latch: [false; 2],
             edits: Vec::new(),
             picker: None,
+            audio_open: None,
             device_drag: None,
             rack_scroll: 0.0,
             eq_band: 0,
@@ -881,6 +907,124 @@ impl Workspace {
         }
     }
 
+    /// The audio output panel under the rate readout: output devices, then
+    /// buffer sizes. A pick asks the app to reopen the output; Esc or a click
+    /// outside closes it.
+    fn audio_panel(
+        &mut self,
+        ui: &egui::Ui,
+        m: &Metrics,
+        anchor: Rect,
+        audio: &AudioView,
+        out: &mut Vec<Request>,
+    ) {
+        let (t, u) = (self.theme, m.u);
+        let p = ui.ctx().layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            ui.scope_id().with("audio-panel"),
+        ));
+        let row_h = 1.75 * u;
+        let rows = audio.devices.len().max(1) as f32 + 1.0;
+        let width = 18.0 * u;
+        let panel = m.snap_rect(Rect::from_min_size(
+            Pos2::new(anchor.max.x - width, anchor.max.y + 0.75 * u),
+            Vec2::new(width, 2.0 * u + rows * row_h + 0.5 * u),
+        ));
+        p.rect_filled(panel, 0.0, t.bg_panel);
+        p.rect_stroke(panel, 0.0, m.hair(t.line_2), StrokeKind::Inside);
+        p.text(
+            Pos2::new(panel.min.x + 0.75 * u, panel.min.y + u),
+            Align2::LEFT_CENTER,
+            "AUDIO OUTPUT // ESC TO CLOSE",
+            m.mono(0.625),
+            t.muted,
+        );
+        let mut y = panel.min.y + 2.0 * u;
+        p.hline(panel.x_range(), m.snap(y), m.hair(t.line));
+        let mut pick: Option<(Option<String>, Option<u32>)> = None;
+        if audio.devices.is_empty() {
+            p.text(
+                Pos2::new(panel.min.x + 0.75 * u, y + row_h / 2.0),
+                Align2::LEFT_CENTER,
+                "NO OUTPUT DEVICES",
+                m.mono(0.625),
+                t.faint,
+            );
+        }
+        for (i, name) in audio.devices.iter().enumerate() {
+            let row = Rect::from_x_y_ranges(panel.x_range(), y..=m.snap(y + row_h));
+            let resp = ui.interact(row, ui.scope_id().with(("audio-dev", i)), Sense::click());
+            // The default device (first) is chosen when none is named.
+            let on = audio.device.as_deref().map_or(i == 0, |d| d == name);
+            if on {
+                p.rect_filled(row, 0.0, t.sel);
+            }
+            let label: String = name.chars().take(34).collect();
+            p.text(
+                Pos2::new(row.min.x + 0.75 * u, row.center().y),
+                Align2::LEFT_CENTER,
+                label.to_uppercase(),
+                m.mono(0.625),
+                if resp.hovered() || on {
+                    t.text
+                } else {
+                    t.muted
+                },
+            );
+            if resp.clicked() && !on {
+                pick = Some(((i > 0).then(|| name.clone()), audio.buffer));
+            }
+            y = row.max.y;
+        }
+        // Buffer sizes, then the device's own.
+        let row = Rect::from_x_y_ranges(panel.x_range(), y..=m.snap(y + row_h));
+        p.hline(panel.x_range(), m.snap(y), m.hair(t.line));
+        let mut x = row.min.x + 0.75 * u;
+        let sizes = BUFFER_SIZES.iter().map(|&b| Some(b)).chain([None]);
+        for size in sizes {
+            let label = size.map_or("AUTO".to_string(), |b| b.to_string());
+            let g = p.layout_no_wrap(label.clone(), m.mono(0.5625), t.text);
+            let cell = m.snap_rect(Rect::from_min_size(
+                Pos2::new(x, row.center().y - 0.5 * u),
+                Vec2::new(g.size().x + 0.5 * u, u),
+            ));
+            let resp = ui.interact(
+                cell,
+                ui.scope_id().with(("audio-buf", size)),
+                Sense::click(),
+            );
+            let on = audio.buffer == size;
+            if on {
+                p.rect_filled(cell, 0.0, t.accent_amber);
+            } else {
+                let line = if resp.hovered() { t.text } else { t.line_2 };
+                p.rect_stroke(cell, 0.0, m.hair(line), StrokeKind::Inside);
+            }
+            p.text(
+                cell.center(),
+                Align2::CENTER_CENTER,
+                label,
+                m.mono(0.5625),
+                if on { t.ink_text } else { t.muted },
+            );
+            if resp.clicked() && !on {
+                pick = Some((audio.device.clone(), size));
+            }
+            x = cell.max.x + 0.25 * u;
+        }
+        if let Some((device, buffer)) = pick {
+            out.push(Request::SetAudio { device, buffer });
+        }
+        let opened = self.audio_open.unwrap_or(0);
+        let outside = ui.input(|i| {
+            i.pointer.any_pressed() && i.pointer.interact_pos().is_some_and(|p| !panel.contains(p))
+        });
+        let esc = ui.input(|i| i.key_pressed(Key::Escape));
+        if esc || (outside && ui.ctx().cumulative_frame_nr() > opened) {
+            self.audio_open = None;
+        }
+    }
+
     /// Return or Home: back to the start (the loop's, when it is on). M and S:
     /// mute and solo the selected track. Cmd+D on the playlist: the selected
     /// clip again, right after itself.
@@ -1293,6 +1437,21 @@ impl Workspace {
             m.mono(0.75),
             t.muted,
         );
+        // The readout opens the audio output panel.
+        let rate_resp = ui.interact(
+            rate.expand(0.25 * u),
+            ui.scope_id().with("audio-readout"),
+            Sense::click(),
+        );
+        if rate_resp.hovered() {
+            p.hline(rate.x_range(), m.snap(rate.max.y), m.hair(t.muted));
+        }
+        if rate_resp.clicked() && self.audio_open.is_none() {
+            self.audio_open = Some(ui.ctx().cumulative_frame_nr());
+        }
+        if self.audio_open.is_some() {
+            self.audio_panel(ui, m, rate, inputs.audio, out);
+        }
         // DSP load, red when the engine cannot keep up.
         let load = p.text(
             Pos2::new(rate.min.x - 1.0 * u, cy),

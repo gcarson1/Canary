@@ -10,7 +10,7 @@ mod transport;
 
 pub use load::{load_audio, resample, write_wav, LoadError};
 pub use midi::{connect_midi, midi_input_ports, MidiConnection, MidiError, MidiSender};
-pub use output::{start_output, start_output_at, OutputError};
+pub use output::{output_devices, start_output, start_output_at, OutputChoice, OutputError};
 pub use peaks::cached_waveform;
 pub use record::{
     bounce_tap, recorder, start_input, BounceTap, InputError, RecordError, RecordInput, Recorder,

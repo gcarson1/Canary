@@ -229,6 +229,9 @@ struct InputFeed {
     frames: Cell<usize>,
     /// The host's transport for this render, read by the unit's host callbacks.
     time: Cell<HostTime>,
+    /// True only inside `AudioUnitRender`: host callbacks from any other time
+    /// or thread are refused rather than read state another thread writes.
+    rendering: std::sync::atomic::AtomicBool,
 }
 
 /// What the AU host callbacks report: the block's musical position, transport
@@ -260,7 +263,9 @@ unsafe fn put<T>(out: *mut T, value: T) {
 unsafe fn host_time(data: *mut c_void) -> Option<HostTime> {
     // SAFETY: the caller's contract; the feed outlives the unit.
     let feed = unsafe { data.cast::<InputFeed>().as_ref()? };
-    Some(feed.time.get())
+    feed.rendering
+        .load(std::sync::atomic::Ordering::Acquire)
+        .then(|| feed.time.get())
 }
 
 unsafe extern "C-unwind" fn beat_and_tempo(
@@ -315,7 +320,9 @@ unsafe fn transport(
     cycling: *mut u8,
 ) -> i32 {
     // SAFETY: the caller's contract.
-    let Some(feed) = (unsafe { data.cast::<InputFeed>().as_ref() }) else {
+    let Some(feed) = (unsafe { data.cast::<InputFeed>().as_ref() })
+        .filter(|f| f.rendering.load(std::sync::atomic::Ordering::Acquire))
+    else {
         return -10863;
     };
     let mut t = feed.time.get();
@@ -422,6 +429,9 @@ pub struct AuPlugin {
     editor: Option<Retained<AnyObject>>,
     /// The ARA extension, when created bound to a document.
     ara: Option<NonNull<c_void>>,
+    /// The unit's callbacks point at this (input feed, host callbacks): held
+    /// here too, after `unit`, so it outlives the unit whichever side goes last.
+    _feed: Arc<InputFeed>,
 }
 
 const ARA_MAGIC: u32 = u32::from_be_bytes(*b"Ara!");
@@ -596,6 +606,7 @@ impl AuPlugin {
             count: Cell::new(0),
             frames: Cell::new(0),
             time: Cell::new(HostTime::default()),
+            rendering: std::sync::atomic::AtomicBool::new(false),
         });
         // Tempo, bar position and transport for synced delays, LFOs and arps.
         let callbacks = HostCallbackInfo {
@@ -656,6 +667,7 @@ impl AuPlugin {
             kind,
             editor: None,
             ara,
+            _feed: feed.clone(),
         };
         let channel = || vec![0.0f32; max_block].into_boxed_slice();
         let node = AuNode {
@@ -1025,6 +1037,8 @@ impl AudioNode for AuNode {
         let mut flags = AudioUnitRenderActionFlags(0);
         // SAFETY: `list` points at two buffers of `n` floats; the input feed points
         // at slices that live for this call.
+        use std::sync::atomic::Ordering;
+        self.feed.rendering.store(true, Ordering::Release);
         let status = unsafe {
             AudioUnitRender(
                 self.unit.0,
@@ -1035,6 +1049,7 @@ impl AudioNode for AuNode {
                 NonNull::from(&mut list).cast(),
             )
         };
+        self.feed.rendering.store(false, Ordering::Release);
         self.sample_time += n as f64;
         self.feed.count.set(0); // the input slices die with this call
         for (ch, out) in outputs.iter_mut().enumerate() {
@@ -1066,6 +1081,7 @@ mod tests {
             channels: std::array::from_fn(|_| Cell::new(ptr::null())),
             count: Cell::new(0),
             frames: Cell::new(0),
+            rendering: std::sync::atomic::AtomicBool::new(true),
             time: Cell::new(HostTime {
                 musical: Musical {
                     bpm: 120.0,

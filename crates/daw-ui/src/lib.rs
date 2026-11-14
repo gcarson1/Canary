@@ -257,6 +257,15 @@ pub struct Workspace {
     pub tool: Tool,
     pub snap: Snap,
     pub selected_track: Option<usize>,
+    /// A step-sequencer paint stroke: its row and whether it sets or clears.
+    /// The x it reached last frame, so a fast swipe paints every cell between.
+    pub(crate) step_paint: Option<(usize, bool, f32)>,
+    /// First row shown in the browser and in the track manifest (scrolled).
+    browser_scroll: f32,
+    manifest_scroll: f32,
+    /// The last click was on a track's name (manifest, lane label, step row or
+    /// mixer strip): only then does Delete take the whole track.
+    pub track_focused: bool,
     pub selected_clip: Option<(usize, usize)>,
     /// A pattern clip on the playlist: (row, index).
     pub selected_pattern_clip: Option<(usize, usize)>,
@@ -316,6 +325,10 @@ impl Default for Workspace {
             tool: Tool::Draw,
             snap: Snap::Sixteenth,
             selected_track: None,
+            step_paint: None,
+            browser_scroll: 0.0,
+            manifest_scroll: 0.0,
+            track_focused: false,
             selected_clip: None,
             selected_pattern_clip: None,
             status: None,
@@ -408,7 +421,13 @@ impl Workspace {
     /// app must do. Call [`theme::install_fonts`] once on the context first.
     pub fn show(&mut self, ui: &mut egui::Ui, inputs: Inputs<'_>) -> Vec<Request> {
         let mut out = Vec::new();
+        // Any click elsewhere takes Delete off the track; a name click (on
+        // release, later this frame) puts it back.
+        if ui.input(|i| i.pointer.any_pressed()) {
+            self.track_focused = false;
+        }
         if !ui.input(|i| i.pointer.any_down()) {
+            self.step_paint = None;
             if let Some((track, key)) = self.held_note.take() {
                 out.push(Request::Note {
                     track,
@@ -508,7 +527,8 @@ impl Workspace {
                 Edit::Gesture(action, id) => drop(inputs.history.apply_gesture(action, id)),
             }
         }
-        if !ui.input(|i| i.pointer.any_down()) {
+        // A wheel turning a dial is one gesture until the scroll stops.
+        if !ui.input(|i| i.pointer.any_down() || i.smooth_scroll_delta != Vec2::ZERO) {
             inputs.history.end_gesture();
         }
         self.clear_selection(inputs.history);
@@ -567,7 +587,7 @@ impl Workspace {
         (id, Some(Action::InsertPattern { index: 0, pattern }))
     }
 
-    /// Queues `notes` as `track`'s notes in the current pattern, creating the
+    /// Queues a project edit for the end of the frame. `notes` as `track`'s notes in the current pattern, creating the
     /// pattern if there is none.
     fn set_notes(&mut self, project: &Project, track: usize, notes: Vec<daw_project::Note>) {
         let (pattern, create) = self.pattern_for_edit(project);
@@ -592,9 +612,14 @@ impl Workspace {
         if ui.ctx().text_edit_focused() {
             return;
         }
-        // Space on a focused button presses that button; it must not also toggle
-        // the transport.
-        let button_focused = ui.ctx().memory(|mem| mem.focused().is_some());
+        // Nothing but a text field keeps keyboard focus: a click or Tab must not
+        // leave a hidden focused widget that Space would press instead of
+        // playing (nothing draws a focus ring here).
+        ui.ctx().memory_mut(|mem| {
+            if let Some(id) = mem.focused() {
+                mem.surrender_focus(id);
+            }
+        });
         self.shortcuts(ui, inputs);
         let (space, undo, redo, delete) = ui.input(|i| {
             let cmd = i.modifiers.command;
@@ -606,7 +631,7 @@ impl Workspace {
                 })
             };
             (
-                !button_focused && fresh(Key::Space),
+                fresh(Key::Space),
                 cmd && !i.modifiers.shift && i.key_pressed(Key::Z),
                 cmd && i.modifiers.shift && i.key_pressed(Key::Z),
                 fresh(Key::Delete) || fresh(Key::Backspace),
@@ -697,6 +722,7 @@ impl Workspace {
                 });
             }
         }
+        self.track_keys(ui, inputs, out);
         if undo {
             self.edits.push(Edit::Undo);
         }
@@ -720,8 +746,9 @@ impl Workspace {
                     self.selected_clip = None;
                     Some(Action::RemoveClip { track, index })
                 }
-                (None, None, Some(index)) => {
+                (None, None, Some(index)) if self.track_focused => {
                     self.selected_track = None;
+                    self.track_focused = false;
                     Some(Action::RemoveTrack { index })
                 }
                 _ => None,
@@ -817,6 +844,97 @@ impl Workspace {
                 }
                 (Key::V, true, false) if self.page == Page::Playlist => {
                     self.paste(inputs);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Return or Home: back to the start (the loop's, when it is on). M and S:
+    /// mute and solo the selected track. Cmd+D on the playlist: the selected
+    /// clip again, right after itself.
+    fn track_keys(&mut self, ui: &egui::Ui, inputs: &Inputs<'_>, out: &mut Vec<Request>) {
+        let keys: Vec<(Key, egui::Modifiers)> = ui.input(|i| {
+            i.events
+                .iter()
+                .filter_map(|e| match e {
+                    egui::Event::Key {
+                        key,
+                        pressed: true,
+                        repeat: false,
+                        modifiers,
+                        ..
+                    } => Some((*key, *modifiers)),
+                    _ => None,
+                })
+                .collect()
+        });
+        let project = inputs.history.project();
+        for (key, mods) in keys {
+            if mods.command && key != Key::D {
+                continue;
+            }
+            match key {
+                Key::Enter | Key::Home => {
+                    let start = project
+                        .loop_region
+                        .filter(|_| project.loop_on && self.song)
+                        .map_or(0, |(a, _)| a);
+                    out.push(Request::Seek(start));
+                }
+                // The piano roll uses neither; M and S on a note would surprise.
+                Key::M | Key::S if self.page != Page::PianoRoll && !mods.shift => {
+                    if let Some(i) = self.selected_track.filter(|&i| i < project.tracks.len()) {
+                        let mut props = TrackProps::of(&project.tracks[i]);
+                        if key == Key::M {
+                            props.mute ^= true;
+                        } else {
+                            props.solo ^= true;
+                        }
+                        self.edit(Action::SetTrackProps { index: i, props });
+                    }
+                }
+                Key::D if mods.command && self.page == Page::Playlist => {
+                    let action = match (self.selected_pattern_clip, self.selected_clip) {
+                        (Some((t, i)), _) => project
+                            .tracks
+                            .get(t)
+                            .and_then(|tr| tr.pattern_clips.get(i))
+                            .map(|c| Action::InsertPatternClip {
+                                track: t,
+                                index: project.tracks[t].pattern_clips.len(),
+                                clip: daw_project::PatternClip {
+                                    start: c.end(),
+                                    ..*c
+                                },
+                            }),
+                        (None, Some((t, i))) => project
+                            .tracks
+                            .get(t)
+                            .and_then(|tr| tr.clips.get(i))
+                            .map(|c| Action::InsertClip {
+                                track: t,
+                                index: project.tracks[t].clips.len(),
+                                clip: daw_project::ClipRef {
+                                    start: c.start + c.length,
+                                    ..c.clone()
+                                },
+                            }),
+                        _ => None,
+                    };
+                    if let Some(action) = action {
+                        // The copy is selected, so Cmd+D again goes on from it.
+                        match &action {
+                            Action::InsertClip { track, index, .. } => {
+                                self.selected_clip = Some((*track, *index));
+                            }
+                            Action::InsertPatternClip { track, index, .. } => {
+                                self.selected_pattern_clip = Some((*track, *index));
+                            }
+                            _ => {}
+                        }
+                        self.edit(action);
+                    }
                 }
                 _ => {}
             }
@@ -953,9 +1071,37 @@ impl Workspace {
             ui.scope_id().with("bpm"),
             Sense::drag(),
         );
+        // Drag up or down (Shift: hundredths); the wheel steps whole BPM
+        // (Shift: tenths).
+        let fine = ui.input(|i| i.modifiers.shift);
         if bpm_resp.dragged() {
             let dy = bpm_resp.drag_delta().y as f64;
-            self.tempo_drag = Some((bpm - dy * 0.25).clamp(20.0, 400.0));
+            let per_point = if fine { 0.01 } else { 0.25 };
+            self.tempo_drag = Some((bpm - dy * per_point).clamp(20.0, 400.0));
+        }
+        // Mouse-wheel notches only: a trackpad's stream of small scrolls would
+        // race the tempo away.
+        let wheel = if bpm_resp.hovered() && self.tempo_drag.is_none() {
+            ui.input(|i| {
+                i.events
+                    .iter()
+                    .filter_map(|e| match e {
+                        egui::Event::MouseWheel {
+                            unit: egui::MouseWheelUnit::Line,
+                            delta,
+                            ..
+                        } => Some(delta.y),
+                        _ => None,
+                    })
+                    .sum::<f32>()
+            })
+        } else {
+            0.0
+        };
+        if wheel != 0.0 {
+            let step = if fine { 0.1 } else { 1.0 } * f64::from(wheel.signum());
+            let next = ((bpm + step) * 100.0).round() / 100.0;
+            self.edit(Action::SetTempo(next.clamp(20.0, 400.0)));
         }
         if bpm_resp.drag_stopped() {
             if let Some(bpm) = self.tempo_drag.take() {
@@ -1344,7 +1490,16 @@ impl Workspace {
             );
         }
         let row_h = 2.0 * u;
-        for (i, path) in inputs.files.iter().enumerate() {
+        // The wheel scrolls the list a row at a time when it runs past the panel.
+        let fits = ((r.max.y - y) / row_h).floor().max(1.0) as usize;
+        self.browser_scroll =
+            scroll_rows(ui, r, self.browser_scroll, inputs.files.len(), fits, row_h);
+        for (i, path) in inputs
+            .files
+            .iter()
+            .enumerate()
+            .skip(self.browser_scroll as usize)
+        {
             if y + row_h > r.max.y {
                 break;
             }
@@ -1369,7 +1524,7 @@ impl Workspace {
                 p.hline(label.x_range(), m.snap(label.max.y), m.hair(t.text));
             }
             let nudge = if resp.hovered() { 0.25 * u } else { 0.0 };
-            // The arrow auditions the file; the rest of the row adds it.
+            // A click (or the arrow) auditions the file; a double-click adds it.
             let hear = Rect::from_x_y_ranges(r.max.x - 2.25 * u..=r.max.x, row.y_range());
             let hear_resp = ui.interact(hear, ui.scope_id().with(("hear", i)), Sense::click());
             p.text(
@@ -1384,11 +1539,11 @@ impl Workspace {
                 },
             );
             // Stop silences an audition.
-            if hear_resp.clicked() {
+            if hear_resp.clicked() || (resp.clicked() && !resp.double_clicked()) {
                 out.push(Request::Preview(Some(path.clone())));
             }
             p.hline(r.x_range(), m.snap(row.max.y), m.hair(t.line));
-            if resp.clicked() {
+            if resp.double_clicked() {
                 out.push(Request::AddFile {
                     track: self.selected_track,
                     path: path.clone(),
@@ -1503,7 +1658,11 @@ impl Workspace {
         let row_h = 2.875 * u;
         let tracks = &history.project().tracks;
         let mut edit = None;
-        for (i, track) in tracks.iter().enumerate() {
+        // Room above the + TRACK row; the wheel scrolls the rest into view.
+        let fits = ((r.max.y - 2.0 * u - y) / row_h).floor().max(1.0) as usize;
+        self.manifest_scroll = scroll_rows(ui, r, self.manifest_scroll, tracks.len(), fits, row_h);
+        let first = self.manifest_scroll as usize;
+        for (i, track) in tracks.iter().enumerate().skip(first) {
             if y + row_h > r.max.y - 2.0 * u {
                 break;
             }
@@ -1602,6 +1761,8 @@ impl Workspace {
                 edit = Some(Action::SetTrackProps { index: i, props });
             } else if resp.clicked() {
                 self.selected_track = Some(i);
+                self.track_focused = true;
+                self.selected_pattern_clip = None;
                 self.selected_clip = None;
             }
             p.hline(r.x_range(), m.snap(row.max.y), m.hair(t.line));
@@ -1847,6 +2008,22 @@ impl Workspace {
 }
 
 /// The browser shows names, not paths.
+/// How far a `len`-row list in `r` that fits `fits` rows is scrolled, in rows
+/// (fractional, so slow trackpad scrolls add up), after this frame's wheel or
+/// trackpad scroll over `r`. Show from row `as usize`.
+fn scroll_rows(ui: &egui::Ui, r: Rect, rows: f32, len: usize, fits: usize, row_h: f32) -> f32 {
+    let max = len.saturating_sub(fits) as f32;
+    let over = ui
+        .input(|i| i.pointer.hover_pos())
+        .is_some_and(|p| r.contains(p));
+    let dy = if over {
+        ui.input(|i| i.smooth_scroll_delta.y)
+    } else {
+        0.0
+    };
+    (rows - dy / row_h).clamp(0.0, max)
+}
+
 fn file_name(path: &Path) -> String {
     path.file_name().map_or_else(
         || path.display().to_string(),

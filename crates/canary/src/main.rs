@@ -1869,7 +1869,7 @@ impl eframe::App for App {
         self.read_telemetry();
         self.tend_export();
         self.engine.collect_garbage();
-        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::S)) {
+        if ctx.input(|i| i.modifiers.command && !i.modifiers.shift && i.key_pressed(egui::Key::S)) {
             self.save();
         }
         let (recover, template) = ctx.input(|i| {

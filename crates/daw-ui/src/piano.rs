@@ -390,15 +390,17 @@ pub(crate) fn show(
                     ws.set_notes(project, ti, notes);
                 }
             }
+            // Shift-click on a selected note takes it out of the selection.
+            Some(n) if mods.shift && v.selected.contains(&n) => v.selected.retain(|s| *s != n),
             Some(n) => {
                 if mods.shift {
-                    if !v.selected.contains(&n) {
-                        v.selected.push(n);
-                    }
+                    v.selected.push(n);
                 } else if !v.selected.contains(&n) {
                     v.selected = vec![n];
                 }
-                let near_end = note_rect(&n).max.x - pos.x < 0.375 * u;
+                // Short notes keep a body to move: the resize zone is at most a third.
+                let r = note_rect(&n);
+                let near_end = r.max.x - pos.x < (0.375 * u).min(r.width() / 3.0);
                 let kind = if near_end { Kind::Resize } else { Kind::Move };
                 v.gesture = Some(begin(kind, stored.to_vec(), v.selected.clone()));
                 if kind == Kind::Move {
@@ -487,15 +489,18 @@ pub(crate) fn show(
     }
 
     // Gesture in progress, then its release.
+    // Holding Option while dragging moves and resizes off the grid.
+    let free = ui.input(|i| i.modifiers.alt);
     if let (Some(g), Some(pos)) = (ws.roll.gesture.as_mut(), pointer) {
-        let dt = (tick_at(pos.x) - tick_at(g.from.x)) / grid_ticks as f64;
-        let dt = dt.round() as i64 * grid_ticks as i64;
+        let step = if free { 1 } else { grid_ticks };
+        let dt = (tick_at(pos.x) - tick_at(g.from.x)) / step as f64;
+        let dt = dt.round() as i64 * step as i64;
         let dk = (key_at(pos.y) as i32 - key_at(g.from.y) as i32) * i32::from(g.kind == Kind::Move);
         match g.kind {
             Kind::Move => (g.preview, g.preview_sel) = edit::shift(&g.base, &g.sel, dt, dk),
             Kind::Resize => {
                 (g.preview, g.preview_sel) = edit::map_notes(&g.base, &g.sel, |n| {
-                    let end = (n.end() as i64 + dt).max(n.start as i64 + grid_ticks as i64);
+                    let end = (n.end() as i64 + dt).max(n.start as i64 + step as i64);
                     Some(Note {
                         length: end as u64 - n.start,
                         ..n
@@ -571,7 +576,8 @@ pub(crate) fn show(
     keys_pressed(ws, ui, project, ti, stored, grid_ticks, at, out);
 }
 
-/// Keyboard edits on the selection (or every note when nothing is selected).
+/// Keyboard edits on the selection (or every note when nothing is selected;
+/// the arrows only move a selection, so a stray press cannot shift them all).
 #[allow(clippy::too_many_arguments)]
 fn keys_pressed(
     ws: &mut Workspace,
@@ -672,18 +678,18 @@ fn keys_pressed(
                 None
             }
             Key::Q if !mods.command => Some(edit::quantize(stored, &sel, grid, false)),
-            Key::ArrowUp => Some(edit::transpose(
+            Key::ArrowUp if !sel.is_empty() => Some(edit::transpose(
                 stored,
                 &sel,
                 if mods.shift { 12 } else { 1 },
             )),
-            Key::ArrowDown => Some(edit::transpose(
+            Key::ArrowDown if !sel.is_empty() => Some(edit::transpose(
                 stored,
                 &sel,
                 if mods.shift { -12 } else { -1 },
             )),
-            Key::ArrowRight => Some(edit::shift(stored, &sel, grid as i64, 0)),
-            Key::ArrowLeft => Some(edit::shift(stored, &sel, -(grid as i64), 0)),
+            Key::ArrowRight if !sel.is_empty() => Some(edit::shift(stored, &sel, grid as i64, 0)),
+            Key::ArrowLeft if !sel.is_empty() => Some(edit::shift(stored, &sel, -(grid as i64), 0)),
             Key::D if mods.command => Some(edit::duplicate(stored, &sel, grid.max(STEP))),
             Key::L if !mods.command => Some(edit::legato(stored, &sel)),
             Key::OpenBracket if !mods.command => Some(edit::scale_velocity(stored, &sel, 0.9)),

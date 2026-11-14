@@ -50,9 +50,10 @@ pub(crate) fn show(
     let body = Rect::from_x_y_ranges(r.x_range(), top..=r.max.y);
     let strip_w = 6.0 * u;
     let total = (project.tracks.len() as f32 + 1.0) * strip_w;
+    // Sideways scrolling moves the strips; the vertical wheel turns the pan
+    // dial under the pointer.
     if ui.rect_contains_pointer(body) {
-        let d = ui.input(|i| i.smooth_scroll_delta);
-        ws.mixer_scroll -= if d.x != 0.0 { d.x } else { d.y };
+        ws.mixer_scroll -= ui.input(|i| i.smooth_scroll_delta.x);
     }
     ws.mixer_scroll = ws.mixer_scroll.clamp(0.0, (total - body.width()).max(0.0));
     let buses: Vec<(u64, &Track)> = project
@@ -115,6 +116,8 @@ pub(crate) fn show(
         );
         if name_resp.clicked() {
             ws.selected_track = Some(ti);
+            ws.track_focused = true;
+            ws.selected_pattern_clip = None;
         }
         y += u;
         sp.hline(strip.x_range(), m.snap(y), m.hair(t.line));
@@ -255,6 +258,7 @@ pub(crate) fn show(
             min: -1.0,
             max: 1.0,
             log: false,
+            default: 0.0,
         };
         let pan_id = ui.scope_id().with(("pan", ti));
         if let Some(v) = dial(ui, &sp, m, ws, pan_area, &pan, Some(pan_id)) {

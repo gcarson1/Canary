@@ -688,6 +688,7 @@ impl Devices {
                             min: p.min,
                             max: p.max,
                             log: p.log,
+                            default: p.default,
                         })
                         .collect()
                 }),

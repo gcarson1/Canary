@@ -227,6 +227,7 @@ fn devices() -> Vec<DeviceView> {
         min: 0.0,
         max: 100.0,
         log: false,
+        default: 50.0,
     };
     vec![
         DeviceView {
@@ -264,6 +265,7 @@ fn devices() -> Vec<DeviceView> {
                 min,
                 max,
                 log,
+                default: min,
             })
             .collect(),
             sampler: None,
@@ -298,6 +300,7 @@ fn sampler() -> DeviceView {
                 min,
                 max,
                 log: false,
+                default: min,
             })
             .collect(),
         editor: false,
@@ -329,6 +332,7 @@ fn eq() -> DeviceView {
             min: min.into(),
             max: max.into(),
             log,
+            default: min.into(),
         })
         .collect();
     for (id, v) in [(0, 4.0), (1, 60.0), (9, 2_000.0), (10, 9.0), (16, 0.0)] {
@@ -356,6 +360,7 @@ fn amp() -> DeviceView {
         min: -24.0,
         max: 24.0,
         log: false,
+        default: 0.0,
     };
     DeviceView {
         name: "Amp (NAM)".into(),
@@ -929,6 +934,42 @@ fn tabs_switch_views_and_steps_toggle_notes() {
     // Clicking it again clears it.
     click(&mut h, egui::Pos2::new(492.0, 228.0));
     assert!(h.state().history.project().tracks[2].notes_in(1).is_empty());
+}
+
+#[test]
+fn dragging_across_steps_paints_them_and_delete_keeps_the_track() {
+    let mut h = rig();
+    h.run();
+    click(&mut h, egui::Pos2::new(140.0, 28.0)); // SEQUENCER
+                                                 // Press on step 1 of row 3, sweep to step 4 in one move, release.
+    let (y, from, to) = (
+        228.0,
+        egui::Pos2::new(456.0, 228.0),
+        egui::Pos2::new(564.0, 228.0),
+    );
+    h.hover_at(from);
+    h.run();
+    press(&mut h, from, true);
+    h.run();
+    h.hover_at(egui::Pos2::new(to.x, y));
+    h.run();
+    press(&mut h, to, false);
+    h.run();
+    let steps: Vec<u64> = h.state().history.project().tracks[2]
+        .notes_in(1)
+        .iter()
+        .map(|n| n.start / STEP)
+        .collect();
+    assert_eq!(
+        steps,
+        [0, 1, 2, 3],
+        "a fast swipe paints every cell it crosses"
+    );
+    // The last click was on a step, not a track name: Delete keeps the track.
+    let tracks = h.state().history.project().tracks.len();
+    h.key_press(egui::Key::Delete);
+    h.run();
+    assert_eq!(h.state().history.project().tracks.len(), tracks);
 }
 
 #[test]

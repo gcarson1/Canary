@@ -8,7 +8,7 @@ use daw_core::{automation_value, AutoPoint};
 use daw_core::{Clip, SampleData};
 use daw_dsp::MinMax;
 use daw_project::{Action, ClipRef, PatternClip, Point, Project, Target, Track, STEP};
-use egui::{Align2, Pos2, Rect, Sense, StrokeKind};
+use egui::{Align2, Pos2, Rect, Sense, StrokeKind, Vec2};
 
 use crate::theme::Metrics;
 use crate::{EngineView, Inputs, Request, Snap, Tool, Workspace};
@@ -628,6 +628,8 @@ pub(crate) fn show(
         );
         if resp.clicked() {
             ws.selected_track = Some(i);
+            ws.track_focused = true;
+            ws.selected_pattern_clip = None;
             ws.selected_clip = None;
         }
     }
@@ -677,9 +679,14 @@ pub(crate) fn show(
             ));
             if probe.is_some_and(|p| rect.contains(p)) && !dragging {
                 let title = rect.min.y + 1.125 * u;
+                // Short clips keep a body to grab: edges take at most a quarter each.
+                let edge = edge.min(rect.width() / 4.0);
+                // The fade handles sit where each fade ends, in the title strip.
+                let fin = rect.min.x + (shown.fade_in as f64 / ws.timeline.zoom) as f32;
+                let fout = rect.max.x - (shown.fade_out as f64 / ws.timeline.zoom) as f32;
                 let grab = match probe {
-                    Some(p) if p.y < title && p.x - rect.min.x < 2.0 * edge => Grab::FadeIn,
-                    Some(p) if p.y < title && rect.max.x - p.x < 2.0 * edge => Grab::FadeOut,
+                    Some(p) if p.y < title && (p.x - fin).abs() < 2.0 * edge => Grab::FadeIn,
+                    Some(p) if p.y < title && (fout - p.x).abs() < 2.0 * edge => Grab::FadeOut,
                     Some(p) if p.x - rect.min.x < edge => Grab::Start,
                     Some(p) if rect.max.x - p.x < edge => Grab::End,
                     _ => Grab::Body,
@@ -692,6 +699,22 @@ pub(crate) fn show(
             draw_clip(ws, &clip_p, m, rect, shown, inputs);
             if ws.selected_clip == Some((ti, ci)) {
                 clip_p.rect_stroke(rect, 0.0, m.hair(t.accent_amber), StrokeKind::Inside);
+                // Fade handles: drag these squares (the title strip's corners).
+                let zoom = ws.timeline.zoom;
+                let fin = (shown.fade_in as f64 / zoom) as f32;
+                let fout = (shown.fade_out as f64 / zoom) as f32;
+                let side = 0.375 * u;
+                for x in [
+                    rect.min.x + fin - side / 2.0,
+                    rect.max.x - fout - side / 2.0,
+                ] {
+                    let x = x.clamp(rect.min.x, (rect.max.x - side).max(rect.min.x));
+                    let handle = m.snap_rect(Rect::from_min_size(
+                        Pos2::new(x, rect.min.y),
+                        Vec2::splat(side),
+                    ));
+                    clip_p.rect_filled(handle, 0.0, t.accent_amber);
+                }
             }
         }
     }
@@ -732,6 +755,7 @@ pub(crate) fn show(
                 lane.min.y + m.px..=lane.max.y - m.px,
             ));
             if probe.is_some_and(|p| rect.contains(p)) && !dragging {
+                let edge = edge.min(rect.width() / 4.0);
                 let grab = match probe {
                     Some(p) if p.x - rect.min.x < edge => Grab::Start,
                     Some(p) if rect.max.x - p.x < edge => Grab::End,
@@ -903,6 +927,33 @@ pub(crate) fn show(
             });
         }
     }
+    // A clip dragged against the left or right edge pans the view that way,
+    // faster the further in, so it can travel past what is on screen.
+    if ws.timeline.drag.is_some() || ws.timeline.pattern_drag.is_some() {
+        if let Some(pos) = pointer {
+            let zone = u;
+            let push = if pos.x > lanes.max.x - zone {
+                (pos.x - (lanes.max.x - zone)) / zone
+            } else if pos.x < lanes.min.x + zone {
+                -((lanes.min.x + zone) - pos.x) / zone
+            } else {
+                0.0
+            };
+            if push != 0.0 {
+                let v = &mut ws.timeline;
+                // Up to half a screen per second at 60 frames.
+                let step = f64::from(push.clamp(-1.0, 1.0) * lanes.width() / 120.0) * v.zoom;
+                v.start = (v.start + step).max(0.0);
+                ui.ctx().request_repaint();
+            }
+        }
+    }
+    // Holding Option while dragging places freely, off the grid (as in FL).
+    let drag_snap = if ui.input(|i| i.modifiers.alt) {
+        Snap::Off
+    } else {
+        ws.snap
+    };
     if let (Some(at), Some(pos)) = (pointer_sample, pointer) {
         if let Some(d) = ws.timeline.drag.as_mut() {
             let original = &project.tracks[d.track].clips[d.index];
@@ -912,19 +963,19 @@ pub(crate) fn show(
                 .map(|w| w.audio().clone());
             match d.grab {
                 Grab::Body => {
-                    d.preview.start = snap_f(at - d.offset, ws.snap, project) as u64;
+                    d.preview.start = snap_f(at - d.offset, drag_snap, project) as u64;
                     let lane = ((pos.y - lanes.min.y + ws.timeline.scroll_y) / lane_h).floor();
                     d.to_track = (lane.max(0.0) as usize).min(project.tracks.len() - 1);
                 }
                 Grab::End if d.stretching => {
-                    let to = snap_f(at, ws.snap, project) as u64;
+                    let to = snap_f(at, drag_snap, project) as u64;
                     let min = original.length / 4 + 1;
                     let max = original.length * 4;
                     d.preview.length = to.saturating_sub(original.start).clamp(min, max);
                 }
                 grab => {
                     if let Some(mut c) = audio.as_ref().and_then(|a| core_clip(original, a)) {
-                        let to = snap_f(at, ws.snap, project) as u64;
+                        let to = snap_f(at, drag_snap, project) as u64;
                         let (fin, fout) = (c.fade_in_samples(), c.fade_out_samples());
                         match grab {
                             Grab::Start => c.trim_start(to),
@@ -1029,18 +1080,18 @@ pub(crate) fn show(
             egui::Stroke::NONE,
         ));
     }
-    // Page forward when the playing playhead crosses the right edge; the view is
-    // otherwise free to pan while it plays.
+    // Follow the playing playhead while it was in view: page forward when it
+    // crosses the right edge, and jump with it when a loop wrap or seek takes
+    // it out of view. Panned away from it, the view stays where it was put.
     let v = &mut ws.timeline;
     let right = v.start + f64::from(lanes.width()) * v.zoom;
-    let ph = inputs.engine.playhead;
-    if inputs.engine.playing
-        && v.drag.is_none()
-        && (v.last_playhead as f64) < right
-        && ph as f64 >= right
-    {
-        v.start = ph as f64;
+    let ph = inputs.engine.playhead as f64;
+    let was = v.last_playhead as f64;
+    let in_view = |at: f64| (v.start..right).contains(&at);
+    if inputs.engine.playing && !v.is_dragging() && in_view(was) && !in_view(ph) {
+        v.start = ph;
     }
+    let ph = inputs.engine.playhead;
     v.last_playhead = ph;
 }
 

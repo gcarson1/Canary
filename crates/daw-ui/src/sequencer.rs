@@ -123,11 +123,20 @@ pub(crate) fn show(
         );
         if resp.clicked() {
             ws.selected_track = Some(ti);
+            ws.track_focused = true;
+            ws.selected_pattern_clip = None;
             ws.selected_clip = None;
         }
 
         let notes = id.map_or(&[][..], |id| track.notes_in(id));
-        let mut toggle = None;
+        let mut toggles: Vec<(u64, bool)> = Vec::new();
+        // The pointer's sweep this frame: from where the stroke was last frame.
+        let pointer = ui.input(|i| i.pointer.interact_pos());
+        let sweep = pointer.map(|p| match ws.step_paint {
+            Some((row, _, last)) if row == ti => (last.min(p.x), last.max(p.x)),
+            _ => (p.x, p.x),
+        });
+        let in_row = pointer.is_some_and(|p| (row.min.y..=row.max.y).contains(&p.y));
         for s in 0..steps {
             let rect = m.snap_rect(Rect::from_min_size(
                 Pos2::new(cell_x(s), row.center().y - cell / 2.0),
@@ -155,21 +164,43 @@ pub(crate) fn show(
                     m.hair(t.text),
                 );
             }
-            if resp.clicked() {
-                toggle = Some((s as u64, on));
+            // Press paints: every cell the pointer crosses on this row takes
+            // the state the first one flipped to (right button erases), FL-style.
+            let under = pointer.is_some_and(|p| rect.intersect(rows).contains(p));
+            let (primary, secondary) =
+                ui.input(|i| (i.pointer.primary_pressed(), i.pointer.secondary_pressed()));
+            if under && (primary || secondary) {
+                let x = pointer.map_or(rect.center().x, |p| p.x);
+                ws.step_paint = Some((ti, primary && !on, x));
+            }
+            let crossed =
+                in_row && sweep.is_some_and(|(lo, hi)| rect.max.x >= lo && rect.min.x <= hi);
+            if crossed
+                && ws
+                    .step_paint
+                    .is_some_and(|(row, want, _)| row == ti && want != on)
+            {
+                toggles.push((s as u64, on));
             }
         }
-        if let Some((s, on)) = toggle {
+        if let (Some((row_i, want, _)), Some(p)) = (ws.step_paint, pointer) {
+            if row_i == ti {
+                ws.step_paint = Some((row_i, want, p.x));
+            }
+        }
+        if !toggles.is_empty() {
             let mut next: Vec<Note> = notes.to_vec();
-            if on {
-                next.retain(|n| step_of(n) != s);
-            } else {
-                next.push(Note {
-                    start: s * STEP,
-                    length: STEP,
-                    key: STEP_KEY,
-                    velocity: STEP_VELOCITY,
-                });
+            for (s, on) in toggles {
+                if on {
+                    next.retain(|n| step_of(n) != s);
+                } else {
+                    next.push(Note {
+                        start: s * STEP,
+                        length: STEP,
+                        key: STEP_KEY,
+                        velocity: STEP_VELOCITY,
+                    });
+                }
             }
             ws.selected_track = Some(ti);
             ws.selected_clip = None;

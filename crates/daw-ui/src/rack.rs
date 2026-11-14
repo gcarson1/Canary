@@ -105,6 +105,8 @@ pub struct ParamView {
     pub max: f64,
     /// Turns logarithmically (a frequency, say); needs `min > 0`.
     pub log: bool,
+    /// Where a double-click or Option-click puts it back.
+    pub default: f64,
 }
 
 pub(crate) fn show(
@@ -144,11 +146,11 @@ pub(crate) fn show(
             module_w
         }
     };
-    // Wheel or trackpad scrolls the modules sideways when they do not fit.
+    // Sideways scrolling (trackpad, or Shift+wheel) moves the modules when they
+    // do not fit; the vertical wheel turns the dial under the pointer.
     let total: f32 = inputs.devices.iter().map(width).sum::<f32>() + 8.0 * u;
     if ui.rect_contains_pointer(body) && ws.picker.is_none() {
-        let d = ui.input(|i| i.smooth_scroll_delta);
-        ws.rack_scroll -= if d.x != 0.0 { d.x } else { d.y };
+        ws.rack_scroll -= ui.input(|i| i.smooth_scroll_delta.x);
     }
     ws.rack_scroll = ws.rack_scroll.clamp(0.0, (total - body.width()).max(0.0));
     // Module left edges, in order.
@@ -973,7 +975,29 @@ pub(crate) fn dial(
     );
 
     let hit = Rect::from_center_size(center, Vec2::splat(radius * 2.4));
-    let resp = ui.interact(hit, id?, Sense::drag());
+    let resp = ui.interact(hit, id?, Sense::click_and_drag());
+    let reset = resp.double_clicked() || (resp.clicked() && ui.input(|i| i.modifiers.alt));
+    if reset {
+        let v = param.default.max(param.min).min(param.max);
+        return (v != param.value).then_some(v);
+    }
+    // The wheel turns a hovered dial (the rack does not scroll under it).
+    let wheel = if resp.hovered() {
+        ui.input(|i| i.smooth_scroll_delta.y)
+    } else {
+        0.0
+    };
+    if wheel != 0.0 {
+        let fine = if ui.input(|i| i.modifiers.shift) {
+            0.1
+        } else {
+            1.0
+        };
+        let v = from_frac(to_frac(param.value) + f64::from(wheel) / 400.0 * fine)
+            .max(param.min)
+            .min(param.max);
+        return (v != param.value).then_some(v);
+    }
     if resp.dragged() {
         let dy = f64::from(-resp.drag_delta().y);
         // Full range over 200 points; hold shift for fine control.

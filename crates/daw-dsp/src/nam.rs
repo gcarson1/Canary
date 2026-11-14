@@ -10,7 +10,6 @@
 //! activations into a head that feeds the next array.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use rtrb::{Consumer, Producer, RingBuffer};
 use serde::Deserialize;
@@ -281,6 +280,17 @@ fn ring_len(dilation: usize, kernel: usize) -> usize {
     (dilation * (kernel - 1) + 1).next_power_of_two()
 }
 
+/// Shape limits well above any real capture (dilations to 512, kernel 3, 16
+/// channels), so a corrupt file cannot ask for absurd memory or prewarm time.
+const MAX_DILATION: usize = 4096;
+const MAX_KERNEL: usize = 32;
+const MAX_CHANNELS: usize = 64;
+/// Total receptive field in samples (a standard model's is about 4,100);
+/// bounds the prewarm run.
+const MAX_FIELD: usize = 1 << 16;
+/// Larger than any real capture (a standard model is about 300 KB).
+pub const MAX_FILE_BYTES: u64 = 32 << 20;
+
 impl Model {
     /// Parses a `.nam` file's JSON. Main thread: allocates.
     pub fn from_json(text: &str) -> Result<Self, String> {
@@ -296,6 +306,7 @@ impl Model {
         }
         let mut w = Weights(file.weights.iter());
         let mut arrays = Vec::new();
+        let mut field = 0usize;
         for (i, a) in file.config.layers.iter().enumerate() {
             let ch = a.channels;
             if a.gated == Some(true) {
@@ -304,8 +315,21 @@ impl Model {
             if a.bottleneck.is_some_and(|b| b != ch) {
                 return Err("models with a bottleneck are not supported yet".into());
             }
-            if a.condition_size != 1 || a.kernel_size == 0 || ch == 0 || a.dilations.is_empty() {
+            let sizes_ok = (1..=MAX_KERNEL).contains(&a.kernel_size)
+                && (1..=MAX_CHANNELS).contains(&ch)
+                && a.input_size <= MAX_CHANNELS
+                && a.dilations.iter().all(|d| (1..=MAX_DILATION).contains(d));
+            if a.condition_size != 1 || !sizes_ok || a.dilations.is_empty() {
                 return Err(format!("layer array {i} has an unsupported shape"));
+            }
+            // Bounded by the checks above, so this cannot overflow.
+            field += a
+                .dilations
+                .iter()
+                .map(|d| d * (a.kernel_size - 1))
+                .sum::<usize>();
+            if field > MAX_FIELD {
+                return Err("the model's receptive field is too long".into());
             }
             let activation = match &a.activation {
                 serde_json::Value::String(s) => Activation::parse(s)?,
@@ -320,6 +344,9 @@ impl Model {
                 (None, Some(n)) => (n, a.head_bias.unwrap_or(false)),
                 (None, None) => return Err(format!("layer array {i} has no head")),
             };
+            if !(1..=MAX_CHANNELS).contains(&head_size) {
+                return Err(format!("layer array {i} has an unsupported head size"));
+            }
             if let Some(prev) = arrays.last() {
                 let prev: &LayerArray = prev;
                 if prev.channels != a.input_size || prev.head_size != ch {
@@ -331,9 +358,6 @@ impl Model {
             let rechannel = w.take(ch * a.input_size)?;
             let mut layers = Vec::new();
             for &dilation in &a.dilations {
-                if dilation == 0 {
-                    return Err("a dilation of 0".into());
-                }
                 let k = a.kernel_size;
                 // The file stores conv weights out, in, tap; keep them tap-major.
                 let raw = w.take(ch * ch * k)?;
@@ -536,7 +560,7 @@ impl Default for NamAmp {
                 path: None,
                 error: None,
                 trained_rate: None,
-                _keep: Arc::new(()),
+                sample_rate: 48_000.0,
             }),
         }
     }
@@ -549,7 +573,8 @@ pub struct NamLoader {
     path: Option<PathBuf>,
     error: Option<String>,
     trained_rate: Option<f32>,
-    _keep: Arc<()>,
+    /// The rate the amp runs at; a capture trained at another sounds off.
+    sample_rate: f32,
 }
 
 impl FileLoader for NamLoader {
@@ -558,8 +583,15 @@ impl FileLoader for NamLoader {
         while self.from_audio.pop().is_ok() {}
         // Remembered even when it fails, so a project keeps pointing at it.
         self.path = Some(path.to_path_buf());
-        let result = std::fs::read_to_string(path)
+        let result = std::fs::metadata(path)
             .map_err(|e| format!("cannot read {}: {e}", path.display()))
+            .and_then(|m| {
+                if m.len() > MAX_FILE_BYTES {
+                    return Err(format!("{} is too large for a capture", path.display()));
+                }
+                std::fs::read_to_string(path)
+                    .map_err(|e| format!("cannot read {}: {e}", path.display()))
+            })
             .and_then(|text| Model::from_json(&text))
             .and_then(|model| {
                 self.trained_rate = model.sample_rate;
@@ -568,6 +600,18 @@ impl FileLoader for NamLoader {
                     .map_err(|_| "busy: try again in a moment".to_string())
             });
         self.error = result.as_ref().err().cloned();
+        // Loaded, but say why it may sound wrong (no resampling yet).
+        if let Some(rate) = self
+            .trained_rate
+            .filter(|r| (r - self.sample_rate).abs() > 1.0)
+        {
+            if result.is_ok() {
+                self.error = Some(format!(
+                    "trained at {} Hz, project is {} Hz: tone will be off",
+                    rate, self.sample_rate
+                ));
+            }
+        }
         result
     }
     fn file(&self) -> Option<&Path> {
@@ -592,7 +636,11 @@ impl Effect for NamAmp {
             _ => {}
         }
     }
-    fn set_sample_rate(&mut self, _sample_rate: f32) {}
+    fn set_sample_rate(&mut self, sample_rate: f32) {
+        if let Some(l) = self.loader.as_mut() {
+            l.sample_rate = sample_rate;
+        }
+    }
     fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
         if let Some(new) = self.incoming.as_mut().and_then(|c| c.pop().ok()) {
             if let (Some(old), Some(back)) = (self.model.replace(new), self.retired.as_mut()) {
@@ -649,6 +697,21 @@ mod tests {
             "weights":[{}]}}"#,
             weights.join(",")
         )
+    }
+
+    #[test]
+    fn hostile_shapes_are_rejected_without_allocating() {
+        let ok = json(|_| 0.1);
+        for (from, to) in [
+            ("\"dilations\":[1,2]", "\"dilations\":[1099511627776,2]"),
+            ("\"dilations\":[1,2]", "\"dilations\":[4096,4096,4096,4096,4096,4096,4096,4096,4096,4096,4096,4096,4096,4096,4096,4096,4096]"),
+            ("\"channels\":2,\"head_size\":2", "\"channels\":4294967296,\"head_size\":2"),
+            ("\"head_size\":2,\"kernel_size\":2", "\"head_size\":2,\"kernel_size\":4611686018427387904"),
+            ("\"head_size\":1,", "\"head_size\":100000,"),
+        ] {
+            assert!(ok.contains(from), "{from}");
+            assert!(Model::from_json(&ok.replacen(from, to, 1)).is_err(), "{to}");
+        }
     }
 
     #[test]

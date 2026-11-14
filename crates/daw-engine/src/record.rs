@@ -9,10 +9,15 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::SampleFormat;
 use rtrb::{Consumer, Producer, RingBuffer};
 
+use crate::stream::{pick_config, StreamFaults};
+
 /// Seconds of input the ring holds while the disk writer catches up.
 const BUFFER_SECONDS: usize = 2;
 /// How long the disk writer sleeps when the ring is empty.
 const WRITER_POLL: Duration = Duration::from_millis(5);
+/// 32-bit float samples a WAV holds: its sizes are u32 byte counts (4 GiB),
+/// less room for the header. About 3 hours of stereo at 48 kHz.
+const MAX_WAV_SAMPLES: u64 = (u32::MAX as u64 - (1 << 20)) / 4;
 
 /// A finished recording on disk.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,6 +160,8 @@ pub struct Recorder {
     shared: Arc<Shared>,
     spec: hound::WavSpec,
     writer: Option<Writer>,
+    /// Samples a take may hold before it ends (`MAX_WAV_SAMPLES`).
+    limit: u64,
 }
 
 /// Both ends of a recorder for `channels`-channel input at `sample_rate`. `playhead`
@@ -185,6 +192,7 @@ pub fn recorder(
             shared: shared.clone(),
             spec,
             writer: None,
+            limit: MAX_WAV_SAMPLES,
         },
         RecordInput {
             queue: tx,
@@ -199,6 +207,12 @@ pub fn recorder(
 impl Recorder {
     pub fn is_recording(&self) -> bool {
         self.writer.is_some()
+    }
+
+    /// The writer stopped a running take by itself (WAV size limit or a write
+    /// error): `stop` it to get the take and the reason.
+    pub fn writer_ended(&self) -> bool {
+        self.writer.is_some() && !self.shared.armed.load(Ordering::Acquire)
     }
 
     /// Creates the WAV at `path` and starts capturing into it.
@@ -225,6 +239,7 @@ impl Recorder {
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = stop.clone();
         let shared = self.shared.clone();
+        let (limit, channels) = (self.limit, usize::from(self.spec.channels));
         let thread = thread::Builder::new()
             .name("canary-disk-writer".into())
             .spawn(move || {
@@ -233,14 +248,26 @@ impl Recorder {
                     let last = stopping.load(Ordering::Acquire);
                     let chunk = queue.read_chunk(queue.slots()).expect("slots are readable");
                     let (a, b) = chunk.as_slices();
-                    if let Err(e) = a.iter().chain(b).try_for_each(|&s| wav.write_sample(s)) {
+                    // Whole frames up to the WAV size limit; past it the header
+                    // would wrap and lie about the length.
+                    let room = (limit - written) as usize;
+                    let n = chunk.len().min(room - room % channels);
+                    let full = n < chunk.len();
+                    let samples = a.iter().chain(b).take(n);
+                    if let Err(e) = samples.copied().try_for_each(|s| wav.write_sample(s)) {
                         // Stop filling a ring nobody drains. hound finalizes the
                         // header on drop, so what was written stays readable.
                         shared.armed.store(false, Ordering::Release);
                         break Err(e);
                     }
-                    written += chunk.len() as u64;
+                    written += n as u64;
                     chunk.commit_all();
+                    if full {
+                        shared.armed.store(false, Ordering::Release);
+                        break wav.finalize().and(Err(hound::Error::IoError(
+                            std::io::Error::other("the take reached the 4 GB WAV size limit"),
+                        )));
+                    }
                     if last {
                         break wav.finalize();
                     }
@@ -328,17 +355,21 @@ impl From<cpal::Error> for InputError {
 }
 
 /// Opens the default input device (CoreAudio on macOS) next to the output stream
-/// and feeds a recorder. `sample_rate` is the output's; the input must match it.
-/// Capture stops when the returned `Stream` is dropped. On macOS the first call
-/// asks the user for microphone access.
+/// and feeds a recorder. `sample_rate` is the output's; the input is asked for
+/// it and must run at it. Stream errors go to `faults`. Capture stops when the
+/// returned `Stream` is dropped. On macOS the first call asks the user for
+/// microphone access.
 pub fn start_input(
     sample_rate: u32,
     playhead: Arc<AtomicU64>,
+    faults: StreamFaults,
 ) -> Result<(Recorder, cpal::Stream, cpal::StreamConfig), InputError> {
     let device = cpal::default_host()
         .default_input_device()
         .ok_or(InputError::NoDevice)?;
-    let supported = device.default_input_config()?;
+    let default = device.default_input_config()?;
+    let ranges: Vec<_> = device.supported_input_configs()?.collect();
+    let supported = pick_config(default, ranges, Some(sample_rate));
     if supported.sample_format() != SampleFormat::F32 {
         return Err(InputError::UnsupportedFormat(supported.sample_format()));
     }
@@ -353,7 +384,7 @@ pub fn start_input(
     let stream = device.build_input_stream(
         config,
         move |data: &[f32], _| input.push(data),
-        |e| eprintln!("input stream error: {e}"),
+        move |e| faults.record(&e),
         None,
     )?;
     stream.play()?;
@@ -400,6 +431,30 @@ mod tests {
         assert_eq!(samples, audio);
         std::fs::remove_file(&take.path).unwrap();
         assert!(matches!(rec.stop(), Err(RecordError::NotRecording)));
+    }
+
+    #[test]
+    fn a_take_ends_cleanly_at_the_wav_size_limit() {
+        let (mut rec, mut input) = recorder(2, 48_000, Arc::default());
+        rec.limit = 1_001; // whole frames only: 500 of them
+        let path = temp_wav("limit");
+        rec.start(&path).unwrap();
+        for _ in 0..10 {
+            input.push(&[0.5; 256]);
+        }
+        // The writer ends the take itself once full; the input stops queueing.
+        while !rec.writer_ended() {
+            thread::sleep(WRITER_POLL);
+        }
+        let Err(RecordError::Wav {
+            take: Some(take), ..
+        }) = rec.stop()
+        else {
+            panic!("a full take reports why it ended");
+        };
+        assert_eq!(take.frames, 500);
+        assert_eq!(read(&take.path).1.len(), 1_000, "a valid, finalized file");
+        std::fs::remove_file(&take.path).unwrap();
     }
 
     #[test]

@@ -126,6 +126,10 @@ struct App {
     recorder: Option<(Recorder, cpal::Stream)>,
     /// MIDI being recorded into a pattern.
     midi_take: Option<take::MidiTake>,
+    /// Quit was asked mid-take: close once the take is in the project.
+    quitting: bool,
+    /// Errors the audio streams reported.
+    faults: daw_engine::StreamFaults,
     /// A mix export in progress.
     export: Option<export::Export>,
     /// The preview node until the first plan inserts it, and its control.
@@ -192,8 +196,24 @@ impl App {
         let ws = Workspace::default();
         theme::apply(&cc.egui_ctx, &ws.theme);
 
+        let template = samples_dir.join(TEMPLATE);
+        let saved = if project_path.exists() {
+            Some(
+                History::load(&project_path)
+                    .map_err(|e| format!("{}: {e}", project_path.display()))?,
+            )
+        } else {
+            None
+        };
+        // Ask the device for a saved project's rate, so it opens on a device
+        // that offers it whatever rate the device was left at.
+        let wanted = saved
+            .as_ref()
+            .filter(|h| !h.project().tracks.is_empty())
+            .map(|h| h.project().sample_rate);
+        let faults = daw_engine::StreamFaults::default();
         let (mut engine, output, config) =
-            daw_engine::start_output(4096).map_err(|e| e.to_string())?;
+            daw_engine::start_output_at(4096, wanted, faults.clone()).map_err(|e| e.to_string())?;
         let midi = engine.midi.take().map(|m| Arc::new(Mutex::new(m)));
         // The first MIDI input, if any; a missing or busy port only loses the keyboard.
         let midi_in = midi.clone().and_then(|m| {
@@ -201,9 +221,8 @@ impl App {
                 .inspect_err(|e| eprintln!("MIDI input: {e}"))
                 .ok()
         });
-        let template = samples_dir.join(TEMPLATE);
-        let mut history = if project_path.exists() {
-            History::load(&project_path).map_err(|e| format!("{}: {e}", project_path.display()))?
+        let mut history = if let Some(saved) = saved {
+            saved
         } else if template.exists() {
             // A new project starts from the saved template (Cmd+Shift+T), if it
             // was made at the device's rate.
@@ -275,6 +294,8 @@ impl App {
             devices: Devices::scan(),
             recorder: None,
             midi_take: None,
+            quitting: false,
+            faults: faults.clone(),
             export: None,
             last_autosave: Instant::now(),
             autosaved: None,
@@ -463,6 +484,39 @@ impl App {
                     self.error(format!("could not load {}: {e}", done.path.display()));
                 }
             }
+        }
+    }
+
+    /// An audio or MIDI take is running.
+    fn taking(&self) -> bool {
+        self.midi_take.is_some()
+            || self
+                .recorder
+                .as_ref()
+                .is_some_and(|(r, _)| r.is_recording())
+    }
+
+    /// Shows what the audio streams reported; a lost device ends any take so
+    /// what was captured is kept.
+    fn check_streams(&mut self) {
+        // A take the writer ended by itself (size limit, disk error) is placed now.
+        if self
+            .recorder
+            .as_ref()
+            .is_some_and(|(r, _)| r.writer_ended())
+        {
+            self.toggle_record();
+        }
+        match self.faults.take() {
+            Some(daw_engine::Fault::Lost) => {
+                if self.taking() {
+                    self.toggle_record();
+                }
+                self.error("AUDIO DEVICE LOST · SAVE AND RESTART CANARY".into());
+            }
+            Some(daw_engine::Fault::Dropout) => self.error("AUDIO DROPOUT".into()),
+            Some(daw_engine::Fault::Other) => self.error("AUDIO DEVICE ERROR".into()),
+            None => {}
         }
     }
 
@@ -1481,7 +1535,11 @@ impl App {
             return self.toggle_midi_take();
         }
         if self.recorder.is_none() {
-            match daw_engine::start_input(self.view.sample_rate, self.engine.playhead_clock()) {
+            match daw_engine::start_input(
+                self.view.sample_rate,
+                self.engine.playhead_clock(),
+                self.faults.clone(),
+            ) {
                 Ok((recorder, stream, _)) => self.recorder = Some((recorder, stream)),
                 Err(e) => return self.error(format!("cannot record: {e}")),
             }
@@ -1653,6 +1711,7 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         self.receive_loads();
         self.receive_stretches();
+        self.check_streams();
         self.preview.collect();
         while let Ok((path, audio)) = self.preview_rx.try_recv() {
             // Only the latest file asked for; earlier ones just drop.
@@ -1685,8 +1744,27 @@ impl eframe::App for App {
         if ctx.input(|i| i.viewport().close_requested()) && self.export.is_some() {
             self.abort_export("EXPORT ABORTED".into(), false);
         }
+        // Quitting mid-take ends the take first and closes once its clip or notes
+        // are in the project, so the save below keeps them.
+        let taking = self.taking();
+        let placing = self.quitting && !self.pending.is_empty();
+        if ctx.input(|i| i.viewport().close_requested()) && (taking || placing) {
+            // A second quit while the take is still loading waits too.
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            if taking {
+                self.toggle_record();
+            }
+            self.quitting = true;
+        } else if self.quitting && self.pending.is_empty() {
+            self.quitting = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
         // Quitting saves edits; if that fails the window stays open with the error.
-        if ctx.input(|i| i.viewport().close_requested()) && self.history.is_dirty() && !self.save()
+        if ctx.input(|i| i.viewport().close_requested())
+            && !taking
+            && !placing
+            && self.history.is_dirty()
+            && !self.save()
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }

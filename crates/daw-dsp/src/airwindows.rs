@@ -225,7 +225,7 @@ struct TapeSide {
     last: f64,
 }
 
-const FLUTTER_LEN: usize = 501;
+const FLUTTER_LEN: usize = 1001;
 
 /// ToTape6: tape saturation with soft high rolloff, head bump, flutter and a
 /// soft clip. INPUT and OUTPUT are ±12 dB around the middle; like the original

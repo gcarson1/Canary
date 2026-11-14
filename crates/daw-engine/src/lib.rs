@@ -5,16 +5,18 @@ mod midi;
 mod output;
 mod peaks;
 mod record;
+mod stream;
 mod transport;
 
 pub use load::{load_audio, resample, write_wav, LoadError};
 pub use midi::{connect_midi, midi_input_ports, MidiConnection, MidiError, MidiSender};
-pub use output::{start_output, OutputError};
+pub use output::{start_output, start_output_at, OutputError};
 pub use peaks::cached_waveform;
 pub use record::{
     bounce_tap, recorder, start_input, BounceTap, InputError, RecordError, RecordInput, Recorder,
     Take,
 };
+pub use stream::{Fault, StreamFaults};
 pub use transport::Transport;
 
 use std::fmt;
@@ -238,23 +240,16 @@ impl AudioEngine {
                     midi = later;
                     let count_in = self.transport.count_in();
                     let rolling = self.transport.is_rolling();
+                    let looping = self.transport.wrapped_loop();
+                    let latency = u64::from(plan.latency());
                     if rolling {
-                        // Heard against the timeline one callback earlier.
-                        let back = total as u64;
-                        let looping = self.transport.loop_range();
+                        // Played one callback earlier, against a mix that leaves
+                        // the plan `latency` behind the transport (PDC).
+                        let back = total as u64 + latency;
                         for e in now.iter() {
                             let at = self.transport.playhead() + u64::from(e.sample_offset);
-                            // Just after a loop wrap, what was heard is the end of the pass.
-                            let heard = match looping {
-                                Some((start, end))
-                                    if at >= start && at - start < back && end - start > back =>
-                                {
-                                    end - (back - (at - start))
-                                }
-                                _ => at.saturating_sub(back),
-                            };
                             let _ = self.midi_log.push(SeqEvent {
-                                at: heard,
+                                at: heard_at(at, back, looping).max(0) as u64,
                                 data: e.data,
                             });
                         }
@@ -272,15 +267,24 @@ impl AudioEngine {
                     );
                     let master = plan.output();
                     for (frame, out) in chunk.chunks_exact_mut(channels).enumerate() {
+                        if let ([mono], [l, r, ..]) = (&mut *out, master) {
+                            // A mono device hears both sides, not just the left.
+                            *mono = 0.5 * (l[frame] + r[frame]);
+                            continue;
+                        }
                         for (ch, sample) in out.iter_mut().enumerate() {
                             *sample = master.get(ch).map_or(0.0, |m| m[frame]);
                         }
                     }
                     measure(chunk, channels, &mut peak, &mut sum);
-                    // The metronome: count-in beats, or the plan's beats while rolling.
+                    // The metronome: count-in beats, or the plan's beats while
+                    // rolling, clicked on the timeline position being heard.
                     let clicks = plan.clicks();
                     let playhead = self.transport.playhead();
-                    let mut next = clicks.partition_point(|c| c.at < playhead);
+                    // Signed: right after Play at 0 the mix is still pre-roll.
+                    let mut pos = heard_at(playhead, latency, looping);
+                    let first = |pos: i64| clicks.partition_point(|c| (c.at as i64) < pos);
+                    let mut next = first(pos);
                     let metronome = rolling && self.transport.metronome();
                     for (f, out) in chunk.chunks_exact_mut(channels).enumerate() {
                         let f = f as u64;
@@ -292,12 +296,21 @@ impl AudioEngine {
                                 self.click.trigger(accent, self.sample_rate);
                             }
                         } else if metronome {
-                            while clicks.get(next).is_some_and(|c| c.at <= playhead + f) {
-                                if clicks[next].at == playhead + f {
+                            while clicks.get(next).is_some_and(|c| c.at as i64 <= pos) {
+                                if clicks[next].at as i64 == pos {
                                     self.click
                                         .trigger(clicks[next].data[0] == 1, self.sample_rate);
                                 }
                                 next += 1;
+                            }
+                        }
+                        pos += 1;
+                        // The heard position wraps `latency` after the transport does.
+                        if let Some((start, end)) = self.transport.loop_range() {
+                            let inside = (start..end).contains(&(playhead + f));
+                            if pos == end as i64 && inside && end - start > latency {
+                                pos = start as i64;
+                                next = first(pos);
                             }
                         }
                         let s = self.click.tick();
@@ -325,6 +338,19 @@ impl AudioEngine {
             playing: self.transport.is_playing(),
         });
         let _ = self.telemetry.push(levels(output, channels));
+    }
+}
+
+/// The timeline sample heard at transport position `at` when the sound lags it
+/// by `back` samples (negative: pre-roll before 0). `wrapped` is the loop once
+/// the transport has wrapped in it: just after its start, what is heard is the
+/// end of the last pass.
+fn heard_at(at: u64, back: u64, wrapped: Option<(u64, u64)>) -> i64 {
+    match wrapped {
+        Some((start, end)) if at >= start && at - start < back && end - start > back => {
+            (end - (back - (at - start))) as i64
+        }
+        _ => at as i64 - back as i64,
     }
 }
 
@@ -1147,6 +1173,94 @@ mod tests {
         }
 
         fn reset(&mut self) {}
+    }
+
+    /// Silence that reports its field as latency in samples.
+    struct Late(u32);
+
+    impl AudioNode for Late {
+        fn process(
+            &mut self,
+            _inputs: &[&[f32]],
+            outputs: &mut [&mut [f32]],
+            _midi_in: &[daw_core::MidiEvent],
+            _midi_out: &mut Vec<daw_core::MidiEvent>,
+            _context: &ProcessContext,
+        ) {
+            outputs.iter_mut().for_each(|o| o.fill(0.0));
+        }
+        fn reset(&mut self) {}
+        fn latency_samples(&self) -> u32 {
+            self.0
+        }
+    }
+
+    #[test]
+    fn the_click_lines_up_with_the_compensated_mix() {
+        use daw_core::SeqEvent;
+        let (mut handle, mut audio) = engine(16, 48_000.0);
+        let mut plan = ExecutionPlan::new(64);
+        plan.insert(NodeId(1), Box::new(Late(100)));
+        plan.add(NodeId(1), vec![], 1).unwrap();
+        plan.set_clicks(vec![SeqEvent {
+            at: 2_010,
+            data: [1, 0, 0],
+        }]);
+        handle.send_plan(Box::new(plan)).unwrap();
+        for c in [
+            Command::Seek(2_000),
+            Command::SetMetronome(true),
+            Command::Play,
+        ] {
+            handle.commands.push(c).unwrap();
+        }
+        let mut block = vec![0.0; 256];
+        assert_no_alloc(|| audio.process(&mut block, 1));
+        // The mix is 100 samples behind the transport, so is the click.
+        assert!(block[..110].iter().all(|&s| s == 0.0), "not early");
+        assert!(block[111] != 0.0, "on the beat as heard");
+    }
+
+    #[test]
+    fn a_click_late_in_a_loop_sounds_after_the_wrap_as_heard() {
+        use daw_core::SeqEvent;
+        let (mut handle, mut audio) = engine(16, 48_000.0);
+        let mut plan = ExecutionPlan::new(64);
+        plan.insert(NodeId(1), Box::new(Late(100)));
+        plan.add(NodeId(1), vec![], 1).unwrap();
+        plan.set_clicks(vec![SeqEvent {
+            at: 950,
+            data: [1, 0, 0],
+        }]);
+        handle.send_plan(Box::new(plan)).unwrap();
+        for c in [
+            Command::SetLoop(Some((0, 1_000))),
+            Command::SetMetronome(true),
+            Command::Play,
+        ] {
+            handle.commands.push(c).unwrap();
+        }
+        // First pass: the mix is heard 100 behind, so beat 950 is not yet heard.
+        let mut first = vec![0.0; 1_000];
+        audio.process(&mut first, 1);
+        assert!(first.iter().all(|&s| s == 0.0));
+        // After the wrap the tail of the pass plays: 950 is heard at frame 50.
+        let mut block = vec![0.0; 256];
+        assert_no_alloc(|| audio.process(&mut block, 1));
+        assert!(block[..50].iter().all(|&s| s == 0.0) && block[51] != 0.0);
+    }
+
+    #[test]
+    fn a_mono_device_hears_both_sides() {
+        let (mut handle, mut audio) = engine(16, 48_000.0);
+        let mut plan = ExecutionPlan::new(64);
+        plan.insert(NodeId(1), Box::new(Const));
+        plan.add(NodeId(1), vec![], 2).unwrap();
+        handle.send_plan(Box::new(plan)).unwrap();
+        let mut block = vec![1.0; 64];
+        audio.process(&mut block, 1);
+        // Left 0.25 and right -0.25 average out; the left alone would be 0.25.
+        assert!(block.iter().all(|&s| s == 0.0));
     }
 
     #[test]

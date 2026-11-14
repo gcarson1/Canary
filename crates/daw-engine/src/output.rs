@@ -3,6 +3,7 @@ use std::fmt;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::SampleFormat;
 
+use crate::stream::{pick_config, StreamFaults};
 use crate::{engine, EngineHandle};
 
 #[derive(Debug)]
@@ -37,10 +38,26 @@ impl From<cpal::Error> for OutputError {
 pub fn start_output(
     queue_capacity: usize,
 ) -> Result<(EngineHandle, cpal::Stream, cpal::StreamConfig), OutputError> {
+    start_output_at(queue_capacity, None, StreamFaults::default())
+}
+
+/// `start_output`, asking the device for `rate` (a project's) if it offers it,
+/// and reporting stream errors to `faults`.
+pub fn start_output_at(
+    queue_capacity: usize,
+    rate: Option<u32>,
+    faults: StreamFaults,
+) -> Result<(EngineHandle, cpal::Stream, cpal::StreamConfig), OutputError> {
     let device = cpal::default_host()
         .default_output_device()
         .ok_or(OutputError::NoDevice)?;
-    let supported = device.default_output_config()?;
+    let default = device.default_output_config()?;
+    let ranges = if rate.is_some() {
+        device.supported_output_configs()?.collect()
+    } else {
+        Vec::new()
+    };
+    let supported = pick_config(default, ranges, rate);
     if supported.sample_format() != SampleFormat::F32 {
         return Err(OutputError::UnsupportedFormat(supported.sample_format()));
     }
@@ -51,8 +68,8 @@ pub fn start_output(
     let stream = device.build_output_stream(
         config,
         move |data: &mut [f32], _| audio.process(data, channels),
-        // Called off the render callback, so printing here is allowed.
-        |e| eprintln!("audio stream error: {e}"),
+        // May run on the render thread (xruns): only flags the fault.
+        move |e| faults.record(&e),
         None,
     )?;
     stream.play()?;

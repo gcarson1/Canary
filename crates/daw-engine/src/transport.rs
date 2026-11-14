@@ -12,6 +12,10 @@ pub struct Transport {
     looping: Option<(u64, u64)>,
     metronome: bool,
     count_in: Option<CountIn>,
+    /// The playhead has wrapped at the loop end since the last seek, stop or
+    /// loop change: what is heard just after the loop start is the end of the
+    /// last pass (PDC lag), not what came before the loop.
+    wrapped: bool,
 }
 
 /// A count-in under way: the playhead holds while it runs.
@@ -34,6 +38,7 @@ impl Default for Transport {
             looping: None,
             metronome: false,
             count_in: None,
+            wrapped: false,
         }
     }
 }
@@ -64,6 +69,7 @@ impl Transport {
             Command::Stop => {
                 self.playing = false;
                 self.count_in = None;
+                self.wrapped = false;
             }
             Command::SetMetronome(on) => self.metronome = on,
             Command::CountIn {
@@ -81,13 +87,17 @@ impl Transport {
                     });
                 }
             }
-            Command::Seek(sample) => self.playhead = sample,
+            Command::Seek(sample) => {
+                self.playhead = sample;
+                self.wrapped = false;
+            }
             Command::SetTempo(bpm) if bpm.is_finite() && bpm > 0.0 => self.bpm = bpm,
             Command::SetTimeSignature(ts) if ts.numerator > 0 && ts.denominator > 0 => {
                 self.time_signature = ts
             }
             Command::SetLoop(range) => {
                 self.looping = range.filter(|(start, end)| start < end);
+                self.wrapped = false;
             }
             Command::SetTempo(_) | Command::SetTimeSignature(_) => {}
         }
@@ -109,6 +119,11 @@ impl Transport {
 
     pub fn loop_range(&self) -> Option<(u64, u64)> {
         self.looping
+    }
+
+    /// The loop range, once the playhead has wrapped in it at least once.
+    pub fn wrapped_loop(&self) -> Option<(u64, u64)> {
+        self.looping.filter(|_| self.wrapped)
     }
 
     /// Frames until the playhead wraps to the loop start, if it will: render no
@@ -140,6 +155,7 @@ impl Transport {
         if let Some((start, end)) = self.looping {
             if before < end && self.playhead >= end {
                 self.playhead = start + (self.playhead - end) % (end - start);
+                self.wrapped = true;
             }
         }
     }

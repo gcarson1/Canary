@@ -1,7 +1,8 @@
 //! Real-time pitch: a shifter (two crossfaded read heads sliding through a
 //! delay line) and pitch correction (YIN pitch detection snapping the voice to
-//! a key and scale through the same shifter). Time-domain, so no latency and
-//! cheap; best on single voices.
+//! a key and scale through the same shifter). Time-domain and cheap; best on
+//! single voices. The heads center on a fixed delay (half the longest grain),
+//! reported as latency so PDC lines the shifted signal up.
 
 use crate::effects::{Effect, ParamSpec};
 
@@ -15,7 +16,15 @@ struct Shifter {
     /// Where the first head is in its grain, 0..1.
     phase: f32,
     grain: f32,
+    /// The heads' average delay, whatever the grain: the latency.
+    center: f32,
+    /// How far the output has crossfaded to one plain read at `center`, used
+    /// while there is no shift so two heads never comb.
+    rest: f32,
 }
+
+/// Samples the crossfade to and from the plain read takes (about 20 ms).
+const REST_FADE: f32 = 1024.0;
 
 /// The shortest delay a head reads at, so it never reads ahead of the writer.
 const MIN_DELAY: f32 = 4.0;
@@ -25,12 +34,13 @@ impl Shifter {
         Self {
             line: vec![0.0; max_grain + 16].into_boxed_slice(),
             grain: max_grain as f32,
+            center: MIN_DELAY + (max_grain / 2) as f32,
             ..Self::default()
         }
     }
 
     fn set_grain(&mut self, samples: f32) {
-        self.grain = samples.clamp(64.0, (self.line.len() - 12) as f32);
+        self.grain = samples.clamp(64.0, (self.line.len() - 16) as f32);
     }
 
     fn read(&self, delay: f32) -> f32 {
@@ -43,12 +53,29 @@ impl Shifter {
     fn tick(&mut self, x: f32, ratio: f32) -> f32 {
         let n = self.line.len();
         self.line[self.write] = x;
-        // Raising pitch shortens the delay each sample; lowering lengthens it.
-        self.phase = (self.phase + (1.0 - ratio) / self.grain).rem_euclid(1.0);
+        let still = (1.0 - ratio).abs() < 1e-4;
+        if still {
+            self.rest = (self.rest + 1.0 / REST_FADE).min(1.0);
+            if self.rest == 1.0 {
+                // Head one at full gain on the center: the plain read, so
+                // shifting again later starts without a jump.
+                self.phase = 0.5;
+            }
+        } else {
+            self.rest = (self.rest - 1.0 / REST_FADE).max(0.0);
+            // Raising pitch shortens the delay each sample; lowering lengthens it.
+            self.phase = (self.phase + (1.0 - ratio) / self.grain).rem_euclid(1.0);
+        }
         let other = (self.phase + 0.5) % 1.0;
         let tri = |p: f32| 1.0 - (2.0 * p - 1.0).abs();
-        let y = self.read(MIN_DELAY + self.phase * self.grain) * tri(self.phase)
-            + self.read(MIN_DELAY + other * self.grain) * tri(other);
+        let delay = |p: f32| self.center + (p - 0.5) * self.grain;
+        let heads =
+            self.read(delay(self.phase)) * tri(self.phase) + self.read(delay(other)) * tri(other);
+        let y = if self.rest > 0.0 {
+            self.rest * self.read(self.center) + (1.0 - self.rest) * heads
+        } else {
+            heads
+        };
         self.write = (self.write + 1) % n;
         y
     }
@@ -130,6 +157,9 @@ impl Effect for PitchShift {
     }
     fn reset(&mut self) {
         self.sides.iter_mut().for_each(Shifter::clear);
+    }
+    fn latency(&self) -> u32 {
+        self.sides[0].center as u32
     }
 }
 
@@ -351,6 +381,9 @@ impl Effect for PitchCorrect {
         self.shift = 0.0;
         self.target = 0.0;
     }
+    fn latency(&self) -> u32 {
+        self.sides[0].center as u32
+    }
 }
 
 #[cfg(test)]
@@ -414,6 +447,45 @@ mod tests {
                 "{semi}: {got} Hz, want {want}"
             );
         }
+    }
+
+    #[test]
+    fn back_at_zero_it_is_a_clean_delay_of_its_latency() {
+        let mut fx = effect("canary.pitch", SR).unwrap();
+        let latency = fx.latency() as usize;
+        assert!(latency > 0);
+        // Shifted for a while, then back to 0: the heads must settle on one
+        // delay, not stay split (a comb) wherever they stopped.
+        let noise: Vec<f32> = (0..240_000u32)
+            .map(|i| ((i.wrapping_mul(2_654_435_761) >> 8) as f32 / 8_388_608.0) - 1.0)
+            .collect();
+        let (mut l, mut r) = (noise.clone(), noise.clone());
+        fx.set_param(0, 3.0);
+        fx.process(&mut l[..20_000], &mut r[..20_000]);
+        fx.set_param(0, 0.0);
+        for (a, b) in l[20_000..].chunks_mut(256).zip(r[20_000..].chunks_mut(256)) {
+            fx.process(a, b);
+        }
+        let err = (200_000..240_000)
+            .map(|i| (l[i] - noise[i - latency]).abs())
+            .fold(0.0f32, f32::max);
+        assert!(err < 1e-3, "{err}");
+    }
+
+    #[test]
+    fn returning_to_zero_does_not_bend_the_pitch() {
+        let mut fx = effect("canary.pitch", SR).unwrap();
+        let input = sine(1_000.0, 48_000);
+        let (mut l, mut r) = (input.clone(), input.clone());
+        fx.set_param(0, 3.0);
+        fx.process(&mut l[..20_000], &mut r[..20_000]);
+        fx.set_param(0, 0.0);
+        for (a, b) in l[20_000..].chunks_mut(256).zip(r[20_000..].chunks_mut(256)) {
+            fx.process(a, b);
+        }
+        // Straight after the switch (past the latency and the 20 ms fade).
+        let got = frequency(&l[24_000..36_000], 1_000.0);
+        assert!((got - 1_000.0).abs() < 2.0, "{got} Hz");
     }
 
     #[test]

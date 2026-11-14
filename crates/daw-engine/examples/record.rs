@@ -47,8 +47,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let (mut recorder, _input, input_config) =
-        daw_engine::start_input(config.sample_rate, handle.playhead_clock())?;
+    let (mut recorder, _input, input_config) = daw_engine::start_input(
+        config.sample_rate,
+        handle.playhead_clock(),
+        Default::default(),
+    )?;
     println!(
         "recording {} channels at {} Hz",
         input_config.channels, input_config.sample_rate

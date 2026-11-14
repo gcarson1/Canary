@@ -5,6 +5,7 @@
 
 use std::fmt;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -1003,12 +1004,18 @@ impl History {
             project: self.project.clone(),
         };
         let json = serde_json::to_vec_pretty(&file).map_err(ProjectError::Format)?;
-        // Write then rename, so a crash or full disk never leaves a broken project.
+        // Write, flush to disk, then rename, so a crash, power cut or full disk
+        // never leaves a broken or empty project.
         let tmp = path.with_extension("daw.tmp");
-        fs::write(&tmp, json)
-            .and_then(|()| fs::rename(&tmp, path))
-            .map_err(ProjectError::Io)?;
-        Ok(())
+        let written = fs::File::create(&tmp).and_then(|mut f| {
+            f.write_all(&json)?;
+            f.sync_all()
+        });
+        if let Err(e) = written {
+            let _ = fs::remove_file(&tmp);
+            return Err(ProjectError::Io(e));
+        }
+        fs::rename(&tmp, path).map_err(ProjectError::Io)
     }
 
     /// Reads a project written by `save`, with empty undo history.

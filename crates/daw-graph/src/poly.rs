@@ -290,7 +290,8 @@ impl AudioNode for PolySynthNode {
                 v.freq = v.target + (v.freq - v.target) * glide;
                 let a = v.amp.tick(attack, decay, sustain, release);
                 let f = v.filt.tick(attack, decay, sustain, release);
-                if i % CONTROL == 0 {
+                // A voice started between control ticks has no filter yet.
+                if i % CONTROL == 0 || v.g == 0.0 {
                     let fc = (cutoff * 2f32.powf(env_amt * f)).clamp(20.0, 0.45 * sr);
                     v.g = (PI * fc / sr).tan();
                     v.k = k;

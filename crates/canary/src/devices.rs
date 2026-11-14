@@ -360,8 +360,8 @@ impl Devices {
         }
         let step = plan.add(instrument.id, vec![], 2).ok()?;
         steps.insert(*uid, step);
-        // The instrument's own delay is compensated like any plugin's; its
-        // sequenced notes are sent that much early (the caller shifts them).
+        // The instrument's own delay is compensated like any plugin's: the
+        // other tracks wait for it, so its notes need no shifting.
         let latency = instrument.hosted.latency_samples();
         plan.set_latency(step, latency);
         let uid = *uid;
@@ -761,7 +761,6 @@ impl Devices {
             .collect()
     }
 
-    /// Every live device's current state, for saving.
     /// One device's state, as a preset saves it.
     pub fn state(&mut self, uid: u64) -> Option<Vec<u8>> {
         self.live.get_mut(&uid)?.hosted.save_state().ok()
@@ -773,6 +772,7 @@ impl Devices {
         l.hosted.load_state(bytes).map_err(|e| e.to_string())
     }
 
+    /// Every live device's current state, for saving.
     pub fn states(&mut self) -> Vec<(u64, Vec<u8>)> {
         self.live
             .iter_mut()

@@ -323,12 +323,26 @@ impl ExecutionPlan {
     /// step's sequence is unchanged, else they are released. Allocation-free; call
     /// it on the audio thread when this plan replaces `old`.
     pub fn adopt_notes(&mut self, old: &ExecutionPlan) {
-        for step in &mut self.steps {
-            if let Some(prev) = old.steps.iter().find(|o| o.node == step.node) {
-                let same_source = prev.midi_source.is_some() == step.midi_source.is_some();
-                step.notes
-                    .adopt(&prev.notes, prev.sequence == step.sequence, same_source);
-            }
+        for i in 0..self.steps.len() {
+            let node = self.steps[i].node;
+            let Some(prev) = old.steps.iter().find(|o| o.node == node) else {
+                continue;
+            };
+            // The same chain of MIDI effects feeds it, node for node.
+            let (mut a, mut b) = (self.steps[i].midi_source, prev.midi_source);
+            let same_source = loop {
+                match (a, b) {
+                    (None, None) => break true,
+                    (Some(x), Some(y)) if self.steps[x].node == old.steps[y].node => {
+                        (a, b) = (self.steps[x].midi_source, old.steps[y].midi_source);
+                    }
+                    _ => break false,
+                }
+            };
+            let same_sequence = prev.sequence == self.steps[i].sequence;
+            self.steps[i]
+                .notes
+                .adopt(&prev.notes, same_sequence, same_source);
         }
     }
 
@@ -930,6 +944,39 @@ mod tests {
         assert_eq!(after.output()[0][0], 16.0, "CC 123 on every channel");
         after.process(&mut arena, &ctx(16), &[]);
         assert_eq!(after.output()[0][0], 0.0, "once");
+    }
+
+    #[test]
+    fn removing_one_of_two_midi_effects_also_sends_all_notes_off() {
+        let mut arena = NodeArena::default();
+        let mut two = ExecutionPlan::new(16);
+        for id in 1..=3 {
+            two.insert(
+                NodeId(id),
+                if id == 3 {
+                    Box::new(MidiCount) as Box<dyn AudioNode>
+                } else {
+                    Box::new(Doubler)
+                },
+            );
+        }
+        let a = two.add(NodeId(1), vec![], 1).unwrap();
+        let b = two.add(NodeId(2), vec![], 1).unwrap();
+        let synth = two.add(NodeId(3), vec![], 1).unwrap();
+        two.midi_from(b, a);
+        two.midi_from(synth, b);
+        arena.apply(&mut two);
+        let mut one = ExecutionPlan::new(16);
+        let b = one.add(NodeId(2), vec![], 1).unwrap();
+        let synth = one.add(NodeId(3), vec![], 1).unwrap();
+        one.midi_from(synth, b);
+        one.remove(NodeId(1));
+        arena.apply(&mut one);
+        one.adopt_notes(&two);
+        one.process(&mut arena, &ctx(16), &[]);
+        // The synth's own All Notes Off, plus the chord's (passed on, doubled):
+        // its source lost its own source too.
+        assert!(one.output()[0][0] >= 16.0, "the chain changed: CC 123");
     }
 
     #[test]

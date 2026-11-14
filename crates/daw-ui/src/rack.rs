@@ -194,13 +194,6 @@ pub(crate) fn show(
                 t.accent_amber,
             );
         }
-        p.text(
-            Pos2::new(module.min.x + 0.75 * u, top),
-            Align2::LEFT_CENTER,
-            format!("{:02} // {}", di + 1, device.name.to_uppercase()),
-            m.mono(0.6875),
-            t.muted,
-        );
         let remove = p.text(
             Pos2::new(module.max.x - 0.75 * u, top),
             Align2::RIGHT_CENTER,
@@ -330,6 +323,14 @@ pub(crate) fn show(
         let title = Rect::from_x_y_ranges(
             module.min.x..=title_end - 0.5 * u,
             module.min.y..=top + 0.75 * u,
+        );
+        // The name stops short of the header's buttons.
+        p.with_clip_rect(title.intersect(p.clip_rect())).text(
+            Pos2::new(module.min.x + 0.75 * u, top),
+            Align2::LEFT_CENTER,
+            format!("{:02} // {}", di + 1, device.name.to_uppercase()),
+            m.mono(0.6875),
+            t.muted,
         );
         let grab = ui.interact(
             title,

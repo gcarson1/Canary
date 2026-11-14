@@ -3,6 +3,7 @@ name = "daw-engine"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [dependencies]
 cpal = "0.18"

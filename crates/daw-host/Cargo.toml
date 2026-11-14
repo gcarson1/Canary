@@ -3,6 +3,7 @@ name = "daw-host"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [dependencies]
 clack-extensions = { version = "0.2", features = ["clack-host", "audio-ports", "gui", "latency", "params", "state"] }

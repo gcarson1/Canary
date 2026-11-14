@@ -3,6 +3,7 @@ name = "daw-ui"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [dependencies]
 daw-core = { path = "../daw-core" }

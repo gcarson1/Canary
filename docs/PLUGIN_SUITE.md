@@ -1,23 +1,23 @@
 # Built-in Plugin Suite: Open-Source Options
 
-Status: proposal, awaiting approval. Nothing here is integrated yet.
+Status: approved 2026-11-13, revised the same day. Canary is GPL-3.0 and for Gabriel's own use, so GPL plugins are bundled directly. Integration follows section 4.
 Researched 2026-11-13. License, last push and archive state were read from each project's GitHub repository or crates.io entry that day. This is engineering guidance, not legal advice.
 
 Goal: ship Canary with a stock suite on par with FL Studio Producer/Signature (Parametric EQ 2, Maximus, Limiter, Reverb 2, Delay 3, Chorus, Flanger, Phaser, Gross Beat, Vocodex, Harmor/Sytrus-class synths, Slicex) and Logic Pro (Channel EQ, Compressor, Space Designer, ChromaVerb, Alchemy, Retro Synth, Sampler, Pitch Correction, Amp Designer/Pedalboard, Tape/Bitcrusher, spatial tools, Drum Machine Designer).
 
 ## 1. Constraints that decide everything
 
-1. **Canary has no license.** The repo has no `LICENSE` file, so it is all-rights-reserved (closed) by default. Code under GPL, AGPL or LGPL cannot be copied into Canary's crates without relicensing Canary under that license. Permissive code (MIT, BSD, ISC, Apache-2.0, BSL-1.0) can be, keeping its notice.
+1. **Canary is GPL-3.0 and not distributed.** Gabriel decided (2026-11-13) that Canary is for his own use and may be open source. GPL-3.0 and GPL-2.0-or-later code can be ported into Canary's crates, and GPL plugin bundles can ship inside `Canary.app`. AGPL-3.0 combines with GPL-3.0 too. Keep each project's copyright notice in `THIRD_PARTY_NOTICES.md`. GPL-2.0-only code (x42, Zam) cannot be combined with GPL-3.0 code, so it stays reference only.
 2. **Built-ins are native Rust nodes.** Stock devices live in `daw_dsp::effects` / `daw_dsp::fx` and `daw_graph` (`Format::Builtin`, ids `canary.*`), get MIX/MATCH/DELTA from `EffectNode`, draw with Styles.md, and are tested with `assert_no_alloc`. Porting permissive DSP into `daw-dsp` keeps all of that. A hosted CLAP bundle gets its own UI, none of MIX/MATCH/DELTA, and Canary's crash exposure until out-of-process sandboxing (ARCHITECTURE.md section 2) is built.
 3. **macOS arm64 only matters for hosted binaries.** Ported source compiles wherever Canary does. Many Linux-first suites (LSP, Calf, x42, Zam, Geonkick, ZynAddSubFX) ship no official macOS build, which removes them as hosted options.
 4. **LGPL is not a shortcut in Rust.** LGPL needs the user to be able to relink the library; Cargo links statically, so LGPL code (LSP, Calf) is reference reading only.
-5. **GPL plugins can still ship, separately.** Unmodified upstream GPL plugin bundles, distributed as a separate optional download with links to their source, are an aggregate, not a derived work of Canary. Keep them out of `Canary.app` itself, and run them out-of-process once the sandbox exists.
+5. **Big plugins are bundled, small ones ported.** A synth like Surge XT is far too large to port; it ships as an unmodified CLAP bundle inside `Canary.app/Contents/PlugIns` and the `Catalog` lists it as a stock device. Small DSP (reverbs, delays, effects) is still ported to Rust so it gets Canary's UI and controls.
 
 Canary already ships (ROADMAP.md Phase 10): EQ (cut, shelves, bell), dynamic EQ, de-esser, compressor (sidechain), saturator (ADAA), Freeverb-style reverb, ping-pong delay, chorus/flanger, brickwall limiter, gate, multimode filter, bitcrusher, utility (gain, width, pan, polarity), 16-voice subtractive synth, sampler with slicing, key/velocity zones and round robin, and master LUFS/true-peak/correlation metering. Slicex and Fruity Slicer are already covered by the sampler's slice mode.
 
 ## 2. Options per category
 
-"Bundle in closed app" means: can the code or binary go inside `Canary.app` while Canary stays closed.
+The "Bundle in closed app" column was written when Canary was assumed closed. Under GPL-3.0 every "no" there becomes "yes", except GPL-2.0-only code (x42, Zam: reference only) and projects with no macOS build.
 
 | Category | FL / Logic targets | Best option | License | Form | macOS arm64 | Maintained | Bundle in closed app | Use it as |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -58,14 +58,14 @@ Canary already ships (ROADMAP.md Phase 10): EQ (cut, shelves, bell), dynamic EQ,
 
 ## 3. Recommended approach
 
-**Two tiers.**
+**One suite, two ways in.**
 
-1. **Canary Stock (inside the app, permissive or own code, native Rust in `daw-dsp`).** Every FL/Logic effect category, plus the synth, sampler and drum machine. This is where the product quality lives: one UI language (Styles.md), MIX/MATCH/DELTA on everything, `assert_no_alloc`-tested, honest `latency_samples()`, no crash surface.
-2. **Canary Extras (optional separate download, unmodified upstream GPL CLAP bundles).** Surge XT, Dexed, OB-Xf, Dragonfly Reverb, optionally Cardinal and Odin 2. These fill the Harmor/Sytrus/Alchemy gap that would take a year to write. The download page links each project's source and license. The `Catalog` already finds CLAP bundles, so this needs no engine work, only a curated installer and an "Extras" filter in the device picker. Recommend gating it on the out-of-process sandbox for safety, but it works in-process today.
+1. **Ported to Rust (`daw-dsp`, native `canary.*` devices):** effects small enough to port. They get Styles.md UI, MIX/MATCH/DELTA, `assert_no_alloc` tests and honest latency. Sources: own code, Cloud Seed, Signalsmith Stretch, Airwindows, and now GPL-3.0 code such as Dragonfly Reverb's algorithms and ChowDSP models where they beat the permissive option.
+2. **Bundled CLAP plugins (inside `Canary.app`, unmodified upstream builds):** instruments too large to port: Surge XT (headline), Dexed (FM), OB-Xf (analog poly), optionally Cardinal (modular) and Odin 2. `scripts/bundle.sh` copies them into `Contents/PlugIns`; the `Catalog` scans that folder and labels them as stock. Their editors open through the existing CLAP `gui` path.
 
-**Port, don't wrap, for Stock.** C++ FFI would bring a C++ toolchain into `daw-dsp` and break "pure DSP, no OS deps" in spirit. Cloud Seed, Signalsmith Stretch and the chosen Airwindows plugins are small enough to port by hand. NAM core is the exception (Eigen-based neural inference): wrap it behind a `nam` feature in a new small crate rather than in `daw-dsp`, or port its WaveNet/LSTM inference later.
+**Port, don't wrap, for effects.** C++ FFI would bring a C++ toolchain into `daw-dsp`. NAM core is the exception (Eigen-based neural inference): wrap it in a small separate crate, or port its inference later.
 
-**Keep a `THIRD_PARTY_NOTICES.md`** listing every ported MIT/BSD/ISC source with its copyright line, and each bundled IR or sample pack with its license. Required by those licenses, and cheap to keep from day one.
+**Keep a `THIRD_PARTY_NOTICES.md`** listing every ported or bundled project with its license and copyright line, and each bundled IR or sample pack.
 
 ## 4. Integration order
 
@@ -79,13 +79,12 @@ Ordered by user value per unit of work, finishing roadmap gaps first.
 6. **Amp/pedal sim:** NAM core plus cab IRs from step 2. Needs a decision on which amp captures ship (each capture has its own license; safest is capturing our own).
 7. **Shaper and vocoder:** Gross Beat-style volume/time shaper and a sidechain-keyed vocoder. Own designs.
 8. **Instruments:** synth roadmap items plus wavetable oscillator, drum machine on the sampler with CC0 kits, SFZ import.
-9. **Canary Extras installer** (Surge XT, Dexed, OB-Xf, Dragonfly), ideally after out-of-process sandboxing. Can move earlier if instruments matter more than effects.
+9. **Bundled instruments:** Surge XT, Dexed and OB-Xf CLAP builds inside `Canary.app`, listed by the `Catalog` as stock devices. Can move earlier if instruments matter more than effects.
 10. **Later:** spatial (binaural panner from SAF core), multiband dynamics, spectrum/phase scope.
 
-## 5. Ranked recommendation (for approval)
+## 5. Ranked recommendation (approved 2026-11-13)
 
-1. Keep Canary closed (or permissively licensed) and build Stock only from own code plus MIT/BSD/ISC/Apache sources. **Decision needed:** if Gabriel would rather make Canary GPL-3.0 open source, Surge XT, Dexed, Dragonfly and the ChowDSP plugins could be built in directly and steps 8-9 change; everything else holds.
-2. Highest-value permissive picks, in order: Cloud Seed (reverb), fft-convolver (convolution), Signalsmith Stretch + pitch-detection (pitch), Neural Amp Modeler core (amp sim), Airwindows (character).
-3. Ship Surge XT as the headline instrument through an optional Extras download, with Dexed, OB-Xf and Dragonfly Reverb alongside.
-4. Skip as hosted options: Vital (stale since 2023, covered by Surge), sfizz (archived), Helm (archived), LSP/Calf/x42/Zam/Geonkick (no official macOS builds, LGPL/GPL anyway).
-5. Start with integration step 1, which needs no new dependencies and closes items already on the roadmap.
+1. Canary is GPL-3.0 and personal use, so GPL plugins are bundled directly; no separate download.
+2. Effects, in order: step 1 roadmap gaps (8-band EQ with analyzer, lookahead true-peak limiter, tempo-synced delay, phaser), convolution (fft-convolver), Cloud Seed reverb, pitch toolkit (Signalsmith Stretch + pitch-detection), Airwindows character pack, NAM amp sim.
+3. Instruments: Surge XT bundled as the headline synth, with Dexed and OB-Xf.
+4. Skip: Vital (stale since 2023, covered by Surge), sfizz and Helm (archived), LSP/Calf/Geonkick (no official macOS builds), x42/Zam (GPL-2.0-only and Linux-first).

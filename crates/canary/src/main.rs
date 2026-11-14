@@ -855,9 +855,12 @@ impl App {
     /// plugin nodes that exist nowhere else.
     fn send(&mut self, plan: Box<ExecutionPlan>) {
         match self.engine.send_plan(plan) {
-            Ok(()) => {}
+            Ok(()) => self.devices.sent(self.engine.plans_sent()),
             Err(daw_engine::SendPlanError::QueueFull(plan)) => self.queued = Some(plan),
-            Err(e) => self.error(format!("plan rejected: {e}")),
+            Err(e) => {
+                self.devices.send_failed();
+                self.error(format!("plan rejected: {e}"));
+            }
         }
     }
 
@@ -1771,7 +1774,8 @@ impl eframe::App for App {
 
         self.feed_samplers();
         self.prepare_reference();
-        self.devices.idle(self.queued.is_some());
+        let engine = &self.engine;
+        self.devices.idle(|n| engine.removed_by_is_gone(n));
         let views = self
             .ws
             .selected_track

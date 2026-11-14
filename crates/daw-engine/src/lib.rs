@@ -52,6 +52,10 @@ pub struct EngineHandle {
     /// Nodes the audio thread will hold once every queued plan is applied.
     live: LiveNodes,
     playhead: Arc<AtomicU64>,
+    /// Plans accepted by `send_plan`, and retired plans dropped by
+    /// `collect_garbage`: plan `n` (counting from 1) is the `n`th collected.
+    sent: u64,
+    collected: u64,
     /// `ExecutionPlan::latency` of the last plan sent.
     plan_latency: u32,
 }
@@ -86,6 +90,7 @@ impl EngineHandle {
             .map_err(|rtrb::PushError::Full(plan)| SendPlanError::QueueFull(plan))?;
         self.live = next;
         self.plan_latency = latency;
+        self.sent += 1;
         Ok(())
     }
 
@@ -108,7 +113,21 @@ impl EngineHandle {
     /// Drops plans the audio thread has retired, freeing their nodes, buffers and
     /// clip audio. Call it regularly from a non-real-time thread.
     pub fn collect_garbage(&mut self) {
-        while self.garbage.pop().is_ok() {}
+        while self.garbage.pop().is_ok() {
+            self.collected += 1;
+        }
+    }
+
+    /// Plans sent so far: the number of the last one.
+    pub fn plans_sent(&self) -> u64 {
+        self.sent
+    }
+
+    /// True once every node removed by plan `n` (a `plans_sent` value) has been
+    /// dropped here. Those nodes leave inside the plan it replaced, plan `n - 1`,
+    /// so a node's main-thread handle (a plugin instance) may go after this.
+    pub fn removed_by_is_gone(&self, n: u64) -> bool {
+        self.collected + 1 >= n
     }
 }
 
@@ -148,6 +167,8 @@ pub fn engine(capacity: usize, sample_rate: f32) -> (EngineHandle, AudioEngine) 
             garbage: garbage_rx,
             live: LiveNodes::default(),
             playhead: playhead.clone(),
+            sent: 0,
+            collected: 0,
             plan_latency: 0,
         },
         AudioEngine {
@@ -1248,6 +1269,27 @@ mod tests {
         let mut block = vec![0.0; 256];
         assert_no_alloc(|| audio.process(&mut block, 1));
         assert!(block[..50].iter().all(|&s| s == 0.0) && block[51] != 0.0);
+    }
+
+    #[test]
+    fn the_handle_learns_when_removed_nodes_are_dropped() {
+        let (mut handle, mut audio) = engine(16, 48_000.0);
+        let mut first = ExecutionPlan::new(64);
+        first.insert(NodeId(1), Box::new(Const));
+        first.add(NodeId(1), vec![], 2).unwrap();
+        handle.send_plan(Box::new(first)).unwrap();
+        let mut second = ExecutionPlan::new(64);
+        second.remove(NodeId(1));
+        handle.send_plan(Box::new(second)).unwrap();
+        let n = handle.plans_sent();
+        assert_eq!(n, 2);
+        handle.collect_garbage();
+        assert!(!handle.removed_by_is_gone(n), "not applied yet");
+        let mut block = vec![0.0; 128];
+        audio.process(&mut block, 2);
+        assert!(!handle.removed_by_is_gone(n), "applied, not collected");
+        handle.collect_garbage();
+        assert!(handle.removed_by_is_gone(n));
     }
 
     #[test]

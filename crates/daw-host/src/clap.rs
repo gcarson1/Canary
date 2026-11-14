@@ -164,6 +164,9 @@ struct CanaryHost;
 #[derive(Default)]
 struct Requests {
     callback: AtomicBool,
+    /// The plugin asked to be deactivated and activated again (a new latency,
+    /// for one); the app remakes it from its state.
+    restart: AtomicBool,
     /// A size the editor asked for, `width << 32 | height`; 0 when none.
     resize: AtomicU64,
 }
@@ -188,7 +191,9 @@ impl HostGuiImpl for Requests {
 }
 
 impl SharedHandler<'_> for Requests {
-    fn request_restart(&self) {} // shortcut: restarting (re-activation) is not wired yet
+    fn request_restart(&self) {
+        self.restart.store(true, Ordering::Release);
+    }
     fn request_process(&self) {} // nodes always process, so nothing to wake
     fn request_callback(&self) {
         self.callback.store(true, Ordering::Release);
@@ -537,6 +542,12 @@ impl ClapPlugin {
 
     /// Runs main-thread work the plugin asked for. Call it regularly, like
     /// `EngineHandle::collect_garbage`.
+    /// True once after the plugin asked for a restart.
+    pub fn wants_restart(&mut self) -> bool {
+        self.instance
+            .access_shared_handler(|r| r.restart.swap(false, Ordering::Acquire))
+    }
+
     pub fn idle(&mut self) {
         let asked = self
             .instance
@@ -813,6 +824,12 @@ mod tests {
             (LATENCY, LATENCY)
         );
         assert_eq!(plugin.param_value(GAIN), Some(1.0));
+        assert!(!plugin.wants_restart());
+        plugin
+            .instance
+            .access_shared_handler(|r| SharedHandler::request_restart(r));
+        assert!(plugin.wants_restart(), "a restart request is seen");
+        assert!(!plugin.wants_restart(), "once");
         assert!(!plugin.set_param(99, 1.0), "unknown id");
         assert!(!plugin.set_param(GAIN, f64::NAN));
         drop(node);

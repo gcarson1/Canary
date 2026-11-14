@@ -19,10 +19,6 @@ const EQ_POINTS: usize = 192;
 
 /// Node ids from here up belong to devices; tracks and the master use those below.
 pub const FIRST_DEVICE_NODE: u32 = 2048;
-/// Frames a removed plugin's handle outlives its node, so the engine has applied
-/// the plan that removes the node and its garbage has been collected first.
-// shortcut: a timer, not a signal; the engine does not report when a plan applied.
-const RETIRE_FRAMES: u32 = 120;
 
 struct Live {
     hosted: Box<dyn Hosted>,
@@ -39,7 +35,11 @@ struct Live {
 
 struct Retired {
     hosted: Box<dyn Hosted>,
-    frames: u32,
+    /// The plan that removes its node from the engine, once sent; the handle
+    /// goes when the engine says that plan's removed nodes are dropped.
+    plan: Option<u64>,
+    /// Its node never reached the engine: nothing to wait for.
+    unsent: bool,
     /// Its ARA document and extension, released once the handle is gone.
     ara: Option<(usize, NonNull<c_void>)>,
 }
@@ -57,7 +57,7 @@ pub struct Devices {
     catalog: Catalog,
     pub choices: Vec<PluginChoice>,
     live: HashMap<u64, Live>,
-    /// Handles whose nodes a plan is removing: (handle, frames left).
+    /// Handles whose nodes a plan is removing.
     retired: Vec<Retired>,
     /// Ids removed from the engine but not yet sent in a plan.
     removing: Vec<NodeId>,
@@ -266,6 +266,23 @@ impl Devices {
             })
     }
 
+    /// Plan `n` (`EngineHandle::plans_sent`) carried the removals handed out by
+    /// the last `apply_changes`. Call after each successful send.
+    pub fn sent(&mut self, n: u64) {
+        for r in self.retired.iter_mut().filter(|r| r.plan.is_none()) {
+            r.plan = Some(n);
+        }
+    }
+
+    /// The plan carrying the last removals was rejected, so their nodes may stay
+    /// in the engine: keep those handles for good rather than risk dropping a
+    /// plugin under a node that still runs.
+    pub fn send_failed(&mut self) {
+        for r in self.retired.iter_mut().filter(|r| r.plan.is_none()) {
+            r.plan = Some(u64::MAX);
+        }
+    }
+
     /// Puts pending inserts and removals into `plan`. Call once per plan sent.
     pub fn apply_changes(&mut self, plan: &mut ExecutionPlan) {
         for id in self.removing.drain(..) {
@@ -349,7 +366,8 @@ impl Devices {
         if let Ok(state) = live.hosted.save_state() {
             self.removed_state.insert(uid, state);
         }
-        if live.node.is_none() {
+        let unsent = live.node.is_some();
+        if !unsent {
             self.removing.push(live.id);
         }
         self.free.push(live.id.0);
@@ -359,7 +377,8 @@ impl Devices {
             .map(|((doc, _), ext)| (doc, ext));
         self.retired.push(Retired {
             hosted: live.hosted,
-            frames: RETIRE_FRAMES,
+            plan: None,
+            unsent,
             ara,
         });
     }
@@ -656,22 +675,27 @@ impl Devices {
             .collect()
     }
 
-    /// Main-thread plugin work, and dropping retired handles once their nodes are
-    /// gone. `waiting` holds the timer while a plan has not reached the engine.
-    pub fn idle(&mut self, waiting: bool) {
-        for l in self.live.values_mut() {
+    /// Main-thread plugin work, and dropping retired handles once `gone` says
+    /// the plan removing their node has had its removed nodes dropped
+    /// (`EngineHandle::removed_by_is_gone`).
+    pub fn idle(&mut self, gone: impl Fn(u64) -> bool) {
+        let mut restart = Vec::new();
+        for (uid, l) in &mut self.live {
             l.hosted.idle();
+            // Not one still waiting to reach the engine: it is made at most once.
+            if l.hosted.wants_restart() && l.node.is_none() {
+                restart.push(*uid);
+            }
+        }
+        // Retired with its state; the next sync makes it again, activated anew
+        // (its new latency read then and compensated).
+        for uid in restart {
+            self.retire(uid);
         }
         self.tend_editors();
-        if waiting {
-            return;
-        }
-        for r in &mut self.retired {
-            r.frames = r.frames.saturating_sub(1);
-        }
         let (done, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.retired)
             .into_iter()
-            .partition(|r| r.frames == 0);
+            .partition(|r| r.unsent || r.plan.is_some_and(&gone));
         self.retired = waiting;
         for r in done {
             drop(r.hosted);
@@ -780,13 +804,20 @@ mod tests {
         send(&mut d, &mut live);
         assert!(!live.is_live(first));
         assert_eq!(d.retired.len(), 2, "handles wait for their nodes to go");
-        for _ in 0..RETIRE_FRAMES {
-            d.idle(true); // a plan still queued: the timer holds
-        }
-        assert_eq!(d.retired.len(), 2);
-        for _ in 0..RETIRE_FRAMES {
-            d.idle(false);
-        }
+        d.idle(|_| true);
+        assert_eq!(
+            d.retired.len(),
+            2,
+            "removal not sent yet: nothing to wait on"
+        );
+        d.sent(7);
+        d.idle(|n| n < 7);
+        assert_eq!(
+            d.retired.len(),
+            2,
+            "plan 7's removed nodes still in the engine"
+        );
+        d.idle(|n| n <= 7);
         assert!(d.retired.is_empty());
     }
 

@@ -48,6 +48,12 @@ pub trait Hosted {
     fn has_audio_input(&self) -> bool;
     /// Main-thread work the plugin asked for; call regularly.
     fn idle(&mut self) {}
+    /// True once after the plugin asked to be deactivated and activated again
+    /// (CLAP `request_restart`, e.g. for a new latency): the host remakes it
+    /// from its saved state, since the active instance runs in the engine.
+    fn wants_restart(&mut self) -> bool {
+        false
+    }
     /// Puts the plugin's own editor inside `parent` and returns its size in points.
     ///
     /// # Safety
@@ -113,6 +119,9 @@ impl Hosted for ClapPlugin {
     }
     fn idle(&mut self) {
         ClapPlugin::idle(self)
+    }
+    fn wants_restart(&mut self) -> bool {
+        ClapPlugin::wants_restart(self)
     }
     unsafe fn open_editor(&mut self, parent: *mut c_void) -> Result<(f64, f64), HostError> {
         // SAFETY: upheld by the caller.

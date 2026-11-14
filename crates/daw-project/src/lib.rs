@@ -118,6 +118,10 @@ pub struct Track {
     /// Automation lanes, at most one per target.
     #[serde(default)]
     pub automation: Vec<Lane>,
+    /// Frozen: this track rendered through its devices (before the fader) to
+    /// this file, which plays instead while the devices are unloaded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frozen: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -215,6 +219,7 @@ impl Track {
             notes: Vec::new(),
             pattern_clips: Vec::new(),
             automation: Vec::new(),
+            frozen: None,
         }
     }
 
@@ -500,6 +505,11 @@ pub enum Action {
         device: usize,
         source: Option<u64>,
     },
+    /// Freezes `track` to `file`, or with `None` thaws it.
+    SetFrozen {
+        track: usize,
+        file: Option<PathBuf>,
+    },
     /// Several edits that undo as one step (a split, say). All or nothing.
     Batch(Vec<Action>),
 }
@@ -625,6 +635,10 @@ impl Action {
                 SetTempo(std::mem::replace(&mut p.bpm, bpm))
             }
             SetReference(path) => SetReference(std::mem::replace(&mut p.reference, path)),
+            SetFrozen { track: ti, file } => SetFrozen {
+                track: ti,
+                file: std::mem::replace(&mut track(p, ti)?.frozen, file),
+            },
             InsertTrack { index, mut track } => {
                 if index > p.tracks.len() {
                     return Err(ActionError::OutOfRange);
@@ -1399,6 +1413,10 @@ mod tests {
                 points: Vec::new(),
             },
             Action::SetTrackProps { index: 1, props },
+            Action::SetFrozen {
+                track: 1,
+                file: Some("/Freeze/Bass.wav".into()),
+            },
             Action::InsertClip {
                 track: 1,
                 index: 0,

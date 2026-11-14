@@ -242,6 +242,8 @@ impl Devices {
             .tracks
             .iter()
             .enumerate()
+            // A frozen track's devices are unloaded (their state is kept).
+            .filter(|(_, t)| t.frozen.is_none())
             .flat_map(|(ti, t)| t.devices.iter().map(move |d| (ti, d)))
             .collect();
         let gone: Vec<u64> = self
@@ -776,11 +778,12 @@ impl Devices {
     }
 
     /// Every live device's current state, for saving.
+    /// Unloaded devices (a frozen track's) give their last state.
     pub fn states(&mut self) -> Vec<(u64, Vec<u8>)> {
-        self.live
-            .iter_mut()
-            .filter_map(|(uid, l)| l.hosted.save_state().ok().map(|s| (*uid, s)))
-            .collect()
+        let unloaded = self.removed_state.iter().map(|(u, s)| (*u, s.clone()));
+        let live = self.live.iter_mut();
+        let live = live.filter_map(|(uid, l)| l.hosted.save_state().ok().map(|s| (*uid, s)));
+        unloaded.chain(live).collect()
     }
 
     /// Main-thread plugin work, and dropping retired handles once `gone` says

@@ -491,6 +491,33 @@ pub(crate) fn show(
     if resp.clicked() && !was_open {
         ws.picker = Some(0.0);
     }
+    // FREEZE renders the track through its devices and unloads them (THAW
+    // brings them back); Shift-click bounces it in place.
+    let frozen = inputs.history.project().tracks[track].frozen.is_some();
+    let freeze = m.snap_rect(Rect::from_min_size(
+        Pos2::new(add.min.x, add.max.y + 0.5 * u),
+        add.size(),
+    ));
+    let resp = ui.interact(freeze, ui.scope_id().with("freeze"), Sense::click());
+    p.rect_stroke(
+        freeze,
+        0.0,
+        m.hair(if resp.hovered() { t.text } else { t.line_2 }),
+        StrokeKind::Inside,
+    );
+    p.text(
+        freeze.center(),
+        Align2::CENTER_CENTER,
+        if frozen { "THAW" } else { "FREEZE" },
+        m.mono(0.6875),
+        if frozen { t.text } else { t.muted },
+    );
+    if resp.clicked() && !was_open {
+        out.push(Request::Freeze {
+            track,
+            bounce: ui.input(|i| i.modifiers.shift),
+        });
+    }
     if ws.picker.is_some() {
         if let Some(choice) = picker(ws, ui, m, r, inputs, was_open) {
             out.push(Request::AddDevice { track, choice });

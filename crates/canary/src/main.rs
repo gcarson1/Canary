@@ -168,6 +168,9 @@ struct App {
     )>,
     /// A file tap could not be made: the export is called off next frame.
     export_failed: bool,
+    /// A freeze render that has finished, applied once its file is trimmed:
+    /// the track's id, the file, and whether to bounce in place.
+    freeze_done: Option<(u64, PathBuf, bool, u64)>,
     /// The last export's format conversion, still running.
     converting: Option<thread::JoinHandle<Vec<String>>>,
     /// Finished audio-to-MIDI analyses: the clip, drums or not, what was found.
@@ -343,6 +346,7 @@ impl App {
             converting: None,
             rendering: None,
             export_failed: false,
+            freeze_done: None,
             stretching: HashSet::new(),
             preset_at: HashMap::new(),
             transcribe_tx,
@@ -510,9 +514,18 @@ impl App {
         }
     }
 
-    /// Gives samplers the audio they wait for, loading each file once.
+    /// Gives samplers and frozen tracks the audio they wait for, loading each
+    /// file once.
     fn feed_samplers(&mut self) {
-        for path in self.devices.feed_samplers(&self.audio) {
+        let frozen = self.history.project().tracks.iter();
+        let frozen = frozen.filter_map(|t| t.frozen.clone());
+        let frozen: Vec<PathBuf> = frozen.filter(|f| !self.audio.contains_key(f)).collect();
+        for path in self
+            .devices
+            .feed_samplers(&self.audio)
+            .into_iter()
+            .chain(frozen)
+        {
             if self.sample_requests.insert(path.clone()) {
                 self.load(path, None);
             }
@@ -818,16 +831,32 @@ impl App {
         let mut steps = Vec::with_capacity(count);
         let mut sends = Vec::new();
         let mut send_levels = Vec::new();
+        // The track a freeze renders: before its fader, so it plays at unity.
+        let freezing = self.export.as_ref().and_then(|e| e.freeze).map(|f| f.0);
+        // Equal-power centre pan is -3 dB: the render passes the track node
+        // once more when it plays, so it is made 3 dB hotter.
+        let unity = Arc::new(TrackParams::new(Arc::new(AtomicUsize::new(0))));
+        unity.set_gain(std::f32::consts::SQRT_2);
         for &i in &order {
             let track = &tracks[i];
+            // A frozen track plays its render instead of its devices and clips.
+            let frozen = track.frozen.as_ref();
             // An ARA plug-in on the track renders its clips itself.
-            let ara = self.devices.ara_track(track);
+            let ara = frozen.is_none() && self.devices.ara_track(track);
             // A looping pattern plays on its own, as in FL's PAT mode.
             let pattern_mode = matches!(playback, Playback::Pattern(_));
+            // shortcut: a frozen track is silent in PAT mode (its render is the song's).
+            let render = frozen
+                .filter(|_| !pattern_mode)
+                .and_then(|f| self.audio.get(f))
+                .and_then(|a| {
+                    let len = a.frames() as u64;
+                    Clip::with_window(0, a.clone(), 0, len, 0, 0)
+                });
             let clips = track
                 .clips
                 .iter()
-                .filter(|_| !ara && !pattern_mode)
+                .filter(|_| frozen.is_none() && !ara && !pattern_mode)
                 .filter_map(|c| {
                     let audio = self.audio.get(&c.source)?.clone();
                     let mut clip = Clip::with_window(
@@ -837,28 +866,36 @@ impl App {
                     clip.reversed = c.reverse;
                     Some(clip)
                 })
+                .chain(render)
                 .collect();
+            let params = if freezing == Some(track.id) {
+                unity.clone()
+            } else {
+                self.params[i].clone()
+            };
             let id = NodeId(i as u32 + 1);
-            plan.insert(id, Box::new(TrackNode::new(clips, self.params[i].clone())));
+            plan.insert(id, Box::new(TrackNode::new(clips, params)));
             // shortcut: notes held while the selection moves keep sounding until
             // played again; a real fix sends note-offs to the old instrument.
             let selected = self.ws.selected_track == Some(i);
             let mut device_steps = HashMap::new();
-            let inputs =
-                match self
+            let instrument = match frozen {
+                Some(_) => None,
+                None => self
                     .devices
-                    .instrument_step(&mut plan, track, selected, &mut device_steps)
-                {
-                    Some((midi_in, step, _)) => {
-                        // The notes go to the first MIDI effect, else the
-                        // instrument; PDC lines up the instrument's latency.
-                        if let Some(seq) = sequences.get(i).filter(|s| !s.is_empty()) {
-                            plan.sequence(midi_in, seq.clone());
-                        }
-                        vec![step]
+                    .instrument_step(&mut plan, track, selected, &mut device_steps),
+            };
+            let inputs = match instrument {
+                Some((midi_in, step, _)) => {
+                    // The notes go to the first MIDI effect, else the
+                    // instrument; PDC lines up the instrument's latency.
+                    if let Some(seq) = sequences.get(i).filter(|s| !s.is_empty()) {
+                        plan.sequence(midi_in, seq.clone());
                     }
-                    None => vec![],
-                };
+                    vec![step]
+                }
+                None => vec![],
+            };
             // A bus sums what is routed or sent to it, after any instrument.
             let feeds: Vec<StepId> = inputs.into_iter().chain(bus_in[i].drain(..)).collect();
             let inputs = if feeds.is_empty() {
@@ -875,9 +912,16 @@ impl App {
                 .enumerate()
                 .filter_map(|(d, dev)| Some((dev.uid, out_step[project.sidechain_of(i, d)?]?)))
                 .collect();
-            let last =
-                self.devices
-                    .effects_after(&mut plan, track, track_step, &mut device_steps, &keys);
+            let last = match frozen {
+                Some(_) => track_step,
+                None => self.devices.effects_after(
+                    &mut plan,
+                    track,
+                    track_step,
+                    &mut device_steps,
+                    &keys,
+                ),
+            };
             out_step[i] = Some(last);
             // The meter reads the track after its effects.
             plan.tap(
@@ -916,7 +960,10 @@ impl App {
             } else {
                 &[]
             };
-            for lane in lanes {
+            // A freeze renders before the fader: no gain or pan automation.
+            let pre_fader =
+                |l: &&Lane| freezing != Some(track.id) || matches!(l.target, Target::Param { .. });
+            for lane in lanes.iter().filter(pre_fader) {
                 let (step, param) = match lane.target {
                     Target::Gain => (Some(track_step), TrackNode::GAIN),
                     Target::Pan => (Some(track_step), TrackNode::PAN),
@@ -973,10 +1020,7 @@ impl App {
                 };
                 let Some(step) = step else { continue };
                 let skip = u64::from(plan.step_latency(step).unwrap_or(0));
-                let out = match who {
-                    None => Some(&mut e.master),
-                    Some(i) => e.stems.iter_mut().find(|s| s.0 == i).map(|s| &mut s.1),
-                };
+                let out = e.outputs.iter_mut().find(|o| o.0 == who).map(|o| &mut o.1);
                 let Some(out) = out else { continue };
                 out.skip = skip;
                 match source {
@@ -1163,6 +1207,7 @@ impl App {
             Request::ExportMidi { track } => self.export_midi(track),
             Request::ToggleRecord => self.toggle_record(),
             Request::Export { stems } => self.toggle_export(stems),
+            Request::Freeze { track, bounce } => self.freeze(track, bounce),
             Request::SetInput(_) if self.taking() => {
                 self.error("stop recording before switching the input".into());
             }
@@ -1744,24 +1789,16 @@ impl App {
         let Some((start, end)) = export_range(project, song_end) else {
             return self.error("the loop region is empty".into());
         };
-        let tracks: Vec<(usize, String)> = if stems {
-            project
-                .tracks
-                .iter()
-                .enumerate()
-                .map(|(i, t)| (i, t.name.clone()))
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let name = self
-            .project_path
-            .file_stem()
-            .map_or_else(|| "Canary".into(), |s| s.to_string_lossy().into_owned());
+        let mut outputs = vec![(None, String::new())];
+        if stems {
+            let tracks = project.tracks.iter().enumerate();
+            outputs.extend(tracks.map(|(i, t)| (Some(i), t.name.clone())));
+        }
+        let name = self.project_name();
         let started = export::Export::start(
             &self.samples_dir.join("Exports"),
             &name,
-            &tracks,
+            &outputs,
             rate,
             end,
             self.ws.export_format,
@@ -1775,19 +1812,143 @@ impl App {
             Ok(mut e) => {
                 e.start = start;
                 e.rate = self.ws.export_rate.filter(|&r| r != rate);
-                self.export = Some(e);
-                self.ws.song = true;
-                // The mix as it is, not what the monitor section is listening to.
-                self.export_restore = Some((self.monitor.mode(), self.monitor.reference()));
-                self.monitor.set_mode(MonitorMode::Stereo);
-                self.monitor.set_reference(false);
-                self.built = None; // the next plan carries the taps
-                                   // Play waits until that plan is delivered (tend_export).
-                for c in [Command::Stop, Command::Seek(start)] {
-                    let _ = self.engine.commands.push(c);
-                }
+                self.begin_export(e);
             }
             Err(e) => self.error(format!("cannot export: {e}")),
+        }
+    }
+
+    /// The project file's name without its extension, for exported files.
+    fn project_name(&self) -> String {
+        self.project_path
+            .file_stem()
+            .map_or_else(|| "Canary".into(), |s| s.to_string_lossy().into_owned())
+    }
+
+    /// Freezes `track` (or thaws it, if frozen); with `bounce`, bounces it in
+    /// place. The render is an offline export of the track before its fader.
+    fn freeze(&mut self, track: usize, bounce: bool) {
+        if self.export.is_some() || self.converting.is_some() {
+            return self.error("wait for the export to finish".into());
+        }
+        let project = self.history.project();
+        let Some(t) = project.tracks.get(track) else {
+            return;
+        };
+        if let Some(file) = t.frozen.clone() {
+            if bounce {
+                return self.bounce(track, file);
+            }
+            if let Err(e) = self.history.apply(Action::SetFrozen { track, file: None }) {
+                self.error(format!("could not thaw: {e}"));
+            }
+            return;
+        }
+        if t.bus {
+            return self.error("a bus cannot be frozen".into());
+        }
+        if t.devices.is_empty() {
+            return self.error("no devices to freeze".into());
+        }
+        let song_end = project.song_end();
+        if song_end == 0 {
+            return self.error("nothing to freeze".into());
+        }
+        let rate = project.sample_rate;
+        let end = project.samples_at(song_end) + export::TAIL_SECONDS * u64::from(rate);
+        // A new name each time: a cached render never stands in for a new one.
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis());
+        let (id, outputs) = (t.id, [(Some(track), t.name.clone())]);
+        let started = export::Export::start(
+            &self.samples_dir.join("Freeze"),
+            &format!("{} {stamp}", self.project_name()),
+            &outputs,
+            rate,
+            end,
+            daw_ui::ExportFormat::Wav32,
+            self.engine
+                .lending
+                .is_none()
+                .then(|| self.engine.playhead_clock()),
+        );
+        match started {
+            Ok(mut e) => {
+                e.freeze = Some((id, bounce, self.history.revision()));
+                self.begin_export(e);
+            }
+            Err(e) => self.error(format!("cannot freeze: {e}")),
+        }
+    }
+
+    /// A finished freeze render: freeze its track, or bounce it in place.
+    /// Refused if the project changed since the render began (it would not
+    /// match, and a bounce would throw the changes away).
+    fn apply_freeze(&mut self, id: u64, file: PathBuf, bounce: bool, revision: u64) {
+        if self.history.revision() != revision {
+            return self.error("the project changed while freezing: freeze again".into());
+        }
+        let Some(track) = self.history.project().track_index(id) else {
+            return self.error("the frozen track is gone".into());
+        };
+        if bounce {
+            return self.bounce(track, file);
+        }
+        // The devices unload: their settings go into the project first.
+        self.gather_state();
+        self.load(file.clone(), None);
+        let action = Action::SetFrozen {
+            track,
+            file: Some(file),
+        };
+        match self.history.apply(action) {
+            Ok(()) => {
+                self.ws.status = Some(Status {
+                    text: "FROZEN · THAW TO EDIT".into(),
+                    error: false,
+                })
+            }
+            Err(e) => self.error(format!("could not freeze: {e}")),
+        }
+    }
+
+    /// Puts the render `file` in place of `track`'s devices, clips and notes,
+    /// as one undo step.
+    fn bounce(&mut self, track: usize, file: PathBuf) {
+        let frames = match hound::WavReader::open(&file) {
+            Ok(r) => u64::from(r.duration()),
+            Err(e) => return self.error(format!("{}: {e}", file.display())),
+        };
+        // Undo brings the devices back as they are now.
+        self.gather_state();
+        let t = &self.history.project().tracks[track];
+        let batch = bounce_actions(t, track, file.clone(), frames);
+        self.load(file, None);
+        match self.history.apply(Action::Batch(batch)) {
+            Ok(()) => {
+                self.ws.status = Some(Status {
+                    text: "BOUNCED IN PLACE".into(),
+                    error: false,
+                })
+            }
+            Err(e) => self.error(format!("could not bounce: {e}")),
+        }
+    }
+
+    /// Takes over the transport for export `e`: the next plan carries its taps,
+    /// and Play waits until that plan is delivered (`tend_export`).
+    fn begin_export(&mut self, e: export::Export) {
+        let start = e.start;
+        self.export = Some(e);
+        self.ws.song = true;
+        // The mix as it is, not what the monitor section is listening to.
+        self.export_restore = Some((self.monitor.mode(), self.monitor.reference()));
+        self.monitor.set_mode(MonitorMode::Stereo);
+        self.monitor.set_reference(false);
+        self.built = None;
+        for c in [Command::Stop, Command::Seek(start)] {
+            let _ = self.engine.commands.push(c);
         }
     }
 
@@ -1844,8 +2005,13 @@ impl App {
     fn tend_export(&mut self) {
         if self.converting.as_ref().is_some_and(|j| j.is_finished()) {
             let job = self.converting.take().expect("checked");
+            let freeze = self.freeze_done.take();
             match job.join() {
-                Ok(failures) if failures.is_empty() => {}
+                Ok(failures) if failures.is_empty() => {
+                    if let Some((id, file, bounce, revision)) = freeze {
+                        self.apply_freeze(id, file, bounce, revision);
+                    }
+                }
                 Ok(failures) => self.error(failures.join("; ")),
                 Err(_) => self.error("conversion thread failed".into()),
             }
@@ -1947,7 +2113,17 @@ impl App {
         };
         self.built = None;
         self.restore_monitor();
+        let freeze = e.freeze;
         match e.finish() {
+            Ok((path, job)) if freeze.is_some() => {
+                self.converting = Some(job);
+                let (id, bounce, revision) = freeze.expect("checked");
+                self.freeze_done = Some((id, path, bounce, revision));
+                self.ws.status = Some(Status {
+                    text: "FREEZING".into(),
+                    error: false,
+                });
+            }
             Ok((path, job)) => {
                 self.converting = Some(job);
                 self.ws.status = Some(Status {
@@ -2525,6 +2701,53 @@ fn export_range(project: &daw_project::Project, song_end: u64) -> Option<(u64, u
     (end > start).then_some((start, end))
 }
 
+/// The edits that put the render `file` (`frames` long) in place of track `t`
+/// (at `track`): its devices, clips, notes and device automation go, and the
+/// render becomes its one clip.
+fn bounce_actions(t: &Track, track: usize, file: PathBuf, frames: u64) -> Vec<Action> {
+    let mut batch = Vec::new();
+    if t.frozen.is_some() {
+        batch.push(Action::SetFrozen { track, file: None });
+    }
+    let devices = (0..t.devices.len()).rev();
+    batch.extend(devices.map(|index| Action::RemoveDevice { track, index }));
+    let clips = (0..t.clips.len()).rev();
+    batch.extend(clips.map(|index| Action::RemoveClip { track, index }));
+    batch.extend(t.notes.iter().map(|n| Action::SetNotes {
+        track,
+        pattern: n.pattern,
+        notes: Vec::new(),
+    }));
+    // Device automation has nothing left to move; gain and pan still apply.
+    batch.extend(
+        t.automation
+            .iter()
+            .filter(|l| matches!(l.target, Target::Param { .. }))
+            .map(|l| Action::SetAutomation {
+                track,
+                target: l.target,
+                points: Vec::new(),
+            }),
+    );
+    batch.push(Action::InsertClip {
+        track,
+        index: 0,
+        clip: ClipRef {
+            source: file,
+            start: 0,
+            offset: 0,
+            length: frames,
+            fade_in: 0,
+            fade_out: 0,
+            gain: 1.0,
+            reverse: false,
+            stretch: None,
+            takes: None,
+        },
+    });
+    batch
+}
+
 /// How far a playhead at `at` is through an export from `start` to `end`, 0 to 1.
 fn progress(at: u64, start: u64, end: u64) -> f64 {
     (at.saturating_sub(start) as f64 / end.saturating_sub(start).max(1) as f64).min(1.0)
@@ -2700,6 +2923,75 @@ mod tests {
         assert_eq!(progress(1_500, 1_000, 2_000), 0.5);
         assert_eq!(progress(500, 1_000, 2_000), 0.0);
         assert_eq!(progress(9_000, 1_000, 1_000), 1.0);
+    }
+
+    #[test]
+    fn a_bounce_replaces_devices_clips_and_notes_and_undoes_as_one() {
+        use daw_project::{Device, Note, PatternNotes, PluginFormat, Point};
+        let device = |uid| Device {
+            uid,
+            format: PluginFormat::Builtin,
+            bundle: None,
+            id: "canary.synth".into(),
+            name: "Synth".into(),
+            state: vec![1, 2],
+            sidechain: None,
+        };
+        let lane = |target| Lane {
+            target,
+            points: vec![Point {
+                tick: 0,
+                value: 0.5,
+                curve: 0.0,
+            }],
+        };
+        let old = ClipRef {
+            source: "/a.wav".into(),
+            start: 10,
+            offset: 0,
+            length: 5,
+            fade_in: 0,
+            fade_out: 0,
+            gain: 1.0,
+            reverse: false,
+            stretch: None,
+            takes: None,
+        };
+        let mut t = Track::new("Lead");
+        t.id = 1;
+        t.devices = vec![device(1), device(2)];
+        t.clips = vec![old.clone(), ClipRef { start: 50, ..old }];
+        t.notes = vec![PatternNotes {
+            pattern: 1,
+            notes: vec![Note {
+                start: 0,
+                length: 10,
+                key: 60,
+                velocity: 100,
+            }],
+        }];
+        t.automation = vec![lane(Target::Gain), lane(Target::Param { device: 2, id: 0 })];
+        t.frozen = Some("/f.wav".into());
+        let mut h = History::new(daw_project::Project {
+            patterns: vec![daw_project::Pattern {
+                id: 1,
+                name: "P".into(),
+                length: 3_840,
+            }],
+            tracks: vec![t],
+            ..Default::default()
+        });
+        let before = h.project().clone();
+        let batch = bounce_actions(&before.tracks[0], 0, "/f.wav".into(), 9_000);
+        h.apply(Action::Batch(batch)).unwrap();
+        let t = &h.project().tracks[0];
+        assert!(t.devices.is_empty() && t.frozen.is_none());
+        assert_eq!(t.clips.len(), 1);
+        assert_eq!((t.clips[0].start, t.clips[0].length), (0, 9_000));
+        assert!(t.notes_in(1).is_empty());
+        assert_eq!(t.automation.len(), 1, "gain automation stays");
+        assert!(h.undo());
+        assert_eq!(h.project(), &before);
     }
 
     #[test]

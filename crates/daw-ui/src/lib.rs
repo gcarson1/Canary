@@ -138,6 +138,13 @@ pub enum Request {
         ratio: f64,
         semitones: f64,
     },
+    /// Freeze `track` (render it through its devices and unload them), or thaw
+    /// it if frozen; with `bounce`, put the render in place of its devices,
+    /// clips and notes.
+    Freeze {
+        track: usize,
+        bounce: bool,
+    },
     /// Load the next saved preset of `track`'s device `device`, or with `save`,
     /// save its current settings as a new one.
     Preset {

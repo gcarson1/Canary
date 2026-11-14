@@ -102,7 +102,7 @@ The UI follows Styles.md whichever framework is chosen.
 - [x] Buses: `+ BUS` in the mixer; any track outputs to the master or a bus, and sends post-fader to buses (`Track::id`/`bus`/`output`/`sends`, `Action::SetRouting`, refused if it would loop; `Project::route_order` schedules sources first). Still to do: pre-fader sends, folder tracks in the playlist
 - [x] Sidechain: built-in compressor key input from any track (`Device::sidechain`, `Action::SetSidechain`, key on the effect's inputs 2-3, `Effect::process_keyed`); KEY in a built-in module's header picks the source track. Still to do: plugins with a sidechain bus
 - [x] DSP load readout in the top bar (`Telemetry::Load`: render time over block time, red from 90%)
-- [ ] Freeze (render a track through its devices to audio, devices unloaded) and bounce in place
+- [x] Freeze (render a track through its devices to audio, devices unloaded) and bounce in place (FREEZE / THAW under + DEVICE in the rack, Shift-click bounces; the render is pre-fader, so the fader, pan and sends still apply)
 - [ ] Input monitoring and per-track record arm; duplex recording with input/output latency compensation
 
 ### Phase 9: Audio Editing

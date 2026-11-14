@@ -48,11 +48,13 @@ pub struct Export {
     pub format: ExportFormat,
     /// The sample rate to convert the files to; `None` keeps the project's.
     pub rate: Option<u32>,
-    pub master: Output,
-    /// (track index, file) per stem.
-    pub stems: Vec<(usize, Output)>,
+    /// Each file and what it records: `None` is the mix, else a track.
+    pub outputs: Vec<(Option<usize>, Output)>,
     /// What the next plan taps, per output: `None` is the master.
     pub taps: Vec<(Option<usize>, TapSource)>,
+    /// A freeze: the frozen track's id, whether to bounce it in place, and the
+    /// project revision it rendered.
+    pub freeze: Option<(u64, bool, u64)>,
     /// Rendering offline on a worker (when the engine could be borrowed).
     pub offline: bool,
     /// Play has been sent, once the plan carrying the taps was delivered.
@@ -69,12 +71,13 @@ fn clean(name: &str) -> String {
 }
 
 impl Export {
-    /// Starts writers for the mix, named `name`, and for each `(index, name)`
-    /// stem, into `dir`. Fails, leaving no files, if one cannot be created.
+    /// Starts writers into `dir` for each output: `(None, _)` is the mix, named
+    /// `name`, and `(Some(index), track)` a track's stem. Fails, leaving no
+    /// files, if one cannot be created.
     pub fn start(
         dir: &Path,
         name: &str,
-        stems: &[(usize, String)],
+        outputs: &[(Option<usize>, String)],
         sample_rate: u32,
         end: u64,
         format: ExportFormat,
@@ -85,12 +88,11 @@ impl Export {
         let offline = playhead.is_none();
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         let mut made: Vec<(Output, TapSource)> = Vec::new();
-        let files = std::iter::once(format!("{}.wav", clean(name))).chain(
-            stems
-                .iter()
-                // The index keeps two tracks with one name from sharing a file.
-                .map(|(i, stem)| format!("{} - {:02} {}.wav", clean(name), i + 1, clean(stem))),
-        );
+        let files = outputs.iter().map(|(who, stem)| match who {
+            None => format!("{}.wav", clean(name)),
+            // The index keeps two tracks with one name from sharing a file.
+            Some(i) => format!("{} - {:02} {}.wav", clean(name), i + 1, clean(stem)),
+        });
         for file in files {
             let path = dir.join(file);
             if offline {
@@ -124,21 +126,19 @@ impl Export {
                 TapSource::Live(input),
             ));
         }
-        let mut made = made.into_iter();
-        let (master, input) = made.next().expect("the master is always made");
-        let mut taps = vec![(None, input)];
-        let mut outputs = Vec::new();
-        for ((out, input), (i, _)) in made.zip(stems) {
-            taps.push((Some(*i), input));
-            outputs.push((*i, out));
+        let mut taps = Vec::new();
+        let mut files = Vec::new();
+        for ((out, input), (who, _)) in made.into_iter().zip(outputs) {
+            taps.push((*who, input));
+            files.push((*who, out));
         }
         Ok(Self {
             start: 0,
             end,
             format,
             rate: None,
-            master,
-            stems: outputs,
+            outputs: files,
+            freeze: None,
             taps,
             offline,
             play_sent: false,
@@ -153,17 +153,17 @@ impl Export {
     }
 
     fn outputs(&self) -> impl Iterator<Item = &Output> {
-        std::iter::once(&self.master).chain(self.stems.iter().map(|s| &s.1))
+        self.outputs.iter().map(|o| &o.1)
     }
 
     fn outputs_mut(&mut self) -> impl Iterator<Item = &mut Output> {
-        std::iter::once(&mut self.master).chain(self.stems.iter_mut().map(|s| &mut s.1))
+        self.outputs.iter_mut().map(|o| &mut o.1)
     }
 
     /// Stops every writer, then on a worker thread trims each file's plugin
-    /// delay and converts it to the chosen format. Returns the master's final
-    /// path and that job (which reports failures). If a writer failed, every
-    /// file is deleted and the error returned.
+    /// delay and converts it to the chosen format. Returns the first output's
+    /// final path and that job (which reports failures). If a writer failed,
+    /// every file is deleted and the error returned.
     pub fn finish(mut self) -> Result<(PathBuf, Conversion), String> {
         let mut files = Vec::new();
         let mut error = None;
@@ -202,9 +202,11 @@ impl Export {
             return Err(e);
         }
         let convert = afconvert_args(self.format, self.rate);
+        let first = self.outputs.first().map(|o| o.1.path.clone());
+        let first = first.ok_or_else(|| "nothing to export".to_string())?;
         let master = match &convert {
-            Some((_, ext)) => self.master.path.with_extension(ext),
-            None => self.master.path.clone(),
+            Some((_, ext)) => first.with_extension(ext),
+            None => first,
         };
         let job = thread::spawn(move || {
             let mut failures = Vec::new();
@@ -238,9 +240,7 @@ impl Export {
 
     /// Stops the writers and deletes the partial files.
     pub fn abort(self) {
-        std::iter::once(self.master)
-            .chain(self.stems.into_iter().map(|s| s.1))
-            .for_each(Output::discard);
+        self.outputs.into_iter().for_each(|o| o.1.discard());
     }
 }
 
@@ -356,15 +356,25 @@ mod tests {
     #[test]
     fn an_offline_export_finishes_its_file_taps_and_trims_their_delay() {
         let dir = std::env::temp_dir().join(format!("canary-offline-{}", std::process::id()));
-        let mut e = Export::start(&dir, "Song", &[], 48_000, 8, ExportFormat::Wav32, None).unwrap();
+        let mut e = Export::start(
+            &dir,
+            "Song",
+            &[(None, String::new())],
+            48_000,
+            8,
+            ExportFormat::Wav32,
+            None,
+        )
+        .unwrap();
         assert!(
             e.offline && !dir.join("Song.wav").exists(),
             "files come with the taps"
         );
         // What rebuild does: a file tap for the master, two frames of delay.
-        let (mut tap, done) = daw_engine::file_tap(&e.master.path, 48_000, 10).unwrap();
-        e.master.skip = 2;
-        e.master.writer = Writer::File(Some(done));
+        let master = &mut e.outputs[0].1;
+        let (mut tap, done) = daw_engine::file_tap(&master.path, 48_000, 10).unwrap();
+        master.skip = 2;
+        master.writer = Writer::File(Some(done));
         let ctx = daw_core::ProcessContext {
             playing: true,
             num_samples: 10,

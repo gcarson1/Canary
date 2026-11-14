@@ -999,23 +999,17 @@ impl History {
     /// Writes the project to `path` without marking it saved: an autosave or a
     /// template.
     pub fn save_copy(&self, path: &Path) -> Result<(), ProjectError> {
+        write_file(path, &self.to_file_bytes()?)
+    }
+
+    /// The project as a `.daw` file's bytes, for `write_file` elsewhere (an
+    /// autosave on a worker thread).
+    pub fn to_file_bytes(&self) -> Result<Vec<u8>, ProjectError> {
         let file = ProjectFile {
             version: FORMAT_VERSION,
             project: self.project.clone(),
         };
-        let json = serde_json::to_vec_pretty(&file).map_err(ProjectError::Format)?;
-        // Write, flush to disk, then rename, so a crash, power cut or full disk
-        // never leaves a broken or empty project.
-        let tmp = path.with_extension("daw.tmp");
-        let written = fs::File::create(&tmp).and_then(|mut f| {
-            f.write_all(&json)?;
-            f.sync_all()
-        });
-        if let Err(e) = written {
-            let _ = fs::remove_file(&tmp);
-            return Err(ProjectError::Io(e));
-        }
-        fs::rename(&tmp, path).map_err(ProjectError::Io)
+        serde_json::to_vec_pretty(&file).map_err(ProjectError::Format)
     }
 
     /// Reads a project written by `save`, with empty undo history.
@@ -1165,6 +1159,22 @@ impl fmt::Display for ProjectError {
 }
 
 impl std::error::Error for ProjectError {}
+
+/// Writes `bytes` to `path` safely: to a temporary file, flushed to disk, then
+/// renamed over it, so a crash, power cut or full disk never leaves a broken
+/// or empty project.
+pub fn write_file(path: &Path, bytes: &[u8]) -> Result<(), ProjectError> {
+    let tmp = path.with_extension("daw.tmp");
+    let written = fs::File::create(&tmp).and_then(|mut f| {
+        f.write_all(bytes)?;
+        f.sync_all()
+    });
+    if let Err(e) = written {
+        let _ = fs::remove_file(&tmp);
+        return Err(ProjectError::Io(e));
+    }
+    fs::rename(&tmp, path).map_err(ProjectError::Io)
+}
 
 #[cfg(test)]
 mod tests {

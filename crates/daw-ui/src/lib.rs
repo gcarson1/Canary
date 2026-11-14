@@ -1755,10 +1755,8 @@ impl Workspace {
             let (left, solo) = toggle(badge.min.x - 0.75 * u, "S", track.solo, t.accent_amber);
             let (_, mute) = toggle(left - 0.25 * u, "M", track.mute, t.ink);
             if mute || solo {
-                let mut props = TrackProps::of(track);
-                props.mute ^= mute;
-                props.solo ^= solo;
-                edit = Some(Action::SetTrackProps { index: i, props });
+                let alt = ui.input(|i| i.modifiers.alt);
+                edit = Some(mute_solo(tracks, i, solo, alt));
             } else if resp.clicked() {
                 self.selected_track = Some(i);
                 self.track_focused = true;
@@ -2008,6 +2006,45 @@ impl Workspace {
 }
 
 /// The browser shows names, not paths.
+/// A click on track `index`'s M (or S when `solo`): toggles it, or with Option
+/// makes it the only muted (soloed) track, Option-clicking it again clears all.
+pub(crate) fn mute_solo(tracks: &[Track], index: usize, solo: bool, exclusive: bool) -> Action {
+    let flag = |t: &Track| if solo { t.solo } else { t.mute };
+    let set = |t: &Track, on: bool| {
+        let mut props = TrackProps::of(t);
+        if solo {
+            props.solo = on;
+        } else {
+            props.mute = on;
+        }
+        props
+    };
+    if !exclusive {
+        let t = &tracks[index];
+        return Action::SetTrackProps {
+            index,
+            props: set(t, !flag(t)),
+        };
+    }
+    // Already the only one: Option-click again turns them all off.
+    let only = tracks
+        .iter()
+        .enumerate()
+        .all(|(i, t)| flag(t) == (i == index));
+    let edits = tracks
+        .iter()
+        .enumerate()
+        .filter_map(|(i, t)| {
+            let on = !only && i == index;
+            (flag(t) != on).then(|| Action::SetTrackProps {
+                index: i,
+                props: set(t, on),
+            })
+        })
+        .collect();
+    Action::Batch(edits)
+}
+
 /// How far a `len`-row list in `r` that fits `fits` rows is scrolled, in rows
 /// (fractional, so slow trackpad scrolls add up), after this frame's wheel or
 /// trackpad scroll over `r`. Show from row `as usize`.
@@ -2029,4 +2066,37 @@ fn file_name(path: &Path) -> String {
         || path.display().to_string(),
         |n| n.to_string_lossy().into_owned(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn option_click_solos_one_track_then_clears() {
+        let mut tracks: Vec<Track> = (0..3).map(|i| Track::new(format!("T{i}"))).collect();
+        tracks[2].solo = true;
+        let apply = |tracks: &mut Vec<Track>, a: Action| {
+            let edits = match a {
+                Action::Batch(v) => v,
+                one => vec![one],
+            };
+            for e in edits {
+                if let Action::SetTrackProps { index, props } = e {
+                    tracks[index].solo = props.solo;
+                    tracks[index].mute = props.mute;
+                }
+            }
+        };
+        let solos = |t: &[Track]| t.iter().map(|t| t.solo).collect::<Vec<_>>();
+        let a = mute_solo(&tracks, 0, true, true);
+        apply(&mut tracks, a);
+        assert_eq!(solos(&tracks), [true, false, false], "only track 0");
+        let a = mute_solo(&tracks, 0, true, true);
+        apply(&mut tracks, a);
+        assert_eq!(solos(&tracks), [false, false, false], "again: all off");
+        let a = mute_solo(&tracks, 1, true, false);
+        apply(&mut tracks, a);
+        assert_eq!(solos(&tracks), [false, true, false], "plain click toggles");
+    }
 }

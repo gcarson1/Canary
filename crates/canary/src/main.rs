@@ -147,6 +147,8 @@ struct App {
     preview_tx: mpsc::Sender<(PathBuf, Arc<SampleData>)>,
     preview_rx: mpsc::Receiver<(PathBuf, Arc<SampleData>)>,
     last_autosave: Instant,
+    /// The autosave being written on a worker thread.
+    autosave_job: Option<thread::JoinHandle<Result<(), String>>>,
     /// The revision last autosaved: nothing new, nothing to write.
     autosaved: Option<u64>,
     /// The monitor mode and A/B reference to put back after an export.
@@ -303,6 +305,7 @@ impl App {
             input_faults: daw_engine::StreamFaults::default(),
             export: None,
             last_autosave: Instant::now(),
+            autosave_job: None,
             autosaved: None,
             export_restore: None,
             converting: None,
@@ -1764,11 +1767,26 @@ impl App {
         {
             return;
         }
+        // The last write is still going (a slow disk): try again next frame.
+        if self.autosave_job.as_ref().is_some_and(|j| !j.is_finished()) {
+            return;
+        }
+        if let Some(Ok(Err(e))) = self.autosave_job.take().map(thread::JoinHandle::join) {
+            self.error(format!("autosave failed: {e}"));
+        }
         self.last_autosave = Instant::now();
         self.autosaved = Some(self.history.revision());
         let _ = self.gather_state();
-        if let Err(e) = self.history.save_copy(&self.autosave_path()) {
-            self.error(format!("autosave failed: {e}"));
+        // Serialized here; written and flushed to disk off the UI thread, so a
+        // slow fsync never stalls a frame.
+        match self.history.to_file_bytes() {
+            Ok(bytes) => {
+                let path = self.autosave_path();
+                self.autosave_job = Some(thread::spawn(move || {
+                    daw_project::write_file(&path, &bytes).map_err(|e| e.to_string())
+                }));
+            }
+            Err(e) => self.error(format!("autosave failed: {e}")),
         }
     }
 
@@ -1832,6 +1850,11 @@ impl App {
         let errors = self.gather_state();
         match self.history.save(&self.project_path) {
             Ok(()) => {
+                // A background autosave finishing later must not leave a file
+                // that looks newer than this save.
+                if let Some(job) = self.autosave_job.take() {
+                    let _ = job.join();
+                }
                 let _ = fs::remove_file(self.autosave_path());
                 self.ws.status = Some(Status {
                     text: "SAVED".into(),

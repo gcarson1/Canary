@@ -52,6 +52,10 @@ pub(crate) struct View {
     placed: bool,
     /// Notes Cmd+C or Cmd+X took, for Cmd+V.
     copied: Vec<Note>,
+    /// Key height as a multiple of the default (Option+scroll zooms it).
+    key_zoom: f32,
+    /// The looping playhead's tick last frame, to follow it while in view.
+    last_tick: u64,
 }
 
 impl Default for View {
@@ -65,6 +69,8 @@ impl Default for View {
             length: STEP,
             placed: false,
             copied: Vec::new(),
+            key_zoom: 1.0,
+            last_tick: 0,
         }
     }
 }
@@ -145,7 +151,7 @@ pub(crate) fn show(
     let keys_w = 4.0 * u;
     let ruler_h = 1.25 * u;
     let lane_h = 4.0 * u;
-    let kh = 0.75 * u;
+    let kh = 0.75 * u * ws.roll.key_zoom;
     let lane_top = m.snap(r.max.y - lane_h);
     let ruler = Rect::from_x_y_ranges(
         m.snap(r.min.x + keys_w)..=r.max.x,
@@ -166,7 +172,17 @@ pub(crate) fn show(
         let (delta, zoom, pointer) =
             ui.input(|i| (i.smooth_scroll_delta, i.zoom_delta(), i.pointer.hover_pos()));
         let factor = 1.0 / zoom.max(1e-3);
-        if factor != 1.0 {
+        let alt = ui.input(|i| i.modifiers.alt);
+        if alt && delta.y != 0.0 {
+            // Option+scroll: taller or shorter keys, the key under the pointer
+            // staying put.
+            let y = pointer.map_or(grid.center().y, |p| p.y) - grid.min.y;
+            let key_pos = (v.top + y) / kh;
+            v.key_zoom = (v.key_zoom * (1.0 + delta.y / 200.0)).clamp(0.5, 3.0);
+            let kh = 0.75 * u * v.key_zoom;
+            let max_top = (128.0 * kh - grid.height()).max(0.0);
+            v.top = (key_pos * kh - y).clamp(0.0, max_top);
+        } else if factor != 1.0 {
             let x = pointer.map_or(grid.center().x, |p| p.x);
             let anchor = v.start + f64::from(x - grid.min.x) * v.zoom;
             v.zoom = (v.zoom * f64::from(factor)).clamp(0.25, 200.0);
@@ -279,13 +295,23 @@ pub(crate) fn show(
             );
         }
     }
-    // Playhead while the pattern loops.
+    // Playhead while the pattern loops; followed (page by page, and back to
+    // the start on each wrap) while it was in view, unless something is dragged.
     if inputs.engine.playing && !ws.song && pattern.is_some() {
         let tick = project.ticks_at(inputs.engine.playhead) % length.max(1);
         let x = x_of(tick as f64);
         if (grid.min.x..=grid.max.x).contains(&x) {
             p.vline(m.snap(x), ruler.min.y..=r.max.y, m.hair(t.text));
         }
+        let v = &mut ws.roll;
+        let in_view = |t: u64| {
+            let x = grid.min.x + ((t as f64 - v.start) / v.zoom) as f32;
+            (grid.min.x..grid.max.x).contains(&x)
+        };
+        if v.gesture.is_none() && in_view(v.last_tick) && !in_view(tick) {
+            v.start = tick as f64;
+        }
+        v.last_tick = tick;
     }
 
     // Keyboard: press a key to hear it.
@@ -329,6 +355,24 @@ pub(crate) fn show(
             out.push(Request::Note {
                 track: ti,
                 key: key_at(pos.y),
+                on: true,
+            });
+        }
+    }
+    // Dragging along the keys plays each one it reaches (a glissando).
+    if let (true, Some(old), Some(pos)) =
+        (kresp.dragged(), held, ui.input(|i| i.pointer.hover_pos()))
+    {
+        let key = key_at(pos.y.clamp(keys.min.y, keys.max.y - 1.0));
+        if key != old {
+            out.push(Request::Note {
+                track: ti,
+                key: old,
+                on: false,
+            });
+            out.push(Request::Note {
+                track: ti,
+                key,
                 on: true,
             });
         }

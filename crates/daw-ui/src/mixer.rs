@@ -399,13 +399,8 @@ pub(crate) fn show(
                 if on { t.ink_text } else { t.muted },
             );
             if resp.clicked() {
-                let mut props = TrackProps::of(track);
-                if k == 0 {
-                    props.mute ^= true;
-                } else {
-                    props.solo ^= true;
-                }
-                ws.edit(Action::SetTrackProps { index: ti, props });
+                let alt = ui.input(|i| i.modifiers.alt);
+                ws.edit(crate::mute_solo(&project.tracks, ti, k == 1, alt));
             }
         }
     }

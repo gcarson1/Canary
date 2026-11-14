@@ -42,9 +42,12 @@ pub enum TapSource {
 }
 
 pub struct Export {
-    /// Timeline sample where the export ends.
+    /// Timeline samples where the export starts and ends.
+    pub start: u64,
     pub end: u64,
     pub format: ExportFormat,
+    /// The sample rate to convert the files to; `None` keeps the project's.
+    pub rate: Option<u32>,
     pub master: Output,
     /// (track index, file) per stem.
     pub stems: Vec<(usize, Output)>,
@@ -130,8 +133,10 @@ impl Export {
             outputs.push((*i, out));
         }
         Ok(Self {
+            start: 0,
             end,
             format,
+            rate: None,
             master,
             stems: outputs,
             taps,
@@ -196,8 +201,8 @@ impl Export {
             }
             return Err(e);
         }
-        let convert = afconvert_args(self.format);
-        let master = match convert {
+        let convert = afconvert_args(self.format, self.rate);
+        let master = match &convert {
             Some((_, ext)) => self.master.path.with_extension(ext),
             None => self.master.path.clone(),
         };
@@ -210,7 +215,7 @@ impl Export {
                         continue;
                     }
                 }
-                let Some((args, ext)) = convert else {
+                let Some((args, ext)) = &convert else {
                     continue;
                 };
                 let out = wav.with_extension(ext);
@@ -277,16 +282,41 @@ fn trim_front(path: &Path, frames: u64) -> Result<(), String> {
     daw_engine::write_wav(path, &split, spec.sample_rate)
 }
 
-/// `afconvert` options and the file extension for a format other than the
-/// float WAV the export writes.
-fn afconvert_args(format: ExportFormat) -> Option<(&'static [&'static str], &'static str)> {
-    match format {
-        ExportFormat::Wav32 => None,
-        ExportFormat::Wav24 => Some((&["-f", "WAVE", "-d", "LEI24"], "24.wav")),
-        ExportFormat::Aiff24 => Some((&["-f", "AIFF", "-d", "BEI24"], "aif")),
-        ExportFormat::Flac => Some((&["-f", "flac", "-d", "flac"], "flac")),
-        ExportFormat::Aac => Some((&["-f", "m4af", "-d", "aac", "-b", "256000"], "m4a")),
+/// `afconvert` options and the file extension for the chosen format and
+/// sample rate, unless that is the float WAV the export writes. Integer
+/// formats are dithered (TPDF).
+fn afconvert_args(format: ExportFormat, rate: Option<u32>) -> Option<(Vec<String>, String)> {
+    // Apple's AAC encoder goes no higher than 48 kHz.
+    let rate = match format {
+        ExportFormat::Aac => rate.map(|r| r.min(48_000)),
+        _ => rate,
+    };
+    let (file, data, dither, ext) = match format {
+        ExportFormat::Wav32 if rate.is_none() => return None,
+        // Named by rate so it cannot overwrite the float file it converts.
+        ExportFormat::Wav32 => ("WAVE", "LEF32", false, "f32.wav"),
+        ExportFormat::Wav24 => ("WAVE", "LEI24", true, "24.wav"),
+        ExportFormat::Wav16 => ("WAVE", "LEI16", true, "16.wav"),
+        ExportFormat::Aiff24 => ("AIFF", "BEI24", true, "aif"),
+        ExportFormat::Flac => ("flac", "flac", false, "flac"),
+        ExportFormat::Aac => ("m4af", "aac", false, "m4a"),
+    };
+    let data = match rate {
+        Some(r) => format!("{data}@{r}"),
+        None => data.to_string(),
+    };
+    let mut args: Vec<String> = ["-f", file, "-d", &data].map(String::from).into();
+    if dither {
+        args.extend(["--dither", "1"].map(String::from));
     }
+    if format == ExportFormat::Aac {
+        args.extend(["-b", "256000"].map(String::from));
+    }
+    let ext = match rate {
+        Some(r) => format!("{}k.{ext}", r / 1000),
+        None => ext.to_string(),
+    };
+    Some((args, ext))
 }
 
 #[cfg(test)]
@@ -297,14 +327,29 @@ mod tests {
     fn every_converted_format_gets_its_own_extension() {
         let all = [
             ExportFormat::Wav24,
+            ExportFormat::Wav16,
             ExportFormat::Aiff24,
             ExportFormat::Flac,
             ExportFormat::Aac,
         ];
-        let mut exts: Vec<_> = all.iter().map(|&f| afconvert_args(f).unwrap().1).collect();
+        let mut exts: Vec<_> = all
+            .iter()
+            .map(|&f| afconvert_args(f, None).unwrap().1)
+            .collect();
+        exts.sort();
         exts.dedup();
-        assert_eq!(exts.len(), 4);
-        assert!(afconvert_args(ExportFormat::Wav32).is_none());
+        assert_eq!(exts.len(), 5);
+        assert!(afconvert_args(ExportFormat::Wav32, None).is_none());
+        // A new rate resamples (even the float WAV) and names the file by it.
+        let (args, ext) = afconvert_args(ExportFormat::Wav32, Some(44_100)).unwrap();
+        assert_eq!(
+            (args[3].as_str(), ext.as_str()),
+            ("LEF32@44100", "44k.f32.wav")
+        );
+        let (args, _) = afconvert_args(ExportFormat::Wav16, Some(48_000)).unwrap();
+        assert!(args.ends_with(&["--dither".into(), "1".into()]));
+        let (args, ext) = afconvert_args(ExportFormat::Aac, Some(96_000)).unwrap();
+        assert_eq!((args[3].as_str(), ext.as_str()), ("aac@48000", "48k.m4a"));
         assert_eq!(clean("a/b:c"), "a-b-c");
     }
 

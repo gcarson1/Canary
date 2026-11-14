@@ -1741,7 +1741,9 @@ impl App {
             return self.error("nothing to export".into());
         }
         let rate = project.sample_rate;
-        let end = project.samples_at(song_end) + export::TAIL_SECONDS * u64::from(rate);
+        let Some((start, end)) = export_range(project, song_end) else {
+            return self.error("the loop region is empty".into());
+        };
         let tracks: Vec<(usize, String)> = if stems {
             project
                 .tracks
@@ -1770,7 +1772,9 @@ impl App {
                 .then(|| self.engine.playhead_clock()),
         );
         match started {
-            Ok(e) => {
+            Ok(mut e) => {
+                e.start = start;
+                e.rate = self.ws.export_rate.filter(|&r| r != rate);
                 self.export = Some(e);
                 self.ws.song = true;
                 // The mix as it is, not what the monitor section is listening to.
@@ -1779,7 +1783,7 @@ impl App {
                 self.monitor.set_reference(false);
                 self.built = None; // the next plan carries the taps
                                    // Play waits until that plan is delivered (tend_export).
-                for c in [Command::Stop, Command::Seek(0)] {
+                for c in [Command::Stop, Command::Seek(start)] {
                     let _ = self.engine.commands.push(c);
                 }
             }
@@ -1898,8 +1902,8 @@ impl App {
         if e.offline {
             let finished = self.rendering.as_ref().is_none_or(|r| r.0.is_finished());
             if !finished {
-                let end = e.record_end().max(1);
-                let pct = (self.view.playhead * 100 / end).min(99);
+                let pct = (progress(self.view.playhead, e.start, e.record_end()) * 100.0) as u64;
+                let pct = pct.min(99);
                 self.ws.status = Some(Status {
                     text: format!("RENDERING {pct}% · EXPORT AGAIN TO ABORT"),
                     error: false,
@@ -1912,8 +1916,9 @@ impl App {
             }
             return self.finish_export();
         }
-        // A playhead from before the seek to 0 does not count as rolling.
-        if self.view.playing && self.view.playhead < e.end {
+        // A playhead from before the seek to the start does not count as rolling.
+        // (Seek(start) went before Play, so any playhead at or past it counts.)
+        if self.view.playing && self.view.playhead >= e.start {
             e.started = true;
         }
         if !e.started {
@@ -1924,7 +1929,7 @@ impl App {
             if !self.view.playing {
                 return self.abort_export("EXPORT STOPPED EARLY · NOTHING SAVED".into(), true);
             }
-            let pct = self.view.playhead * 100 / end.max(1);
+            let pct = (progress(self.view.playhead, e.start, end) * 100.0) as u64;
             self.ws.status = Some(Status {
                 text: format!("EXPORTING {pct}% · EXPORT AGAIN TO ABORT"),
                 error: false,
@@ -2506,6 +2511,25 @@ fn metronome_clicks(project: &daw_project::Project, playback: Playback) -> Vec<S
         .collect()
 }
 
+/// The samples an export covers: the loop region when the song loop is on (no
+/// tail, so it loops cleanly), else the song to `song_end` plus a tail. `None`
+/// for an empty region.
+fn export_range(project: &daw_project::Project, song_end: u64) -> Option<(u64, u64)> {
+    let (start, end) = match project.loop_region.filter(|_| project.loop_on) {
+        Some((a, b)) => (project.samples_at(a), project.samples_at(b)),
+        None => (
+            0,
+            project.samples_at(song_end) + export::TAIL_SECONDS * u64::from(project.sample_rate),
+        ),
+    };
+    (end > start).then_some((start, end))
+}
+
+/// How far a playhead at `at` is through an export from `start` to `end`, 0 to 1.
+fn progress(at: u64, start: u64, end: u64) -> f64 {
+    (at.saturating_sub(start) as f64 / end.saturating_sub(start).max(1) as f64).min(1.0)
+}
+
 /// A render reached the export's end (and was not stopped short).
 fn rendered_to(playhead: u64, end: u64) -> bool {
     playhead >= end
@@ -2672,6 +2696,26 @@ mod tests {
     fn a_render_counts_only_if_it_reached_the_end() {
         assert!(rendered_to(1_000, 1_000));
         assert!(!rendered_to(999, 1_000), "stopped short: nothing saved");
+        // A range export counts from its own start.
+        assert_eq!(progress(1_500, 1_000, 2_000), 0.5);
+        assert_eq!(progress(500, 1_000, 2_000), 0.0);
+        assert_eq!(progress(9_000, 1_000, 1_000), 1.0);
+    }
+
+    #[test]
+    fn an_export_covers_the_loop_when_it_is_on_else_the_song_and_tail() {
+        use daw_project::PPQ;
+        // 120 BPM at 48 kHz: a beat is 24 000 samples.
+        let mut p = daw_project::Project {
+            loop_region: Some((PPQ, 3 * PPQ)),
+            ..Default::default()
+        };
+        let tail = export::TAIL_SECONDS * 48_000;
+        assert_eq!(export_range(&p, 4 * PPQ), Some((0, 96_000 + tail)));
+        p.loop_on = true;
+        assert_eq!(export_range(&p, 4 * PPQ), Some((24_000, 72_000)));
+        p.loop_region = Some((PPQ, PPQ));
+        assert_eq!(export_range(&p, 4 * PPQ), None, "an empty loop");
     }
 
     #[test]

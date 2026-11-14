@@ -124,8 +124,9 @@ pub enum Request {
         key: u8,
         on: bool,
     },
-    /// Play the song through and write the mix (and with `stems`, every track)
-    /// to files in `Inputs::export_format`; again while exporting aborts.
+    /// Play the song (the loop region, when the loop is on) through and write
+    /// the mix (and with `stems`, every track) to files in
+    /// `Workspace::export_format` at `export_rate`; again while exporting aborts.
     Export {
         stems: bool,
     },
@@ -224,6 +225,8 @@ pub enum ExportFormat {
     #[default]
     Wav32,
     Wav24,
+    /// 16-bit WAV, dithered.
+    Wav16,
     Aiff24,
     Flac,
     /// AAC in an .m4a at 256 kbit/s.
@@ -235,6 +238,7 @@ impl ExportFormat {
         match self {
             Self::Wav32 => "WAV32F",
             Self::Wav24 => "WAV24",
+            Self::Wav16 => "WAV16",
             Self::Aiff24 => "AIFF24",
             Self::Flac => "FLAC",
             Self::Aac => "AAC",
@@ -244,11 +248,22 @@ impl ExportFormat {
     fn next(self) -> Self {
         match self {
             Self::Wav32 => Self::Wav24,
-            Self::Wav24 => Self::Aiff24,
+            Self::Wav24 => Self::Wav16,
+            Self::Wav16 => Self::Aiff24,
             Self::Aiff24 => Self::Flac,
             Self::Flac => Self::Aac,
             Self::Aac => Self::Wav32,
         }
+    }
+}
+
+/// The export sample rate after `rate`: the project's, then 44.1, 48 and 96 kHz.
+fn next_export_rate(rate: Option<u32>) -> Option<u32> {
+    match rate {
+        None => Some(44_100),
+        Some(44_100) => Some(48_000),
+        Some(48_000) => Some(96_000),
+        Some(_) => None,
     }
 }
 
@@ -337,6 +352,8 @@ pub struct Workspace {
     /// The automation lane drawn over the selected track in the playlist.
     pub automation: Option<Target>,
     pub export_format: ExportFormat,
+    /// The sample rate exports are converted to; `None` keeps the project's.
+    pub export_rate: Option<u32>,
     seq: sequencer::View,
     roll: piano::View,
     timeline: timeline::View,
@@ -403,6 +420,7 @@ impl Default for Workspace {
             auto_pass: HashMap::new(),
             automation: None,
             export_format: ExportFormat::default(),
+            export_rate: None,
             seq: sequencer::View::default(),
             roll: piano::View::default(),
             timeline: timeline::View::default(),
@@ -1648,8 +1666,16 @@ impl Workspace {
             },
         );
         let rate = load;
-        // EXPORT (Shift: with stems); right-click picks the format.
-        let label = format!("EXPORT {}", self.export_format.label());
+        // EXPORT (Shift: with stems); right-click picks the format, and
+        // Shift+right-click the sample rate.
+        let label = match self.export_rate {
+            Some(r) => format!(
+                "EXPORT {} {}K",
+                self.export_format.label(),
+                r as f32 / 1000.0
+            ),
+            None => format!("EXPORT {}", self.export_format.label()),
+        };
         let g = p.layout_no_wrap(label.clone(), m.mono(0.625), t.text);
         let export = m.snap_rect(Rect::from_min_size(
             Pos2::new(rate.min.x - 1.0 * u - g.size().x - 0.75 * u, cy - 0.625 * u),
@@ -1670,7 +1696,11 @@ impl Workspace {
             out.push(Request::Export { stems });
         }
         if resp.secondary_clicked() {
-            self.export_format = self.export_format.next();
+            if ui.input(|i| i.modifiers.shift) {
+                self.export_rate = next_export_rate(self.export_rate);
+            } else {
+                self.export_format = self.export_format.next();
+            }
         }
         let rate = export;
         if let Some(status) = &self.status {

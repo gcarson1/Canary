@@ -13,6 +13,7 @@ pub mod pitch;
 mod scope;
 pub mod slice;
 pub mod stretch;
+pub mod transcribe;
 mod waveform;
 
 pub use click::Click;

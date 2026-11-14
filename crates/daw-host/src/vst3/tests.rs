@@ -534,3 +534,30 @@ fn stream_reads_nothing_past_the_end_and_rejects_bad_seeks() {
         assert_eq!((n, &buf[..2]), (2, &[2u8, 3][..]));
     }
 }
+
+#[test]
+fn edits_in_the_plugins_own_editor_reach_the_processor_and_mark_changes() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let b = bundle();
+    let id = b.plugins()[0].id.clone();
+    let (mut plugin, mut node) = Vst3Plugin::new(&b, &id, 48_000.0, 64).unwrap();
+    assert!(!plugin.take_edited());
+    // What the controller calls when its knob turns.
+    // SAFETY: the handler's own method, as the plugin would call it.
+    unsafe { plugin.instance.handler.performEdit(0, 0.5) };
+    assert!(plugin.take_edited(), "the project has unsaved changes");
+    assert!(!plugin.take_edited(), "once");
+    assert_eq!(run(&mut node, &[]), [1.0; 8], "not until the host idles");
+    plugin.idle();
+    assert_eq!(run(&mut node, &[]), [0.5; 8], "the processor has it");
+    // A latency change asks for the plugin to be made again.
+    assert!(!plugin.wants_restart());
+    // SAFETY: as above.
+    unsafe {
+        plugin
+            .instance
+            .handler
+            .restartComponent(RestartFlags_::kLatencyChanged as int32)
+    };
+    assert!(plugin.wants_restart());
+}

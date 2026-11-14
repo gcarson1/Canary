@@ -2405,7 +2405,11 @@ impl eframe::App for App {
         self.feed_samplers();
         self.prepare_reference();
         let engine = &self.engine;
-        self.devices.idle(|n| engine.removed_by_is_gone(n));
+        if self.devices.idle(|n| engine.removed_by_is_gone(n)) {
+            // An edit in a plugin's own window: quitting and autosave keep it.
+            self.history.mark_dirty();
+            self.autosaved = None;
+        }
         let views = self
             .ws
             .selected_track

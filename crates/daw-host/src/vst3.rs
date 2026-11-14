@@ -236,6 +236,60 @@ impl IHostApplicationTrait for HostApp {
     }
 }
 
+/// The plugin's line back to the host from its controller: edits made in its
+/// own editor (`performEdit`), and restart requests. Called on the main
+/// thread; `Vst3Plugin::idle` forwards the edits to the processor.
+#[derive(Default)]
+struct EditHandler {
+    edits: Mutex<Vec<(u32, f64)>>,
+    /// Some edit arrived since the host last asked (the project changed).
+    edited: std::sync::atomic::AtomicBool,
+    /// `restartComponent` asked for a new latency (or I/O): remake it.
+    restart: std::sync::atomic::AtomicBool,
+}
+
+impl Class for EditHandler {
+    type Interfaces = (IComponentHandler,);
+}
+
+impl IComponentHandlerTrait for EditHandler {
+    unsafe fn beginEdit(&self, _id: ParamID) -> tresult {
+        kResultOk
+    }
+
+    unsafe fn performEdit(&self, id: ParamID, value: ParamValue) -> tresult {
+        if !value.is_finite() {
+            return kInvalidArgument;
+        }
+        if let Ok(mut edits) = self.edits.lock() {
+            // Bounded: a plugin flooding edits between two idles keeps the latest.
+            if edits.len() >= 4096 {
+                edits.remove(0);
+            }
+            edits.push((id, value.clamp(0.0, 1.0)));
+        }
+        self.edited.store(true, Ordering::Release);
+        kResultOk
+    }
+
+    unsafe fn endEdit(&self, _id: ParamID) -> tresult {
+        kResultOk
+    }
+
+    unsafe fn restartComponent(&self, flags: int32) -> tresult {
+        const REMAKE: int32 = RestartFlags_::kLatencyChanged as int32
+            | RestartFlags_::kIoChanged as int32
+            | RestartFlags_::kReloadComponent as int32;
+        if flags & REMAKE != 0 {
+            self.restart.store(true, Ordering::Release);
+        }
+        if flags & RestartFlags_::kParamValuesChanged as int32 != 0 {
+            self.edited.store(true, Ordering::Release);
+        }
+        kResultOk
+    }
+}
+
 /// An in-memory `IBStream` for plugin state.
 struct Stream {
     data: Mutex<(Vec<u8>, usize)>,
@@ -443,6 +497,7 @@ struct Instance {
     separate: Option<ComPtr<IEditController>>,
     controller: ComPtr<IEditController>,
     _host: ComWrapper<HostApp>,
+    handler: ComWrapper<EditHandler>,
     _bundle: Arc<Vst3Bundle>,
     /// Set once `setActive(1)` succeeded; processing calls are only legal after.
     active: bool,
@@ -461,6 +516,8 @@ impl Drop for Instance {
                 self.processor.setProcessing(0);
                 self.component.setActive(0);
             }
+            // The controller lets go of the handler before it goes.
+            self.controller.setComponentHandler(ptr::null_mut());
             if let Some(c) = &self.separate {
                 c.terminate();
             }
@@ -669,9 +726,14 @@ impl Vst3Plugin {
                 separate,
                 controller,
                 _host: host,
+                handler: ComWrapper::new(EditHandler::default()),
                 _bundle: bundle.clone(),
                 active: false,
             };
+            // Edits in the plugin's own editor come back through this.
+            if let Some(h) = instance.handler.as_com_ref::<IComponentHandler>() {
+                instance.controller.setComponentHandler(h.as_ptr());
+            }
             let inputs = bus_channels(
                 &instance.component,
                 MediaTypes_::kAudio as MediaType,
@@ -872,6 +934,32 @@ impl Vst3Plugin {
             .any(|p| p.id == id)
             // SAFETY: main-thread controller query.
             .then(|| unsafe { self.instance.controller.getParamNormalized(id) })
+    }
+
+    /// Forwards edits made in the plugin's own editor to the processor (the
+    /// controller has them already).
+    pub fn idle(&mut self) {
+        let edits = self
+            .instance
+            .handler
+            .edits
+            .lock()
+            .map(|mut e| std::mem::take(&mut *e))
+            .unwrap_or_default();
+        for (id, value) in edits {
+            // A full queue drops the edit; the controller still shows it.
+            let _ = self.changes.push((id, value));
+        }
+    }
+
+    /// True once after the plugin's editor changed a parameter.
+    pub fn take_edited(&mut self) -> bool {
+        self.instance.handler.edited.swap(false, Ordering::AcqRel)
+    }
+
+    /// True once after the plugin asked to be restarted (a new latency).
+    pub fn wants_restart(&mut self) -> bool {
+        self.instance.handler.restart.swap(false, Ordering::AcqRel)
     }
 
     /// Sets a normalized parameter on the controller and queues it for the

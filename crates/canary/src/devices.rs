@@ -786,10 +786,14 @@ impl Devices {
     /// Main-thread plugin work, and dropping retired handles once `gone` says
     /// the plan removing their node has had its removed nodes dropped
     /// (`EngineHandle::removed_by_is_gone`).
-    pub fn idle(&mut self, gone: impl Fn(u64) -> bool) {
+    /// Returns true when a plugin's own editor changed something (the project
+    /// has unsaved changes).
+    pub fn idle(&mut self, gone: impl Fn(u64) -> bool) -> bool {
         let mut restart = Vec::new();
+        let mut edited = false;
         for (uid, l) in &mut self.live {
             l.hosted.idle();
+            edited |= l.hosted.take_edited();
             // Not one still waiting to reach the engine: it is made at most once.
             if l.hosted.wants_restart() && l.node.is_none() {
                 restart.push(*uid);
@@ -812,6 +816,7 @@ impl Devices {
                 self.ara[doc].release(ext);
             }
         }
+        edited
     }
 }
 

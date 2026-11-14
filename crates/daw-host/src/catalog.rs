@@ -52,6 +52,11 @@ pub trait Hosted {
     }
     /// Main-thread work the plugin asked for; call regularly.
     fn idle(&mut self) {}
+    /// True once after the plugin's own editor changed something, so the
+    /// project has unsaved changes.
+    fn take_edited(&mut self) -> bool {
+        false
+    }
     /// True once after the plugin asked to be deactivated and activated again
     /// (CLAP `request_restart`, e.g. for a new latency): the host remakes it
     /// from its saved state, since the active instance runs in the engine.
@@ -180,6 +185,15 @@ impl Hosted for Vst3Plugin {
     }
     fn ara_extension(&self) -> Option<NonNull<c_void>> {
         Vst3Plugin::ara_extension(self)
+    }
+    fn idle(&mut self) {
+        Vst3Plugin::idle(self)
+    }
+    fn take_edited(&mut self) -> bool {
+        Vst3Plugin::take_edited(self)
+    }
+    fn wants_restart(&mut self) -> bool {
+        Vst3Plugin::wants_restart(self)
     }
 }
 

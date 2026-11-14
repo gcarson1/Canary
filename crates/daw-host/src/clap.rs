@@ -827,7 +827,7 @@ mod tests {
         assert!(!plugin.wants_restart());
         plugin
             .instance
-            .access_shared_handler(|r| SharedHandler::request_restart(r));
+            .access_shared_handler(SharedHandler::request_restart);
         assert!(plugin.wants_restart(), "a restart request is seen");
         assert!(!plugin.wants_restart(), "once");
         assert!(!plugin.set_param(99, 1.0), "unknown id");

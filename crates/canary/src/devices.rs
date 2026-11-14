@@ -692,15 +692,14 @@ impl Devices {
                         .collect()
                 }),
                 editor: d.format != PluginFormat::Builtin,
-                file: self
-                    .live
-                    .get(&d.uid)
-                    .and_then(|l| l.hosted.file())
-                    .map(|(path, error)| FileView {
+                file: self.live.get(&d.uid).and_then(|l| l.hosted.file()).map(
+                    |(path, error, takes)| FileView {
                         name: path
                             .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned())),
                         error,
-                    }),
+                        takes: takes.into(),
+                    },
+                ),
                 eq: self
                     .live
                     .get(&d.uid)

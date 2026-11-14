@@ -902,6 +902,7 @@ version = "0.1.0"
 dependencies = [
  "daw-core",
  "fft-convolver",
+ "hound",
  "rtrb",
  "serde",
  "serde_json",

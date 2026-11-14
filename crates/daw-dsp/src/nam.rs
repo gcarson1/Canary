@@ -778,6 +778,9 @@ impl FileLoader for NamLoader {
     fn extensions(&self) -> &'static [&'static str] {
         &["nam"]
     }
+    fn takes(&self) -> &'static str {
+        "NAM CAPTURE"
+    }
 }
 
 impl Effect for NamAmp {

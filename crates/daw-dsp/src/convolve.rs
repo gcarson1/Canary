@@ -3,16 +3,22 @@
 //! an impulse response allocates, so a worker thread per instance builds it
 //! whenever DECAY or DAMP change and hands it to the audio thread over a
 //! lock-free queue; the old one keeps ringing out its tail, fed silence, so a
-//! change never cuts the reverb off.
+//! change never cuts the reverb off. A WAV impulse response dropped on the
+//! device replaces the synthesized space (DECAY and DAMP then do nothing).
 
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Duration;
 
 use fft_convolver::TwoStageFFTConvolver;
 use rtrb::{Consumer, Producer, RingBuffer};
 
-use crate::effects::{Effect, ParamSpec};
+use crate::effects::{Effect, FileLoader, ParamSpec};
+
+/// The longest impulse response a file may hold, in seconds.
+const MAX_IR_SECONDS: f32 = 20.0;
 
 /// Samples per head block: the cost of a block, not latency (there is none).
 const HEAD_BLOCK: usize = 128;
@@ -90,16 +96,96 @@ pub fn synth_ir(decay: f32, damp: f32, sample_rate: f32) -> [Vec<f32>; 2] {
             ir.push(lp * envelope);
         }
     }
-    // Half the input's power out for white noise: a tail sits under the dry.
-    let energy: f32 = sides.iter().flatten().map(|s| s * s).sum::<f32>() / 2.0;
-    let scale = (0.25 / energy.max(1e-12)).sqrt();
-    sides.iter_mut().flatten().for_each(|s| *s *= scale);
+    normalize(&mut sides);
     sides
 }
 
+/// Half the input's power out for white noise: a tail sits under the dry.
+fn normalize(sides: &mut [Vec<f32>; 2]) {
+    let energy: f32 = sides.iter().flatten().map(|s| s * s).sum::<f32>() / 2.0;
+    let scale = (0.25 / energy.max(1e-12)).sqrt();
+    sides.iter_mut().flatten().for_each(|s| *s *= scale);
+}
+
+/// Reads a WAV impulse response as stereo at `sample_rate` (mono goes to both
+/// sides; more channels: the first two), normalized like the synthesized one.
+pub fn read_ir(path: &Path, sample_rate: f32) -> Result<[Vec<f32>; 2], String> {
+    let mut reader = hound::WavReader::open(path).map_err(|e| format!("not a WAV file: {e}"))?;
+    let spec = reader.spec();
+    let channels = usize::from(spec.channels.max(1));
+    let frames = reader.duration() as usize;
+    if frames == 0 || spec.sample_rate == 0 {
+        return Err("the file is empty".into());
+    }
+    if frames as f32 / spec.sample_rate as f32 > MAX_IR_SECONDS {
+        return Err(format!("longer than {MAX_IR_SECONDS} s"));
+    }
+    let samples: Vec<f32> = match spec.sample_format {
+        hound::SampleFormat::Float => reader.samples::<f32>().collect::<Result<_, _>>(),
+        hound::SampleFormat::Int => {
+            let full = (1i64 << (spec.bits_per_sample.clamp(1, 32) - 1)) as f32;
+            reader
+                .samples::<i32>()
+                .map(|s| s.map(|v| v as f32 / full))
+                .collect::<Result<_, _>>()
+        }
+    }
+    .map_err(|e| format!("cannot read the samples: {e}"))?;
+    let side = |c: usize| -> Vec<f32> {
+        let c = c.min(channels - 1);
+        samples
+            .chunks_exact(channels)
+            .map(|f| if f[c].is_finite() { f[c] } else { 0.0 })
+            .collect()
+    };
+    let mut sides = [side(0), side(1)].map(|s| resample(&s, spec.sample_rate as f32, sample_rate));
+    if sides[0].iter().chain(&sides[1]).all(|&s| s == 0.0) {
+        return Err("the file is silent".into());
+    }
+    normalize(&mut sides);
+    Ok(sides)
+}
+
+/// Windowed-sinc (Lanczos, 8 lobes) resampling of a whole signal from rate
+/// `from` to `to`, low-passing when it goes down. Main thread or worker.
+fn resample(x: &[f32], from: f32, to: f32) -> Vec<f32> {
+    if (from - to).abs() < 0.5 {
+        return x.to_vec();
+    }
+    const A: f64 = 8.0;
+    let step = f64::from(from) / f64::from(to);
+    let scale = (1.0 / step).min(1.0);
+    let width = A / scale;
+    let len = ((x.len() as f64) / step).ceil() as usize;
+    (0..len)
+        .map(|k| {
+            let t = k as f64 * step;
+            let first = (t - width).floor().max(0.0) as usize;
+            let last = ((t + width).ceil() as usize).min(x.len() - 1);
+            let mut sum = 0.0f64;
+            for (i, &s) in x.iter().enumerate().take(last + 1).skip(first) {
+                let d = (t - i as f64) * scale;
+                let w = if d.abs() < 1e-12 {
+                    1.0
+                } else if d.abs() >= A {
+                    0.0
+                } else {
+                    let p = std::f64::consts::PI * d;
+                    A * p.sin() * (p / A).sin() / (p * p)
+                };
+                sum += w * f64::from(s);
+            }
+            (sum * scale) as f32
+        })
+        .collect()
+}
+
 fn build(decay: f32, damp: f32, sample_rate: f32) -> Box<Engine> {
-    let irs = synth_ir(decay, damp, sample_rate);
-    let tail = irs[0].len();
+    from_ir(synth_ir(decay, damp, sample_rate))
+}
+
+fn from_ir(irs: [Vec<f32>; 2]) -> Box<Engine> {
+    let tail = irs[0].len().max(irs[1].len());
     let sides = irs.map(|ir| {
         let mut c = TwoStageFFTConvolver::default();
         // Only fails for a zero block size or an empty response.
@@ -111,25 +197,78 @@ fn build(decay: f32, damp: f32, sample_rate: f32) -> Box<Engine> {
 }
 
 /// Builds engines when the wanted space changes; drops the retired ones.
+/// A file's impulse response, or the synthesized one again.
+type FileIr = Option<[Vec<f32>; 2]>;
+
 fn worker(
     wanted: Arc<Wanted>,
     sample_rate: f32,
     mut built: (f32, f32),
     mut to_audio: Producer<Box<Engine>>,
     mut retired: Consumer<Box<Engine>>,
+    files: mpsc::Receiver<FileIr>,
 ) {
+    // A file's response waiting for room in the queue, and whether one rules.
+    let mut file: Option<[Vec<f32>; 2]> = None;
+    let mut from_file = false;
     while !wanted.stop.load(Ordering::Relaxed) {
         while retired.pop().is_ok() {}
+        while let Ok(ir) = files.try_recv() {
+            from_file = ir.is_some();
+            file = ir;
+            built = (f32::NAN, f32::NAN); // rebuild the synthesized one if asked
+        }
         let now = (
             f32::from_bits(wanted.decay.load(Ordering::Relaxed)),
             f32::from_bits(wanted.damp.load(Ordering::Relaxed)),
         );
-        if now != built && to_audio.slots() > 0 {
-            built = now;
+        if to_audio.slots() > 0 {
             // The queue had room a moment ago and only this thread pushes.
-            let _ = to_audio.push(build(now.0, now.1, sample_rate));
+            if let Some(ir) = file.take() {
+                let _ = to_audio.push(from_ir(ir));
+            } else if !from_file && now != built {
+                built = now;
+                let _ = to_audio.push(build(now.0, now.1, sample_rate));
+            }
         }
         std::thread::sleep(POLL);
+    }
+}
+
+/// The main thread's side of the convolver's file: reads and resamples an
+/// impulse response and hands it to the worker.
+pub struct IrLoader {
+    to_worker: mpsc::Sender<FileIr>,
+    sample_rate: f32,
+    path: Option<PathBuf>,
+    error: Option<String>,
+}
+
+impl FileLoader for IrLoader {
+    fn load(&mut self, path: &Path) -> Result<(), String> {
+        // Remembered even when it fails, so a project keeps pointing at it.
+        self.path = Some(path.to_path_buf());
+        let result = read_ir(path, self.sample_rate)
+            .map_err(|e| format!("{}: {e}", path.display()))
+            .and_then(|ir| {
+                self.to_worker
+                    .send(Some(ir))
+                    .map_err(|_| "the convolver is gone".to_string())
+            });
+        self.error = result.as_ref().err().cloned();
+        result
+    }
+    fn file(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+    fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+    fn extensions(&self) -> &'static [&'static str] {
+        &["wav"]
+    }
+    fn takes(&self) -> &'static str {
+        "WAV IMPULSE RESPONSE"
     }
 }
 
@@ -148,6 +287,8 @@ pub struct Convolver {
     pre_len: usize,
     /// Scratch for one block: delayed input, a draining tail, silence.
     scratch: [Box<[f32]>; 3],
+    /// The worker's file queue, until `file_loader` hands it out.
+    files: Option<mpsc::Sender<FileIr>>,
 }
 
 impl Default for Convolver {
@@ -168,6 +309,7 @@ impl Default for Convolver {
             pre_pos: 0,
             pre_len: 0,
             scratch: Default::default(),
+            files: None,
         }
     }
 }
@@ -293,10 +435,30 @@ impl Effect for Convolver {
         self.from_worker = Some(from_worker);
         self.to_worker = Some(to_worker);
         let wanted = self.wanted.clone();
+        let (files, from_main) = mpsc::channel();
+        self.files = Some(files);
         std::thread::Builder::new()
             .name("canary-convolver".into())
-            .spawn(move || worker(wanted, sample_rate, (decay, damp), to_audio, retired))
+            .spawn(move || {
+                worker(
+                    wanted,
+                    sample_rate,
+                    (decay, damp),
+                    to_audio,
+                    retired,
+                    from_main,
+                )
+            })
             .expect("spawn the convolver's worker thread");
+    }
+    fn file_loader(&mut self) -> Option<Box<dyn FileLoader>> {
+        let to_worker = self.files.take()?;
+        Some(Box::new(IrLoader {
+            to_worker,
+            sample_rate: self.sr,
+            path: None,
+            error: None,
+        }))
     }
     fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
         if self.pre[0].is_empty() {
@@ -324,6 +486,62 @@ mod tests {
     use crate::effects::effect;
 
     const SR: f32 = 48_000.0;
+
+    /// A mono 16-bit WAV at 44.1 kHz: a click, silence, a second click at 0.1 s.
+    fn write_ir(name: &str) -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("canary-ir-{}-{name}.wav", std::process::id()));
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 44_100,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut w = hound::WavWriter::create(&path, spec).unwrap();
+        for i in 0..8_820 {
+            w.write_sample(if i == 0 || i == 4_410 { i16::MAX } else { 0 })
+                .unwrap();
+        }
+        w.finalize().unwrap();
+        path
+    }
+
+    #[test]
+    fn a_wav_impulse_response_is_read_resampled_and_used() {
+        let path = write_ir("echo");
+        let ir = read_ir(&path, SR).unwrap();
+        assert_eq!(ir[0], ir[1], "mono goes to both sides");
+        assert!((ir[0].len() as i64 - 9_600).abs() <= 1, "{}", ir[0].len());
+        // The second click lands 0.1 s in at the new rate.
+        let peak = (4_000..ir[0].len())
+            .max_by(|&a, &b| ir[0][a].abs().total_cmp(&ir[0][b].abs()))
+            .unwrap();
+        assert_eq!(peak, 4_800);
+
+        let mut fx = effect("canary.convolver", SR).unwrap();
+        fx.set_param(2, 0.0); // no predelay: the echo lands at 4800
+        let mut loader = fx.file_loader().unwrap();
+        assert_eq!(loader.extensions(), ["wav"]);
+        loader.load(&path).unwrap();
+        // The worker builds it, then a click comes back with its echo at 4800.
+        let mut echo = 0.0f32;
+        for _ in 0..200 {
+            let mut l = vec![0.0; 9_600];
+            l[0] = 1.0;
+            let mut r = l.clone();
+            fx.reset();
+            fx.process(&mut l, &mut r);
+            echo = l[4_800].abs();
+            if echo > 0.01 {
+                break;
+            }
+            std::thread::sleep(POLL);
+        }
+        assert!(echo > 0.01, "the file's response is in use");
+        assert!(loader.load(Path::new("/nowhere.wav")).is_err());
+        assert!(loader.error().is_some());
+        std::fs::remove_file(&path).unwrap();
+    }
 
     fn tail_energy(fx: &mut Box<dyn Effect>, from: usize) -> f32 {
         let mut click = vec![0.0; 96_000];

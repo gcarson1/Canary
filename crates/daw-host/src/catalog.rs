@@ -80,9 +80,10 @@ pub trait Hosted {
     fn scope(&self) -> Option<Arc<daw_dsp::Scope>> {
         None
     }
-    /// For a built-in device that loads a file (the amp's capture): the file
-    /// it was given, and why it failed if it did. None for everything else.
-    fn file(&self) -> Option<(Option<PathBuf>, Option<String>)> {
+    /// For a built-in device that loads a file (the amp's capture, the
+    /// convolver's response): the file it was given, why it failed if it did,
+    /// and what it takes ("NAM CAPTURE"). None for everything else.
+    fn file(&self) -> Option<(Option<PathBuf>, Option<String>, &'static str)> {
         None
     }
     /// Gives such a device a file; the reason when it cannot use it.

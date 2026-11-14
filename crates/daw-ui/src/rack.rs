@@ -60,6 +60,8 @@ pub struct FileView {
     pub name: Option<String>,
     /// Why it could not be used, if it could not.
     pub error: Option<String>,
+    /// What to drop, for the empty slot: "NAM CAPTURE", "WAV IMPULSE RESPONSE".
+    pub takes: String,
 }
 
 /// What the rack shows of the parametric EQ besides its parameters.
@@ -498,7 +500,7 @@ fn file_slot(
     let (text, color) = match (&file.name, &file.error) {
         (_, Some(error)) => (error.to_uppercase(), t.bad),
         (Some(name), None) => (name.to_uppercase(), t.text),
-        (None, None) => ("DROP A .NAM CAPTURE FROM 01".to_string(), t.faint),
+        (None, None) => (format!("DROP A {} FROM 01", file.takes), t.faint),
     };
     let fit = ((line.width() / (0.4 * u)) as usize).max(4);
     let shown: String = if text.chars().count() > fit {

@@ -83,6 +83,8 @@ pub trait FileLoader: Send {
     fn error(&self) -> Option<&str>;
     /// File extensions it takes, lower case.
     fn extensions(&self) -> &'static [&'static str];
+    /// What it takes, for a prompt: "NAM CAPTURE".
+    fn takes(&self) -> &'static str;
 }
 
 /// The built-in effects by id, for the device picker: (id, display name).

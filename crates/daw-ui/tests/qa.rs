@@ -365,6 +365,7 @@ fn amp() -> DeviceView {
         file: Some(FileView {
             name: Some("Plexi Crunch".into()),
             error: Some("cannot read Plexi Crunch.nam".into()),
+            takes: "NAM CAPTURE".into(),
         }),
         editor: false,
     }

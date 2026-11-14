@@ -132,11 +132,12 @@ impl Hosted for Builtin {
     fn scope(&self) -> Option<Arc<daw_dsp::Scope>> {
         self.scope.clone()
     }
-    fn file(&self) -> Option<(Option<std::path::PathBuf>, Option<String>)> {
+    fn file(&self) -> Option<(Option<std::path::PathBuf>, Option<String>, &'static str)> {
         let l = self.loader.as_ref()?;
         Some((
             l.file().map(ToOwned::to_owned),
             l.error().map(ToOwned::to_owned),
+            l.takes(),
         ))
     }
     fn load_file(&mut self, path: &std::path::Path) -> Result<(), HostError> {
@@ -250,14 +251,14 @@ mod tests {
     #[test]
     fn the_amp_keeps_its_file_in_state_even_when_missing() {
         let (mut amp, _) = instantiate("canary.amp", 48_000.0, 64).unwrap();
-        assert_eq!(amp.file(), Some((None, None)));
+        assert_eq!(amp.file(), Some((None, None, "NAM CAPTURE")));
         let gone = std::path::Path::new("/nowhere/Plexi.nam");
         assert!(amp.load_file(gone).is_err());
         let state = amp.save_state().unwrap();
         assert!(String::from_utf8_lossy(&state).contains("FILE=/nowhere/Plexi.nam"));
         let (mut again, _) = instantiate("canary.amp", 48_000.0, 64).unwrap();
         again.load_state(&state).unwrap();
-        let (path, error) = again.file().unwrap();
+        let (path, error, _) = again.file().unwrap();
         assert_eq!(path.as_deref(), Some(gone));
         assert!(error.is_some(), "says why it is silent");
         let (mut eq, _) = instantiate("canary.eq", 48_000.0, 64).unwrap();

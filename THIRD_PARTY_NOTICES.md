@@ -20,6 +20,7 @@ Their factory data (Surge XT patches and wavetables, OB-Xf patches and themes) i
 | --- | --- | --- |
 | fft-convolver 0.4 | MIT | Partitioned convolution for `canary.convolver` |
 | serde, serde_json | MIT OR Apache-2.0 | Reading `.nam` captures |
+| hound 3.5 | Apache-2.0 | Reading WAV impulse responses for `canary.convolver` |
 
 ## Ported source
 

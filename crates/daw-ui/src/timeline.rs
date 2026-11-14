@@ -469,6 +469,7 @@ fn clip_ref(source: &ClipRef, c: &Clip) -> ClipRef {
         gain: c.gain,
         reverse: c.reversed,
         stretch: source.stretch.clone(),
+        takes: source.takes,
     }
 }
 
@@ -1376,6 +1377,9 @@ fn draw_clip(
     }
     if clip.reverse {
         name = format!("{name} · REV");
+    }
+    if let Some(t) = clip.takes {
+        name = format!("{name} · TAKE {}/{}", t.pass_of(clip.offset) + 1, t.count);
     }
     p.with_clip_rect(rect.intersect(p.clip_rect())).text(
         Pos2::new(rect.min.x + 0.375 * u, title.center().y),

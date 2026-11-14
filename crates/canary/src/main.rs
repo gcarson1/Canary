@@ -135,7 +135,7 @@ struct App {
     /// MIDI being recorded into a pattern.
     midi_take: Option<take::MidiTake>,
     /// Punch ranges (timeline samples) for takes still loading, by file.
-    punches: HashMap<PathBuf, (u64, u64)>,
+    punches: HashMap<PathBuf, TakePlan>,
     /// Quit was asked mid-take: close once the take is in the project.
     quitting: bool,
     /// Errors the output and input streams reported.
@@ -391,12 +391,13 @@ impl App {
         };
         let frames = audio.frames() as u64;
         // A punched take: only its part inside the punch range.
-        let (start, offset, length) = match self.punches.remove(path) {
-            Some(range) => match punch_window(at, frames, range) {
-                Some(window) => window,
+        let (start, offset, length, takes) = match self.punches.remove(path) {
+            Some(TakePlan::Punch(range)) => match punch_window(at, frames, range) {
+                Some((s, o, l)) => (s, o, l, None),
                 None => return self.error("nothing was recorded inside the punch range".into()),
             },
-            None => (at, 0, frames),
+            Some(TakePlan::Loop((s, o, l, t))) => (s, o, l, Some(t)),
+            None => (at, 0, frames, None),
         };
         let clip = ClipRef {
             source: path.to_path_buf(),
@@ -408,6 +409,7 @@ impl App {
             gain: 1.0,
             reverse: false,
             stretch: None,
+            takes,
         };
         let tracks = &self.history.project().tracks;
         let action = match track.filter(|&t| t < tracks.len()) {
@@ -1751,11 +1753,22 @@ impl App {
             let start = take
                 .start_sample
                 .saturating_sub(u64::from(self.engine.plan_latency()));
-            // PUNCH keeps only the part inside the song loop region; the rest
-            // stays in the file, outside the clip's window.
-            let region = self.history.project().loop_region;
-            if let Some((from, to)) = region.filter(|_| self.ws.punch) {
-                self.punches.insert(take.path.clone(), (from, to));
+            // The song loop region, in samples, when it is on.
+            let project = self.history.project();
+            let region = project
+                .loop_region
+                .filter(|_| project.loop_on && self.ws.song)
+                .map(|(a, b)| (project.samples_at(a), project.samples_at(b)));
+            // PUNCH keeps only the part inside the loop region; recording
+            // round the loop keeps every pass as a take of it. The rest stays
+            // in the file, outside the clip's window.
+            let plan = match region {
+                Some(r) if self.ws.punch => Some(TakePlan::Punch(r)),
+                Some(r) => take::loop_passes(start, take.frames, r).map(TakePlan::Loop),
+                None => None,
+            };
+            if let Some(plan) = plan {
+                self.punches.insert(take.path.clone(), plan);
             }
             self.load(take.path, Some((self.ws.selected_track, start)));
         } else {
@@ -2102,6 +2115,13 @@ fn metronome_clicks(project: &daw_project::Project, playback: Playback) -> Vec<S
 fn into_loop(looping: Option<(u64, u64)>, at: u64) -> Option<u64> {
     let (start, end) = looping?;
     (at >= end).then(|| start + (at - start) % (end - start))
+}
+
+/// How a finished take is placed besides its start: only the punch range, or
+/// as the passes of a loop recording.
+enum TakePlan {
+    Punch((u64, u64)),
+    Loop((u64, u64, u64, daw_project::Takes)),
 }
 
 /// The part of a take (`frames` long, starting at timeline sample `at`) inside

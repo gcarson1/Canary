@@ -114,3 +114,76 @@ mod tests {
         );
     }
 }
+
+/// A loop recording that started at timeline sample `at` and ran `frames`
+/// while the transport looped `[a, b)`: the clip that plays its latest full
+/// pass over the loop, (start, offset, length, takes). None unless it holds at
+/// least two full passes.
+pub fn loop_passes(
+    at: u64,
+    frames: u64,
+    (a, b): (u64, u64),
+) -> Option<(u64, u64, u64, daw_project::Takes)> {
+    if a >= b || at >= b {
+        return None;
+    }
+    let len = b - a;
+    // Where the first full pass begins in the file: the transport reaches a
+    // from before the loop, or wraps to it at b.
+    let first = if at <= a { a - at } else { b - at };
+    let count = frames.checked_sub(first)? / len;
+    if count < 2 {
+        return None;
+    }
+    let count = u32::try_from(count).ok()?;
+    let takes = daw_project::Takes { first, len, count };
+    Some((a, first + u64::from(count - 1) * len, len, takes))
+}
+
+#[cfg(test)]
+mod loop_tests {
+    use super::*;
+
+    #[test]
+    fn a_loop_recording_becomes_its_last_full_pass_with_all_passes_kept() {
+        // Loop 1000..2000, recorded from the loop start for 3.5 passes.
+        let (start, offset, len, t) = loop_passes(1_000, 3_500, (1_000, 2_000)).unwrap();
+        assert_eq!((start, offset, len), (1_000, 2_000, 1_000));
+        assert_eq!((t.first, t.count), (0, 3));
+        // Started mid-loop at 1500: the first full pass begins 500 frames in.
+        let (_, offset, _, t) = loop_passes(1_500, 2_600, (1_000, 2_000)).unwrap();
+        assert_eq!((t.first, t.count, offset), (500, 2, 1_500));
+        // One pass is a plain take.
+        assert!(loop_passes(1_000, 1_900, (1_000, 2_000)).is_none());
+        assert!(
+            loop_passes(2_500, 9_000, (1_000, 2_000)).is_none(),
+            "started past it"
+        );
+    }
+
+    #[test]
+    fn a_comp_piece_switches_pass_and_keeps_its_place_in_the_loop() {
+        let t = daw_project::Takes {
+            first: 500,
+            len: 1_000,
+            count: 3,
+        };
+        // A piece 200 into the loop, showing pass 2.
+        let clip = daw_project::ClipRef {
+            source: "take.wav".into(),
+            start: 1_200,
+            offset: 500 + 2 * 1_000 + 200,
+            length: 300,
+            fade_in: 0,
+            fade_out: 0,
+            gain: 1.0,
+            reverse: false,
+            stretch: None,
+            takes: Some(t),
+        };
+        assert_eq!(t.pass_of(clip.offset), 2);
+        let first = clip.with_take(0).unwrap();
+        assert_eq!((first.offset, first.start), (700, 1_200));
+        assert!(clip.with_take(3).is_none());
+    }
+}

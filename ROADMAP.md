@@ -109,7 +109,8 @@ The UI follows Styles.md whichever framework is chosen.
 - [x] Clip gain (Up/Down 1 dB, Shift 0.1 dB, shown in the clip title and waveform), reverse (R) and fade handles (drag a clip title's corner). Slicing to new clips was already the SLICE tool. Still to do: consolidate
 - [x] Time-stretch and pitch-shift, offline (`daw_dsp::stretch`, WSOLA): Option-drag a clip's end edge to stretch it, [ and ] shift it a semitone. Rendered from the original file to `Stretched/`, recorded in `ClipRef::stretch` so a new stretch starts from the original. Still to do: formant preservation, stretch-to-tempo
 - [ ] Warp markers (audio follows the tempo map)
-- [ ] Loop recording into takes; take lanes; comping by swiping regions; flatten comp
+- [x] Loop recording into takes and comping: recording round the song loop keeps every full pass in one file and places the latest as a clip marked TAKE k/N; slice it (C) and press T / Shift+T on a piece to hear another pass there. Each piece is a plain window, so nothing needs flattening
+- [ ] Take lanes drawn under the track and comping by swiping across them
 - [ ] Audio-to-MIDI (monophonic pitch, drum transients to notes)
 
 ### Phase 10: Built-in Instruments and Effects

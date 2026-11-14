@@ -772,6 +772,7 @@ impl Workspace {
             let mut db = 0.0;
             let mut flip = false;
             let mut semis = 0.0;
+            let mut take = 0i32;
             for e in &i.events {
                 if let egui::Event::Key {
                     key,
@@ -788,6 +789,9 @@ impl Workspace {
                         Key::ArrowUp => db += step,
                         Key::ArrowDown => db -= step,
                         Key::R if !repeat => flip ^= true,
+                        // A loop recording's piece: T plays the next pass,
+                        // Shift+T the one before (comping).
+                        Key::T if !repeat => take += if modifiers.shift { -1 } else { 1 },
                         // A render per press; a held key must not start dozens.
                         Key::OpenBracket if !repeat => semis -= 1.0,
                         Key::CloseBracket if !repeat => semis += 1.0,
@@ -795,9 +799,9 @@ impl Workspace {
                     }
                 }
             }
-            (db, flip, semis)
+            (db, flip, semis, take)
         });
-        if let (Page::Playlist, Some((ti, ci)), (db, flip, semis)) =
+        if let (Page::Playlist, Some((ti, ci)), (db, flip, semis, take)) =
             (self.page, self.selected_clip, clip_keys)
         {
             let clip = inputs
@@ -806,6 +810,18 @@ impl Workspace {
                 .tracks
                 .get(ti)
                 .and_then(|t| t.clips.get(ci));
+            // T / Shift+T: another pass of a loop recording, wrapping round.
+            if let Some((c, t)) = clip.and_then(|c| Some((c, c.takes?))).filter(|_| take != 0) {
+                let n = t.count as i32;
+                let pass = (t.pass_of(c.offset) as i32 + take).rem_euclid(n.max(1));
+                if let Some(next) = c.with_take(pass as u32) {
+                    self.edit(Action::SetClip {
+                        track: ti,
+                        index: ci,
+                        clip: next,
+                    });
+                }
+            }
             // [ and ] shift the clip's pitch a semitone, rendered from its original.
             if let (Some(c), true) = (clip, semis != 0.0) {
                 let (ratio, now) = c

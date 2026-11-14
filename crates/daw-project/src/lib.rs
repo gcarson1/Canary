@@ -248,6 +248,27 @@ pub struct ClipRef {
     /// made from and how, so a new stretch starts from the original again.
     #[serde(default)]
     pub stretch: Option<Stretch>,
+    /// Set on a loop recording: the file holds `count` passes of the loop,
+    /// and the window shows one of them (pick another with `with_take`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub takes: Option<Takes>,
+}
+
+/// The passes of a loop recording in one file: pass `k` starts at file
+/// offset `first + k * len`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Takes {
+    pub first: u64,
+    pub len: u64,
+    pub count: u32,
+}
+
+impl Takes {
+    /// The pass a clip window at file `offset` shows.
+    pub fn pass_of(&self, offset: u64) -> u32 {
+        let k = offset.saturating_sub(self.first) / self.len.max(1);
+        (k.min(u64::from(self.count.saturating_sub(1)))) as u32
+    }
 }
 
 /// How a clip's audio was rendered from an original file.
@@ -270,6 +291,22 @@ fn loop_ok(region: Option<(u64, u64)>) -> bool {
 }
 
 impl ClipRef {
+    /// The same stretch of the loop played from pass `pass` of its recording
+    /// instead (a comp: slice the clip, pick a pass per piece). None when it
+    /// is not a loop recording or there is no such pass.
+    pub fn with_take(&self, pass: u32) -> Option<ClipRef> {
+        let t = self.takes?;
+        if pass >= t.count {
+            return None;
+        }
+        let now = t.pass_of(self.offset);
+        let shift = (i64::from(pass) - i64::from(now)) * t.len as i64;
+        Some(ClipRef {
+            offset: self.offset.checked_add_signed(shift)?,
+            ..self.clone()
+        })
+    }
+
     /// Clip gain is finite and within 0..=4 (+12 dB).
     pub fn gain_ok(&self) -> bool {
         self.gain.is_finite() && (0.0..=4.0).contains(&self.gain)
@@ -1191,6 +1228,7 @@ mod tests {
             gain: 1.0,
             reverse: false,
             stretch: None,
+            takes: None,
         }
     }
 

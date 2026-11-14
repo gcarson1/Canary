@@ -54,6 +54,7 @@ fn fixture() -> (History, HashMap<PathBuf, WaveformPyramid>, Vec<PathBuf>) {
         gain: 1.0,
         reverse: false,
         stretch: None,
+        takes: None,
     };
     let mut h = History::default();
     for (i, (name, clips)) in [

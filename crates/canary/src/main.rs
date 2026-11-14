@@ -613,7 +613,7 @@ impl App {
         }
     }
 
-    /// Opens the default output again at the project's rate and moves the
+    /// Opens the chosen output (or the default) again at the project's rate and moves the
     /// session onto a fresh engine: the old stream (and every node in it) is
     /// dropped, plugins are made again from their state, and the next sync
     /// sends a whole new plan.
@@ -819,9 +819,10 @@ impl App {
                     .devices
                     .instrument_step(&mut plan, track, selected, &mut device_steps)
                 {
-                    Some(step) => {
+                    Some((midi_in, step)) => {
+                        // The notes go to the first MIDI effect, else the instrument.
                         if let Some(seq) = sequences.get(i).filter(|s| !s.is_empty()) {
-                            plan.sequence(step, seq.clone());
+                            plan.sequence(midi_in, seq.clone());
                         }
                         vec![step]
                     }
@@ -1108,8 +1109,8 @@ impl App {
             Request::ExportMidi { track } => self.export_midi(track),
             Request::ToggleRecord => self.toggle_record(),
             Request::Export { stems } => self.toggle_export(stems),
-            Request::SetAudio { .. } if self.taking() => {
-                self.error("stop recording before switching the output".into());
+            Request::SetAudio { .. } if self.taking() || self.export.is_some() => {
+                self.error("stop recording or exporting before switching the output".into());
             }
             Request::SetAudio { device, buffer } => {
                 let previous = std::mem::replace(
@@ -1118,6 +1119,7 @@ impl App {
                 );
                 match self.restart_audio() {
                     Ok(()) => {
+                        self.audio_lost = None;
                         self.audio_view.device = self.audio_choice.device.clone();
                         self.audio_view.buffer = self.audio_choice.buffer;
                         save_audio_choice(&self.samples_dir, &self.audio_choice);

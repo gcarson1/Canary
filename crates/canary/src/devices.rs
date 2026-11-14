@@ -26,6 +26,8 @@ struct Live {
     /// The node, until a plan inserts it into the engine.
     node: Option<Box<dyn AudioNode>>,
     instrument: bool,
+    /// An arpeggiator, chord or scale lock: it plays into the instrument.
+    midi_fx: bool,
     /// The latency the last plan compensated for; a change needs a new plan.
     latency: u32,
     /// An ARA plug-in: index into `Devices::ara`, and the track whose regions it
@@ -213,7 +215,8 @@ impl Devices {
             // A plugin that rejects old state still works with its defaults.
             let _ = hosted.load_state(&state);
         }
-        let instrument = !hosted.has_audio_input();
+        let midi_fx = hosted.is_midi_effect();
+        let instrument = !hosted.has_audio_input() && !midi_fx;
         self.live.insert(
             d.uid,
             Live {
@@ -221,6 +224,7 @@ impl Devices {
                 id: NodeId(raw),
                 node: Some(node),
                 instrument,
+                midi_fx,
                 latency: 0,
                 ara,
             },
@@ -329,19 +333,42 @@ impl Devices {
         track: &Track,
         live_midi: bool,
         steps: &mut HashMap<u64, StepId>,
-    ) -> Option<StepId> {
-        let (uid, instrument) = track
+    ) -> Option<(StepId, StepId)> {
+        let live: Vec<(u64, &Live)> = track
             .devices
             .iter()
             .filter_map(|d| Some((d.uid, self.live.get(&d.uid)?)))
-            .find(|(_, l)| l.instrument)?;
-        let step = plan.add(instrument.id, vec![], 2).ok()?;
-        steps.insert(uid, step);
-        if live_midi {
-            plan.route_midi(step);
+            .collect();
+        let (uid, instrument) = live.iter().find(|(_, l)| l.instrument)?;
+        // MIDI effects in rack order, each playing into the next, the last into
+        // the instrument. The first takes the live input and the notes.
+        let mut first = None;
+        let mut prev = None;
+        for (fx_uid, fx) in live.iter().filter(|(_, l)| l.midi_fx) {
+            let Ok(step) = plan.add(fx.id, vec![], 2) else {
+                continue;
+            };
+            steps.insert(*fx_uid, step);
+            plan.set_latency(step, 0);
+            match prev {
+                Some(p) => {
+                    plan.midi_from(step, p);
+                }
+                None => first = Some(step),
+            }
+            prev = Some(step);
         }
+        let step = plan.add(instrument.id, vec![], 2).ok()?;
+        steps.insert(*uid, step);
         plan.set_latency(step, 0);
-        Some(step)
+        if let Some(p) = prev {
+            plan.midi_from(step, p);
+        }
+        let midi_in = first.unwrap_or(step);
+        if live_midi {
+            plan.route_midi(midi_in);
+        }
+        Some((midi_in, step))
     }
 
     /// Chains `track`'s effects after `step` and returns the last step. Each
@@ -355,7 +382,11 @@ impl Devices {
         keys: &HashMap<u64, StepId>,
     ) -> StepId {
         for d in &track.devices {
-            let Some(l) = self.live.get_mut(&d.uid).filter(|l| !l.instrument) else {
+            let Some(l) = self
+                .live
+                .get_mut(&d.uid)
+                .filter(|l| !l.instrument && !l.midi_fx)
+            else {
                 continue;
             };
             let from = |channel| vec![Source { step, channel }];
@@ -924,11 +955,51 @@ mod tests {
         for selected in [true, false] {
             let mut plan = ExecutionPlan::new(64);
             d.apply_changes(&mut plan);
-            let step = d
+            let (midi_in, step) = d
                 .instrument_step(&mut plan, &p.tracks[0], selected, &mut HashMap::new())
                 .unwrap();
+            assert_eq!(midi_in, step, "no MIDI effects: the instrument takes it");
             assert_eq!(plan.takes_midi(step), selected);
         }
+    }
+
+    #[test]
+    fn midi_effects_play_into_the_instrument_and_take_the_live_input() {
+        let mut d = Devices::scan();
+        let mut track = Track::new("t");
+        let device = |uid, id: &str| Device {
+            uid,
+            format: PluginFormat::Builtin,
+            bundle: None,
+            id: id.into(),
+            name: id.into(),
+            state: Vec::new(),
+            sidechain: None,
+        };
+        // Rack order: chord, synth, arp. The effects chain before the synth.
+        track.devices = vec![
+            device(1, "canary.chord"),
+            device(2, "canary.synth"),
+            device(3, "canary.arp"),
+        ];
+        let p = Project {
+            tracks: vec![track],
+            ..Project::default()
+        };
+        assert!(d.sync(&p, 48_000.0, 64).is_empty());
+        assert!(!d.is_instrument(1) && d.is_instrument(2));
+        let mut plan = ExecutionPlan::new(64);
+        d.apply_changes(&mut plan);
+        let mut steps = HashMap::new();
+        let (midi_in, synth) = d
+            .instrument_step(&mut plan, &p.tracks[0], true, &mut steps)
+            .unwrap();
+        assert_eq!(midi_in, steps[&1], "the chord comes first");
+        assert!(plan.takes_midi(midi_in) && !plan.takes_midi(synth));
+        assert_eq!(synth, steps[&2]);
+        // Effects after the instrument skip the MIDI effects.
+        let last = d.effects_after(&mut plan, &p.tracks[0], synth, &mut steps, &HashMap::new());
+        assert_eq!(last, synth);
     }
 
     #[test]

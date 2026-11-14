@@ -81,6 +81,12 @@ struct Step {
     takes_midi: bool,
     /// Notes the node plays with the transport, sorted by `at` (see `sequence`).
     sequence: Box<[SeqEvent]>,
+    /// An earlier step whose MIDI output is this step's MIDI input (a MIDI
+    /// effect feeding an instrument); then it takes no live MIDI or sequence.
+    midi_source: Option<usize>,
+    /// This step's MIDI output from the last block, kept for a later step that
+    /// reads it (`midi_from`). Capacity fixed when that is set up.
+    kept_midi: Vec<MidiEvent>,
     notes: NoteState,
     /// Parameter envelopes applied to the node before each block.
     automation: Vec<(u32, Box<[AutoPoint]>)>,
@@ -221,6 +227,8 @@ impl ExecutionPlan {
             sources: inputs,
             takes_midi: false,
             sequence: Box::default(),
+            midi_source: None,
+            kept_midi: Vec::new(),
             notes: NoteState::default(),
             automation: Vec::new(),
             taps: Vec::new(),
@@ -293,6 +301,21 @@ impl ExecutionPlan {
 
     pub fn clicks(&self) -> &[SeqEvent] {
         &self.clicks
+    }
+
+    /// Feeds `source`'s MIDI output to `step` instead of the live input and
+    /// any sequence: a MIDI effect in front of an instrument. `source` must come
+    /// before `step`. Returns false otherwise.
+    pub fn midi_from(&mut self, step: StepId, source: StepId) -> bool {
+        if source.0 >= step.0 || step.0 >= self.steps.len() {
+            return false;
+        }
+        self.steps[step.0].midi_source = Some(source.0);
+        let kept = &mut self.steps[source.0].kept_midi;
+        if kept.capacity() < MIDI_CAPACITY {
+            *kept = Vec::with_capacity(MIDI_CAPACITY);
+        }
+        true
     }
 
     /// Hands each step the held-note state of the step running the same node in
@@ -455,6 +478,8 @@ impl ExecutionPlan {
                 notes,
                 automation,
                 taps,
+                midi_source,
+                kept_midi,
                 ..
             } = &mut rest[0];
 
@@ -500,7 +525,9 @@ impl ExecutionPlan {
             }
             self.midi_out.clear();
             let live = if *takes_midi { midi } else { &[] };
-            let midi_in = if sequence.is_empty() && notes.is_idle() {
+            let midi_in = if let Some(src) = *midi_source {
+                &done[src].kept_midi[..]
+            } else if sequence.is_empty() && notes.is_idle() {
                 live
             } else {
                 notes.render(sequence, context, live, &mut self.midi_in);
@@ -513,6 +540,11 @@ impl ExecutionPlan {
                 &mut self.midi_out,
                 context,
             );
+            // Kept for a later step; the same capacity, so this never allocates.
+            if kept_midi.capacity() >= MIDI_CAPACITY {
+                kept_midi.clear();
+                kept_midi.extend_from_slice(&self.midi_out);
+            }
             if let [l, r, ..] = &outs[..num_outputs] {
                 for tap in taps.iter_mut() {
                     tap.write(l, r, context);
@@ -856,6 +888,51 @@ mod tests {
             outputs[0].fill(midi_in.len() as f32);
         }
         fn reset(&mut self) {}
+    }
+
+    /// Doubles every incoming MIDI event (a stand-in MIDI effect).
+    struct Doubler;
+
+    impl AudioNode for Doubler {
+        fn process(
+            &mut self,
+            _inputs: &[&[f32]],
+            outputs: &mut [&mut [f32]],
+            midi_in: &[MidiEvent],
+            midi_out: &mut Vec<MidiEvent>,
+            _context: &ProcessContext,
+        ) {
+            outputs.iter_mut().for_each(|o| o.fill(0.0));
+            for e in midi_in {
+                midi_out.push(*e);
+                midi_out.push(*e);
+            }
+        }
+        fn reset(&mut self) {}
+    }
+
+    #[test]
+    fn a_midi_effect_feeds_the_instrument_after_it() {
+        let mut arena = NodeArena::default();
+        let mut plan = ExecutionPlan::new(16);
+        plan.insert(NodeId(1), Box::new(Doubler));
+        plan.insert(NodeId(2), Box::new(MidiCount));
+        let fx = plan.add(NodeId(1), vec![], 1).unwrap();
+        let synth = plan.add(NodeId(2), vec![], 1).unwrap();
+        plan.route_midi(fx);
+        assert!(plan.midi_from(synth, fx));
+        assert!(!plan.midi_from(fx, synth), "only from an earlier step");
+        arena.apply(&mut plan);
+        let note = [MidiEvent {
+            sample_offset: 0,
+            data: [0x90, 60, 100],
+        }];
+        assert_no_alloc::assert_no_alloc(|| plan.process(&mut arena, &ctx(16), &note));
+        assert_eq!(
+            plan.output()[0][0],
+            2.0,
+            "the instrument hears the effect's output"
+        );
     }
 
     /// Outputs the last value automated on parameter 3.

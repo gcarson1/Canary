@@ -44,8 +44,12 @@ pub trait Hosted {
     fn save_state(&mut self) -> Result<Vec<u8>, HostError>;
     fn load_state(&mut self, bytes: &[u8]) -> Result<(), HostError>;
     fn latency_samples(&self) -> u32;
-    /// False for instruments.
+    /// False for instruments (and MIDI effects).
     fn has_audio_input(&self) -> bool;
+    /// A MIDI effect: turns the notes headed for the instrument into others.
+    fn is_midi_effect(&self) -> bool {
+        false
+    }
     /// Main-thread work the plugin asked for; call regularly.
     fn idle(&mut self) {}
     /// True once after the plugin asked to be deactivated and activated again

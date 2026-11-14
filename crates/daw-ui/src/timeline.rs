@@ -342,6 +342,25 @@ struct PatternDrag {
     revision: u64,
 }
 
+/// How far a group drag moves the selection: the dragged clip's move, held
+/// back so no selected clip would go before the timeline's start. None when
+/// no group moves with `d`.
+fn group_shift(project: &Project, d: &Drag, group: &[(usize, usize)]) -> Option<i64> {
+    let original = project.tracks.get(d.track)?.clips.get(d.index)?;
+    if d.grab != Grab::Body || group.is_empty() {
+        return None;
+    }
+    let earliest = group
+        .iter()
+        .filter_map(|&(t, c)| project.tracks.get(t)?.clips.get(c))
+        .map(|c| c.start)
+        .chain([original.start])
+        .min()
+        .unwrap_or(0);
+    let dx = d.preview.start as i64 - original.start as i64;
+    Some(dx.max(-(earliest as i64)))
+}
+
 /// Where a pattern clip's edge lands when dragged to tick `at`: the start edge
 /// trims into the pattern (moving `offset`), the end edge sets the length.
 /// Both keep at least one grid step.
@@ -660,11 +679,11 @@ pub(crate) fn show(
     }
     let mut hit = None;
     // A selection moving with the dragged clip: by how many samples.
-    let group_delta = ws.timeline.drag.as_ref().and_then(|d| {
-        let original = project.tracks.get(d.track)?.clips.get(d.index)?;
-        (d.grab == Grab::Body && !ws.clip_group.is_empty())
-            .then(|| d.preview.start as i64 - original.start as i64)
-    });
+    let group_delta = ws
+        .timeline
+        .drag
+        .as_ref()
+        .and_then(|d| group_shift(project, d, &ws.clip_group));
     for (ti, track) in project.tracks.iter().enumerate() {
         for (ci, clip) in track.clips.iter().enumerate() {
             let dragging = ws
@@ -674,6 +693,13 @@ pub(crate) fn show(
                 .is_some_and(|d| (d.track, d.index) == (ti, ci));
             let moved;
             let (shown, lane_i) = match (&ws.timeline.drag, group_delta) {
+                (Some(d), Some(dx)) if dragging => {
+                    moved = ClipRef {
+                        start: clip.start.saturating_add_signed(dx),
+                        ..d.preview.clone()
+                    };
+                    (&moved, d.to_track)
+                }
                 (Some(d), _) if dragging => (&d.preview, d.to_track),
                 (_, Some(dx)) if ws.clip_group.contains(&(ti, ci)) => {
                     moved = ClipRef {
@@ -1038,12 +1064,17 @@ pub(crate) fn show(
             }
         }
         if let Some(d) = ws.timeline.drag.take() {
-            let action = if let Some(dx) = group_delta {
+            // Measured again from where the clip was let go, not last frame.
+            let action = if let Some(dx) = group_shift(project, &d, &ws.clip_group) {
                 // The whole selection, in place: indices stay valid.
+                let original = &project.tracks[d.track].clips[d.index];
                 let mut moves = vec![Action::SetClip {
                     track: d.track,
                     index: d.index,
-                    clip: d.preview,
+                    clip: ClipRef {
+                        start: original.start.saturating_add_signed(dx),
+                        ..d.preview
+                    },
                 }];
                 for &(t, c) in &ws.clip_group {
                     if let Some(clip) = project.tracks.get(t).and_then(|tr| tr.clips.get(c)) {

@@ -629,6 +629,62 @@ fn shift_click_selects_clips_and_delete_removes_them_together() {
 }
 
 #[test]
+fn a_selection_moves_together_and_one_undo_puts_it_back() {
+    let mut h = rig();
+    h.run();
+    click(&mut h, egui::Pos2::new(500.0, 165.0));
+    let second = egui::Pos2::new(980.0, 165.0);
+    h.hover_at(second);
+    h.run();
+    h.event(egui::Event::ModifiersChanged(egui::Modifiers::SHIFT));
+    for pressed in [true, false] {
+        h.event(egui::Event::PointerButton {
+            pos: second,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::SHIFT,
+        });
+        h.run();
+    }
+    h.event(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
+    let before: Vec<u64> = h.state().history.project().tracks[0]
+        .clips
+        .iter()
+        .map(|c| c.start)
+        .collect();
+    // Drag the first clip right, in small steps, and let go.
+    let start = egui::Pos2::new(500.0, 165.0);
+    h.hover_at(start);
+    press(&mut h, start, true);
+    h.run();
+    for step in 1..=10 {
+        h.hover_at(start + Vec2::new(4.0 * step as f32, 0.0));
+        h.run();
+    }
+    press(&mut h, start + Vec2::new(40.0, 0.0), false);
+    h.run();
+    let after: Vec<u64> = h.state().history.project().tracks[0]
+        .clips
+        .iter()
+        .map(|c| c.start)
+        .collect();
+    let dx: Vec<i64> = before
+        .iter()
+        .zip(&after)
+        .map(|(a, b)| *b as i64 - *a as i64)
+        .collect();
+    assert!(dx[0] > 0 && dx[0] == dx[1], "both moved alike: {dx:?}");
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    h.run();
+    let undone: Vec<u64> = h.state().history.project().tracks[0]
+        .clips
+        .iter()
+        .map(|c| c.start)
+        .collect();
+    assert_eq!(undone, before, "one undo step");
+}
+
+#[test]
 fn picker_adds_a_device_and_dials_set_params() {
     // Rack: x 280..1100, y 520..900 (45% of the body), header 32pt. The two
     // devices are 16u = 256pt wide, so + DEVICE (96 x 24) starts at x 804, y 564.

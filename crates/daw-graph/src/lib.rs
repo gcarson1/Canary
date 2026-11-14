@@ -2,6 +2,7 @@
 //! built-in nodes.
 
 mod effect;
+mod midifx;
 mod monitor;
 mod plan;
 mod poly;
@@ -12,6 +13,7 @@ mod synth;
 mod track;
 
 pub use effect::{EffectNode, ParamBank};
+pub use midifx::{ArpNode, ChordNode, ScaleNode, ARP_PARAMS, CHORD_PARAMS, SCALE_PARAMS};
 pub use monitor::{MasterNode, Monitor, MonitorMode, Readings};
 pub use plan::{
     ExecutionPlan, LiveNodes, NodeArena, PlanError, Source, StepId, Tap, MAX_CHANNELS, MAX_LATENCY,

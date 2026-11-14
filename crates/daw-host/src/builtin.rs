@@ -10,18 +10,28 @@ use crate::{HostError, Hosted, Instance, ParamInfo, PluginInfo};
 
 /// The built-in synth's id.
 pub const SYNTH: &str = "canary.synth";
+/// The built-in MIDI effects' ids.
+pub const ARP: &str = "canary.arp";
+pub const CHORD: &str = "canary.chord";
+pub const SCALE: &str = "canary.scale";
 
 /// The built-in instruments and effects, for the catalog.
 pub fn builtins() -> Vec<PluginInfo> {
-    [(crate::sampler::ID, "Sampler"), (SYNTH, "Synth")]
-        .iter()
-        .chain(&EFFECTS)
-        .map(|(id, name)| PluginInfo {
-            id: (*id).into(),
-            name: (*name).into(),
-            vendor: "Canary".into(),
-        })
-        .collect()
+    [
+        (crate::sampler::ID, "Sampler"),
+        (SYNTH, "Synth"),
+        (ARP, "Arpeggiator"),
+        (CHORD, "Chord"),
+        (SCALE, "Scale Lock"),
+    ]
+    .iter()
+    .chain(&EFFECTS)
+    .map(|(id, name)| PluginInfo {
+        id: (*id).into(),
+        name: (*name).into(),
+        vendor: "Canary".into(),
+    })
+    .collect()
 }
 
 pub fn instantiate(id: &str, sample_rate: f32, max_block: usize) -> Result<Instance, HostError> {
@@ -30,9 +40,27 @@ pub fn instantiate(id: &str, sample_rate: f32, max_block: usize) -> Result<Insta
     }
     let mut scope = None;
     let mut loader = None;
+    let mut midi_fx = false;
     let (node, params, instrument): (Box<dyn daw_graph::AudioNode>, _, _) = if id == SYNTH {
         let (node, params) = PolySynthNode::new();
         (Box::new(node), params, true)
+    } else if [ARP, CHORD, SCALE].contains(&id) {
+        midi_fx = true;
+        let (node, params): (Box<dyn daw_graph::AudioNode>, _) = match id {
+            ARP => {
+                let (n, p) = daw_graph::ArpNode::new();
+                (Box::new(n), p)
+            }
+            CHORD => {
+                let (n, p) = daw_graph::ChordNode::new();
+                (Box::new(n), p)
+            }
+            _ => {
+                let (n, p) = daw_graph::ScaleNode::new();
+                (Box::new(n), p)
+            }
+        };
+        (node, params, false)
     } else {
         let mut fx = effect(id, sample_rate).ok_or_else(|| HostError::UnknownPlugin(id.into()))?;
         scope = fx.scope();
@@ -59,6 +87,7 @@ pub fn instantiate(id: &str, sample_rate: f32, max_block: usize) -> Result<Insta
             params,
             infos,
             instrument,
+            midi_fx,
             latency,
             scope,
             loader,
@@ -72,6 +101,8 @@ struct Builtin {
     infos: Vec<ParamInfo>,
     /// The synth: no audio input, plays MIDI.
     instrument: bool,
+    /// An arpeggiator, chord or scale lock: MIDI in, MIDI out, no audio.
+    midi_fx: bool,
     /// Fixed for the instance (lookahead), so PDC is sized once.
     latency: u32,
     scope: Option<Arc<daw_dsp::Scope>>,
@@ -127,7 +158,10 @@ impl Hosted for Builtin {
         self.latency
     }
     fn has_audio_input(&self) -> bool {
-        !self.instrument
+        !self.instrument && !self.midi_fx
+    }
+    fn is_midi_effect(&self) -> bool {
+        self.midi_fx
     }
     fn scope(&self) -> Option<Arc<daw_dsp::Scope>> {
         self.scope.clone()

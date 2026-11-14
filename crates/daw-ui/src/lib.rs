@@ -289,8 +289,8 @@ pub struct Workspace {
     /// mixer strip): only then does Delete take the whole track.
     pub track_focused: bool,
     pub selected_clip: Option<(usize, usize)>,
-    /// More audio clips selected with it (Shift-click, Cmd+A): they move,
-    /// delete and duplicate together. Valid for `group_revision` only.
+    /// More audio clips selected with it (Shift-click, Cmd+A): they move and
+    /// delete together (Cmd+D duplicates the clicked one). Valid for `group_revision` only.
     pub(crate) clip_group: Vec<(usize, usize)>,
     pub(crate) group_revision: u64,
     /// This frame's edit keeps the group's indices valid (a group move).
@@ -329,6 +329,8 @@ pub struct Workspace {
     /// The audio panel is open (opened from the rate readout); the frame it
     /// opened, so that click does not close it.
     audio_open: Option<u64>,
+    /// The rate readout the panel hangs from, as last drawn.
+    audio_anchor: Option<Rect>,
     /// Points the rack is scrolled to the left.
     rack_scroll: f32,
     /// The parametric EQ band whose dials the rack shows.
@@ -384,6 +386,7 @@ impl Default for Workspace {
             edits: Vec::new(),
             picker: None,
             audio_open: None,
+            audio_anchor: None,
             device_drag: None,
             rack_scroll: 0.0,
             eq_band: 0,
@@ -533,6 +536,10 @@ impl Workspace {
         }
         self.manifest(ui, &p, &m, z.manifest, inputs.history, inputs.engine);
         self.dock(ui, &p, &m, z.dock, &inputs, &mut out);
+        // Last, so its rows are registered over everything they cover.
+        if let (Some(_), Some(anchor)) = (self.audio_open, self.audio_anchor) {
+            self.audio_panel(ui, &m, anchor, inputs.audio, &mut out);
+        }
         if let Some(path) = &self.file_drag {
             // The file follows the pointer; the rack takes the drop.
             if let Some(at) = ui.input(|i| i.pointer.hover_pos()) {
@@ -1017,7 +1024,10 @@ impl Workspace {
         }
         let opened = self.audio_open.unwrap_or(0);
         let outside = ui.input(|i| {
-            i.pointer.any_pressed() && i.pointer.interact_pos().is_some_and(|p| !panel.contains(p))
+            i.pointer.any_pressed()
+                && i.pointer
+                    .interact_pos()
+                    .is_some_and(|p| !panel.contains(p) && !anchor.contains(p))
         });
         let esc = ui.input(|i| i.key_pressed(Key::Escape));
         if esc || (outside && ui.ctx().cumulative_frame_nr() > opened) {
@@ -1446,11 +1456,13 @@ impl Workspace {
         if rate_resp.hovered() {
             p.hline(rate.x_range(), m.snap(rate.max.y), m.hair(t.muted));
         }
-        if rate_resp.clicked() && self.audio_open.is_none() {
-            self.audio_open = Some(ui.ctx().cumulative_frame_nr());
-        }
-        if self.audio_open.is_some() {
-            self.audio_panel(ui, m, rate, inputs.audio, out);
+        // The readout toggles the panel; the panel ignores presses on it.
+        self.audio_anchor = Some(rate.expand(0.25 * u));
+        if rate_resp.clicked() {
+            self.audio_open = match self.audio_open {
+                Some(_) => None,
+                None => Some(ui.ctx().cumulative_frame_nr()),
+            };
         }
         // DSP load, red when the engine cannot keep up.
         let load = p.text(

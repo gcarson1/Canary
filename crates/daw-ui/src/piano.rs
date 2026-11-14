@@ -193,6 +193,8 @@ pub(crate) fn show(
         }
     }
     let (start, zoom, scroll) = (v.start, v.zoom, v.top);
+    // A key zoom this frame takes effect now, so the key under the pointer stays.
+    let kh = 0.75 * u * v.key_zoom;
     let x_of = |tick: f64| grid.min.x + ((tick - start) / zoom) as f32;
     let tick_at = |x: f32| (start + f64::from(x - grid.min.x) * zoom).max(0.0);
     let y_of = |key: u8| grid.min.y - scroll + f32::from(127 - key) * kh;

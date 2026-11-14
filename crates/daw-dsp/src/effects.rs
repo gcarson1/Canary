@@ -69,7 +69,7 @@ pub trait Effect: Send {
 }
 
 /// The built-in effects by id, for the device picker: (id, display name).
-pub const EFFECTS: [(&str, &str); 17] = [
+pub const EFFECTS: [(&str, &str); 19] = [
     ("canary.eq", "EQ"),
     ("canary.eq8", "Parametric EQ"),
     ("canary.compressor", "Compressor"),
@@ -86,6 +86,8 @@ pub const EFFECTS: [(&str, &str); 17] = [
     ("canary.chorus", "Chorus / Flanger"),
     ("canary.phaser", "Phaser"),
     ("canary.crusher", "Bitcrusher"),
+    ("canary.pitch", "Pitch Shift"),
+    ("canary.tune", "Pitch Correction"),
     ("canary.utility", "Utility"),
 ];
 
@@ -108,6 +110,8 @@ pub fn effect(id: &str, sample_rate: f32) -> Option<Box<dyn Effect>> {
         "canary.chorus" => Box::new(crate::fx::Chorus::default()),
         "canary.phaser" => Box::new(crate::fx::Phaser::default()),
         "canary.crusher" => Box::new(crate::fx::Crusher::default()),
+        "canary.pitch" => Box::new(crate::pitch::PitchShift::default()),
+        "canary.tune" => Box::new(crate::pitch::PitchCorrect::default()),
         "canary.utility" => Box::new(crate::fx::Utility::default()),
         _ => return None,
     };

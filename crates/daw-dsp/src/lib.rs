@@ -7,6 +7,7 @@ pub mod effects;
 mod filter;
 pub mod fx;
 mod meter;
+pub mod pitch;
 mod scope;
 pub mod slice;
 pub mod stretch;

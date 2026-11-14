@@ -47,6 +47,8 @@ pub enum HostError {
     NoEditor,
     /// The plugin has no usable ARA 2 factory, or its document controller failed.
     NoAra,
+    /// A file a built-in device was given could not be used; the reason.
+    File(String),
 }
 
 impl fmt::Display for HostError {
@@ -70,6 +72,7 @@ impl fmt::Display for HostError {
             Self::Status(s) => write!(f, "Audio Unit call failed (OSStatus {s})"),
             Self::NoEditor => write!(f, "the plugin has no editor to show"),
             Self::NoAra => write!(f, "the plugin does not support ARA 2"),
+            Self::File(reason) => write!(f, "{reason}"),
         }
     }
 }

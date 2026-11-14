@@ -10,8 +10,8 @@ use daw_core::SampleData;
 use daw_dsp::WaveformPyramid;
 use daw_project::{Action, ClipRef, History, Note, Pattern, PatternClip, Track, PPQ, STEP};
 use daw_ui::{
-    theme, DeviceView, EngineView, EqView, Inputs, Page, ParamView, PluginChoice, Request,
-    SampleDrop, SamplerView, Theme, Workspace,
+    theme, DeviceView, EngineView, EqView, FileView, Inputs, Page, ParamView, PluginChoice,
+    Request, SampleDrop, SamplerView, Theme, Workspace,
 };
 use egui::epaint::ColorMode;
 use egui::{Color32, Shape, Vec2};
@@ -194,7 +194,7 @@ fn harness(
                         waveforms: &waveforms,
                         files: &files,
                         plugins: &plugins(),
-                        devices: &[vec![sampler()], devices(), vec![eq()]].concat(),
+                        devices: &[vec![sampler()], devices(), vec![eq(), amp()]].concat(),
                         meters: &[[0.4, 0.5], [0.9, 1.0], [0.0, 0.0], [0.2, 0.25]],
                     },
                 );
@@ -239,6 +239,7 @@ fn devices() -> Vec<DeviceView> {
             ],
             sampler: None,
             eq: None,
+            file: None,
             editor: true,
         },
         DeviceView {
@@ -267,6 +268,7 @@ fn devices() -> Vec<DeviceView> {
             .collect(),
             sampler: None,
             eq: None,
+            file: None,
             editor: false,
         },
     ]
@@ -300,6 +302,7 @@ fn sampler() -> DeviceView {
             .collect(),
         editor: false,
         eq: None,
+        file: None,
         sampler: Some(SamplerView {
             path: Some(PathBuf::from("/samples/808_Thermal_Sub.wav")),
             slices: vec![0.0, 0.25, 0.5, 0.75],
@@ -335,9 +338,33 @@ fn eq() -> DeviceView {
         name: "Parametric EQ".into(),
         params,
         sampler: None,
+        file: None,
         eq: Some(EqView {
             sample_rate: 48_000.0,
             spectrum: (0..192).map(|i| -20.0 - i as f32 * 0.3).collect(),
+        }),
+        editor: false,
+    }
+}
+
+/// The amp with a capture that failed to load, so its reason shows.
+fn amp() -> DeviceView {
+    let param = |id: u32, name: &str| ParamView {
+        id,
+        name: name.into(),
+        value: 0.0,
+        min: -24.0,
+        max: 24.0,
+        log: false,
+    };
+    DeviceView {
+        name: "Amp (NAM)".into(),
+        params: vec![param(0, "INPUT"), param(1, "OUTPUT")],
+        sampler: None,
+        eq: None,
+        file: Some(FileView {
+            name: Some("Plexi Crunch".into()),
+            error: Some("cannot read Plexi Crunch.nam".into()),
         }),
         editor: false,
     }
@@ -652,6 +679,42 @@ fn dragging_an_eq_band_sets_its_frequency_and_gain() {
     );
     assert!(
         last(10).is_some_and(|g| g > 9.0),
+        "{:?}",
+        h.state().requests
+    );
+}
+
+#[test]
+fn a_file_dropped_on_the_amp_loads_into_it() {
+    // The amp is 16u wide from x 280; its file slot is the module's bottom
+    // line, y 868..888.
+    let mut h = rig_with(vec![amp()]);
+    h.run();
+    let file = egui::Pos2::new(100.0, 104.0);
+    h.hover_at(file);
+    press(&mut h, file, true);
+    h.run();
+    let slot = egui::Pos2::new(400.0, 878.0);
+    for step in 1..=10 {
+        h.hover_at(file + (slot - file) * step as f32 / 10.0);
+        h.run();
+    }
+    std::fs::create_dir_all("../../target/qa").unwrap();
+    h.render()
+        .unwrap()
+        .save("../../target/qa/amp-drop.png")
+        .unwrap();
+    press(&mut h, slot, false);
+    h.run();
+    assert!(
+        h.state().requests.iter().any(|r| matches!(
+            r,
+            Request::LoadSample {
+                track: 0,
+                device: 0,
+                ..
+            }
+        )),
         "{:?}",
         h.state().requests
     );

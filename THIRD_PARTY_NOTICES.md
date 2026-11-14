@@ -19,12 +19,14 @@ Their factory data (Surge XT patches and wavetables, OB-Xf patches and themes) i
 | Crate | License | Use |
 | --- | --- | --- |
 | fft-convolver 0.4 | MIT | Partitioned convolution for `canary.convolver` |
+| serde, serde_json | MIT OR Apache-2.0 | Reading `.nam` captures |
 
 ## Ported source
 
 | Project | License | Copyright | Where |
 | --- | --- | --- | --- |
 | Airwindows (ToTape6, Density2, PurestDrive) | MIT | Copyright (c) 2018 Chris Johnson | `crates/daw-dsp/src/airwindows.rs` |
+| NeuralAmpModelerCore (WaveNet inference, fast tanh) | MIT | Copyright (c) 2023 Steven Atkinson | `crates/daw-dsp/src/nam.rs` |
 | CloudSeedCore | MIT | Copyright (c) 2024 Ghost Note Audio / Ghost Note Engineering Ltd | `crates/daw-dsp/src/cloudseed.rs` (Rust port of the reverb core) |
 
 ## Vendored source

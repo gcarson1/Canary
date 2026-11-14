@@ -62,14 +62,31 @@ pub trait Effect: Send {
     }
     /// The song tempo, called before each block; for tempo-synced effects.
     fn set_tempo(&mut self, _bpm: f32) {}
+    /// The main-thread side of an effect that loads a file (an amp capture).
+    /// Taken once, when the effect is made.
+    fn file_loader(&mut self) -> Option<Box<dyn FileLoader>> {
+        None
+    }
     /// What an analyzer shows of the output, for effects that draw one.
     fn scope(&self) -> Option<std::sync::Arc<crate::Scope>> {
         None
     }
 }
 
+/// Loads a file into an effect from the main thread: parses it (allocating)
+/// and hands the result to the audio thread lock-free.
+pub trait FileLoader: Send {
+    fn load(&mut self, path: &std::path::Path) -> Result<(), String>;
+    /// The file last asked for, loaded or not.
+    fn file(&self) -> Option<&std::path::Path>;
+    /// Why the last load failed.
+    fn error(&self) -> Option<&str>;
+    /// File extensions it takes, lower case.
+    fn extensions(&self) -> &'static [&'static str];
+}
+
 /// The built-in effects by id, for the device picker: (id, display name).
-pub const EFFECTS: [(&str, &str); 22] = [
+pub const EFFECTS: [(&str, &str); 23] = [
     ("canary.eq", "EQ"),
     ("canary.eq8", "Parametric EQ"),
     ("canary.compressor", "Compressor"),
@@ -77,6 +94,7 @@ pub const EFFECTS: [(&str, &str); 22] = [
     ("canary.gate", "Gate"),
     ("canary.saturator", "Saturator"),
     ("canary.totape", "Tape (ToTape6)"),
+    ("canary.amp", "Amp (NAM)"),
     ("canary.density", "Density"),
     ("canary.purestdrive", "PurestDrive"),
     ("canary.dynamic_eq", "Dynamic EQ"),
@@ -100,6 +118,7 @@ pub fn effect(id: &str, sample_rate: f32) -> Option<Box<dyn Effect>> {
         "canary.compressor" => Box::new(Compressor::default()),
         "canary.saturator" => Box::new(Saturator::default()),
         "canary.totape" => Box::new(crate::airwindows::ToTape6::default()),
+        "canary.amp" => Box::new(crate::nam::NamAmp::default()),
         "canary.density" => Box::new(crate::airwindows::Density2::default()),
         "canary.purestdrive" => Box::new(crate::airwindows::PurestDrive::default()),
         "canary.dynamic_eq" => Box::new(DynamicEq::default()),

@@ -8,6 +8,7 @@ pub mod effects;
 mod filter;
 pub mod fx;
 mod meter;
+pub mod nam;
 pub mod pitch;
 mod scope;
 pub mod slice;

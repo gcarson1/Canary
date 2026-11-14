@@ -74,6 +74,15 @@ pub trait Hosted {
     fn scope(&self) -> Option<Arc<daw_dsp::Scope>> {
         None
     }
+    /// For a built-in device that loads a file (the amp's capture): the file
+    /// it was given, and why it failed if it did. None for everything else.
+    fn file(&self) -> Option<(Option<PathBuf>, Option<String>)> {
+        None
+    }
+    /// Gives such a device a file; the reason when it cannot use it.
+    fn load_file(&mut self, _path: &Path) -> Result<(), HostError> {
+        Err(HostError::File("this device takes no files".into()))
+    }
     /// The built-in sampler's own controls; None for everything else.
     fn sampler(&mut self) -> Option<&mut crate::Sampler> {
         None

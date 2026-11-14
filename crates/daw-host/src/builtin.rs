@@ -29,12 +29,14 @@ pub fn instantiate(id: &str, sample_rate: f32, max_block: usize) -> Result<Insta
         return Ok(crate::sampler::instantiate());
     }
     let mut scope = None;
+    let mut loader = None;
     let (node, params, instrument): (Box<dyn daw_graph::AudioNode>, _, _) = if id == SYNTH {
         let (node, params) = PolySynthNode::new();
         (Box::new(node), params, true)
     } else {
-        let fx = effect(id, sample_rate).ok_or_else(|| HostError::UnknownPlugin(id.into()))?;
+        let mut fx = effect(id, sample_rate).ok_or_else(|| HostError::UnknownPlugin(id.into()))?;
         scope = fx.scope();
+        loader = fx.file_loader();
         let (node, params) = EffectNode::new(fx, sample_rate, max_block);
         (Box::new(node), params, false)
     };
@@ -59,6 +61,7 @@ pub fn instantiate(id: &str, sample_rate: f32, max_block: usize) -> Result<Insta
             instrument,
             latency,
             scope,
+            loader,
         }),
         node,
     ))
@@ -72,7 +75,11 @@ struct Builtin {
     /// Fixed for the instance (lookahead), so PDC is sized once.
     latency: u32,
     scope: Option<Arc<daw_dsp::Scope>>,
+    loader: Option<Box<dyn daw_dsp::effects::FileLoader>>,
 }
+
+/// The state line naming a built-in device's file.
+const FILE_KEY: &str = "FILE";
 
 impl Hosted for Builtin {
     fn params(&self) -> &[ParamInfo] {
@@ -90,6 +97,12 @@ impl Hosted for Builtin {
             .infos
             .iter()
             .filter_map(|p| Some(format!("{}={}", p.name, self.params.get(p.id as usize)?)))
+            .chain(
+                self.loader
+                    .as_ref()
+                    .and_then(|l| l.file())
+                    .map(|path| format!("{FILE_KEY}={}", path.display())),
+            )
             .collect();
         Ok(lines.join("\n").into_bytes())
     }
@@ -97,6 +110,12 @@ impl Hosted for Builtin {
     fn load_state(&mut self, bytes: &[u8]) -> Result<(), HostError> {
         let text = std::str::from_utf8(bytes).map_err(|_| HostError::State)?;
         for (name, value) in text.lines().filter_map(|l| l.split_once('=')) {
+            if let (FILE_KEY, Some(loader)) = (name, self.loader.as_mut()) {
+                // A missing or broken file keeps its name, so the project still
+                // says what it was; the device stays silent until it is found.
+                let _ = loader.load(std::path::Path::new(value));
+                continue;
+            }
             let id = self.infos.iter().find(|p| p.name == name).map(|p| p.id);
             if let (Some(id), Ok(v)) = (id, value.trim().parse::<f32>()) {
                 self.params.set(id as usize, v);
@@ -112,6 +131,19 @@ impl Hosted for Builtin {
     }
     fn scope(&self) -> Option<Arc<daw_dsp::Scope>> {
         self.scope.clone()
+    }
+    fn file(&self) -> Option<(Option<std::path::PathBuf>, Option<String>)> {
+        let l = self.loader.as_ref()?;
+        Some((
+            l.file().map(ToOwned::to_owned),
+            l.error().map(ToOwned::to_owned),
+        ))
+    }
+    fn load_file(&mut self, path: &std::path::Path) -> Result<(), HostError> {
+        match self.loader.as_mut() {
+            Some(l) => l.load(path).map_err(HostError::File),
+            None => Err(HostError::File("this device takes no files".into())),
+        }
     }
 }
 
@@ -213,6 +245,23 @@ mod tests {
             block(&mut node);
         }
         assert!(l.iter().all(|x| x.is_finite()));
+    }
+
+    #[test]
+    fn the_amp_keeps_its_file_in_state_even_when_missing() {
+        let (mut amp, _) = instantiate("canary.amp", 48_000.0, 64).unwrap();
+        assert_eq!(amp.file(), Some((None, None)));
+        let gone = std::path::Path::new("/nowhere/Plexi.nam");
+        assert!(amp.load_file(gone).is_err());
+        let state = amp.save_state().unwrap();
+        assert!(String::from_utf8_lossy(&state).contains("FILE=/nowhere/Plexi.nam"));
+        let (mut again, _) = instantiate("canary.amp", 48_000.0, 64).unwrap();
+        again.load_state(&state).unwrap();
+        let (path, error) = again.file().unwrap();
+        assert_eq!(path.as_deref(), Some(gone));
+        assert!(error.is_some(), "says why it is silent");
+        let (mut eq, _) = instantiate("canary.eq", 48_000.0, 64).unwrap();
+        assert!(eq.file().is_none() && eq.load_file(gone).is_err());
     }
 
     #[test]

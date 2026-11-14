@@ -903,6 +903,8 @@ dependencies = [
  "daw-core",
  "fft-convolver",
  "rtrb",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

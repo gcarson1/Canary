@@ -37,6 +37,8 @@ pub struct DeviceView {
     pub sampler: Option<SamplerView>,
     /// Set for the built-in parametric EQ.
     pub eq: Option<EqView>,
+    /// Set for a built-in device that loads a file (the amp's capture).
+    pub file: Option<FileView>,
     /// A third-party plugin, which may have its own editor.
     pub editor: bool,
 }
@@ -49,6 +51,15 @@ pub struct SamplerView {
     /// Slice starts as fractions of the sample, the first at 0.
     pub slices: Vec<f64>,
     pub layers: usize,
+}
+
+/// The file a device takes (dropped from the browser onto its module).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct FileView {
+    /// The file's name, once one was given.
+    pub name: Option<String>,
+    /// Why it could not be used, if it could not.
+    pub error: Option<String>,
 }
 
 /// What the rack shows of the parametric EQ besides its parameters.
@@ -406,6 +417,9 @@ pub(crate) fn show(
                 });
             }
         }
+        if let Some(file) = &device.file {
+            file_slot(ui, &p, m, ws, module, file, (track, di), was_open, out);
+        }
         if device.params.is_empty() {
             p.text(
                 module.center(),
@@ -444,6 +458,72 @@ pub(crate) fn show(
     if ws.picker.is_some() {
         if let Some(choice) = picker(ws, ui, m, r, inputs, was_open) {
             out.push(Request::AddDevice { track, choice });
+        }
+    }
+}
+
+/// The bottom line of a module that takes a file: what it holds (or why not),
+/// and the drop target for a file dragged from 01.
+#[allow(clippy::too_many_arguments)]
+fn file_slot(
+    ui: &egui::Ui,
+    p: &egui::Painter,
+    m: &Metrics,
+    ws: &Workspace,
+    module: Rect,
+    file: &FileView,
+    (track, di): (usize, usize),
+    covered: bool,
+    out: &mut Vec<Request>,
+) {
+    let (t, u) = (ws.theme, m.u);
+    let line = m.snap_rect(Rect::from_x_y_ranges(
+        module.min.x + 0.75 * u..=module.max.x - 0.75 * u,
+        module.max.y - 2.0 * u..=module.max.y - 0.75 * u,
+    ));
+    let pointer = ui.input(|i| i.pointer.hover_pos());
+    // Only where the module is drawn: the rack clips modules that run past it.
+    let over = pointer.is_some_and(|at| module.contains(at) && p.clip_rect().contains(at));
+    let dragging = ws.file_drag.is_some();
+    p.rect_stroke(
+        line,
+        0.0,
+        if dragging && over {
+            Stroke::new(0.125 * u, t.accent_amber)
+        } else {
+            m.hair(t.line_2)
+        },
+        StrokeKind::Inside,
+    );
+    let (text, color) = match (&file.name, &file.error) {
+        (_, Some(error)) => (error.to_uppercase(), t.bad),
+        (Some(name), None) => (name.to_uppercase(), t.text),
+        (None, None) => ("DROP A .NAM CAPTURE FROM 01".to_string(), t.faint),
+    };
+    let fit = ((line.width() / (0.4 * u)) as usize).max(4);
+    let shown: String = if text.chars().count() > fit {
+        text.chars()
+            .take(fit - 1)
+            .chain(std::iter::once('…'))
+            .collect()
+    } else {
+        text
+    };
+    p.text(
+        Pos2::new(line.min.x + 0.5 * u, line.center().y),
+        Align2::LEFT_CENTER,
+        shown,
+        m.mono(0.5625),
+        color,
+    );
+    if let (Some(path), true, false) = (&ws.file_drag, over, covered) {
+        if ui.input(|i| i.pointer.any_released()) {
+            out.push(Request::LoadSample {
+                track,
+                device: di,
+                path: path.clone(),
+                drop: SampleDrop::Replace,
+            });
         }
     }
 }

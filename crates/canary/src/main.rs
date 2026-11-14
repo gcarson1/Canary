@@ -42,6 +42,8 @@ const SEND_NODES: std::ops::Range<u32> = MAX_TRACKS as u32 + 1..PREVIEW_NODE.0;
 const PREVIEW_NODE: NodeId = NodeId(REFERENCE_NODE.0 - 1);
 const AUDIO_EXTENSIONS: [&str; 7] = ["wav", "flac", "mp3", "m4a", "aac", "aif", "aiff"];
 const MIDI_EXTENSIONS: [&str; 2] = ["mid", "midi"];
+/// Amp captures, for the amp device; listed in the browser, never played.
+const NAM_EXTENSIONS: [&str; 1] = ["nam"];
 /// New projects start from this, under the samples folder.
 const TEMPLATE: &str = "Templates/Default.daw";
 const AUTOSAVE_EVERY: Duration = Duration::from_secs(60);
@@ -170,7 +172,11 @@ fn audio_files(dir: &Path) -> Vec<PathBuf> {
         .flatten()
         .flatten()
         .map(|e| e.path())
-        .filter(|p| has_extension(p, &AUDIO_EXTENSIONS) || has_extension(p, &MIDI_EXTENSIONS))
+        .filter(|p| {
+            has_extension(p, &AUDIO_EXTENSIONS)
+                || has_extension(p, &MIDI_EXTENSIONS)
+                || has_extension(p, &NAM_EXTENSIONS)
+        })
         .collect();
     files.sort();
     files
@@ -894,6 +900,8 @@ impl App {
             Request::AddFile { track, path, .. } if has_extension(&path, &MIDI_EXTENSIONS) => {
                 self.import_midi(track, &path)
             }
+            // A capture belongs on an amp, not the playlist.
+            Request::AddFile { path, .. } if has_extension(&path, &NAM_EXTENSIONS) => {}
             Request::AddFile { track, path, at } => self.load(path, Some((track, at))),
             Request::ExportMidi { track } => self.export_midi(track),
             Request::ToggleRecord => self.toggle_record(),
@@ -901,7 +909,9 @@ impl App {
             Request::Preview(path) => {
                 self.preview_wanted = None;
                 match path {
-                    Some(p) if has_extension(&p, &MIDI_EXTENSIONS) => {}
+                    Some(p)
+                        if has_extension(&p, &MIDI_EXTENSIONS)
+                            || has_extension(&p, &NAM_EXTENSIONS) => {}
                     Some(p) => match self.audio.get(&p) {
                         Some(audio) => {
                             self.preview_wanted = None;
@@ -1001,7 +1011,13 @@ impl App {
                     SampleDrop::Key => LayerKind::Key,
                 };
                 let uid = self.device_uid(track, device);
-                if let Some(s) = uid.and_then(|uid| self.devices.sampler(uid)) {
+                if has_extension(&path, &NAM_EXTENSIONS) {
+                    // A capture onto the amp; anything else ignores it.
+                    if uid.is_some_and(|uid| self.devices.load_file(uid, &path)) {
+                        self.history.mark_dirty();
+                        self.autosaved = None;
+                    }
+                } else if let Some(s) = uid.and_then(|uid| self.devices.sampler(uid)) {
                     // Dropping a file again retries a load that failed.
                     self.sample_requests.remove(&path);
                     s.add_layer(path, kind);

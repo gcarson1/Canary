@@ -12,7 +12,7 @@ use daw_graph::{AudioNode, ExecutionPlan, Source, StepId, MAX_NODES};
 use daw_host::ara::{self, AraClip};
 use daw_host::{Catalog, Format, Hosted, Sampler};
 use daw_project::{AraArchive, Device, PluginFormat, Project, Track};
-use daw_ui::{DeviceView, EqView, ParamView, PluginChoice, SamplerView};
+use daw_ui::{DeviceView, EqView, FileView, ParamView, PluginChoice, SamplerView};
 
 /// Analyzer points the EQ panel draws, spaced evenly in octaves.
 const EQ_POINTS: usize = 192;
@@ -552,6 +552,20 @@ impl Devices {
         self.live.get_mut(&uid)?.hosted.sampler()
     }
 
+    /// Gives device `uid` a file (an amp capture). False if it takes none.
+    pub fn load_file(&mut self, uid: u64, path: &Path) -> bool {
+        let Some(l) = self
+            .live
+            .get_mut(&uid)
+            .filter(|l| l.hosted.file().is_some())
+        else {
+            return false;
+        };
+        // A bad file shows its reason on the module; the attempt still counts.
+        let _ = l.hosted.load_file(path);
+        true
+    }
+
     /// Hands loaded audio to samplers waiting for it; returns the files still
     /// to load.
     pub fn feed_samplers(&mut self, audio: &HashMap<PathBuf, Arc<SampleData>>) -> Vec<PathBuf> {
@@ -604,6 +618,15 @@ impl Devices {
                         .collect()
                 }),
                 editor: d.format != PluginFormat::Builtin,
+                file: self
+                    .live
+                    .get(&d.uid)
+                    .and_then(|l| l.hosted.file())
+                    .map(|(path, error)| FileView {
+                        name: path
+                            .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned())),
+                        error,
+                    }),
                 eq: self
                     .live
                     .get(&d.uid)

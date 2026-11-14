@@ -17,7 +17,7 @@ use daw_dsp::WaveformPyramid;
 use daw_project::{Action, History, Pattern, Playback, Project, Target, Track, TrackProps, PPQ};
 use egui::{Align2, Color32, Key, Pos2, Rect, Sense, Shape, StrokeKind, Vec2};
 
-pub use rack::{DeviceView, EqView, ParamView, PluginChoice, SampleDrop, SamplerView};
+pub use rack::{DeviceView, EqView, FileView, ParamView, PluginChoice, SampleDrop, SamplerView};
 use theme::Metrics;
 pub use theme::Theme;
 

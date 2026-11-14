@@ -285,7 +285,7 @@ impl App {
             audio_view: daw_ui::AudioView {
                 devices: daw_engine::output_devices(),
                 device: audio_choice.device.clone(),
-                buffer: audio_choice.buffer,
+                buffer: fixed_buffer(&config),
                 inputs: daw_engine::input_devices(),
                 input: input_choice.clone(),
             },
@@ -681,6 +681,8 @@ impl App {
         self.built_loop = None;
         self.built_reference = None;
         self.sent_metronome = !self.ws.metronome;
+        // The panel shows the buffer the device took, not the one asked for.
+        self.audio_view.buffer = fixed_buffer(&config);
         Ok(())
     }
 
@@ -1150,15 +1152,21 @@ impl App {
                     Ok(()) => {
                         self.audio_lost = None;
                         self.audio_view.device = self.audio_choice.device.clone();
-                        self.audio_view.buffer = self.audio_choice.buffer;
                         save_audio_choice(
                             &self.samples_dir,
                             &self.audio_choice,
                             &self.input_choice,
                         );
-                        self.ws.status = Some(Status {
-                            text: "AUDIO OUTPUT CHANGED".into(),
-                            error: false,
+                        let asked = self.audio_choice.buffer;
+                        self.ws.status = Some(match asked {
+                            Some(n) if self.audio_view.buffer != asked => Status {
+                                text: format!("{n} FRAMES NOT SUPPORTED · USING THE DEVICE'S OWN"),
+                                error: true,
+                            },
+                            _ => Status {
+                                text: "AUDIO OUTPUT CHANGED".into(),
+                                error: false,
+                            },
                         });
                     }
                     Err(e) => {
@@ -2370,6 +2378,15 @@ fn punch_window(at: u64, frames: u64, (from, to): (u64, u64)) -> Option<(u64, u6
     let begin = from.max(at);
     let end = to.min(at.saturating_add(frames));
     (begin < end).then(|| (begin, begin - at, end - begin))
+}
+
+/// The frames per callback a stream was opened with, if fixed (else the
+/// device's own size).
+fn fixed_buffer(config: &cpal::StreamConfig) -> Option<u32> {
+    match config.buffer_size {
+        cpal::BufferSize::Fixed(n) => Some(n),
+        _ => None,
+    }
 }
 
 /// Where the audio output choice is kept between sessions.

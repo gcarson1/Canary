@@ -220,6 +220,10 @@ mod tests {
             for p in handle.params().to_vec() {
                 handle.set_param(p.id, (p.min + p.max) / 2.0);
             }
+            if info.id == crate::sampler::ID {
+                // Classic mode (MODE's middle would be slices, off key 60).
+                handle.set_param(0, 1.0);
+            }
             if let Some(s) = handle.sampler() {
                 // Something to play, so voices run too.
                 let audio = daw_core::SampleData::new(48_000, vec![vec![0.3; 4_800]]).unwrap();

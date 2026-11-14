@@ -312,6 +312,8 @@ fn sampler() -> DeviceView {
             path: Some(PathBuf::from("/samples/808_Thermal_Sub.wav")),
             slices: vec![0.0, 0.25, 0.5, 0.75],
             layers: 2,
+            kit_pads: 0,
+            pads: vec![(0, 0), (3, 1), (0, 1), (-12, 0)],
         }),
     }
 }

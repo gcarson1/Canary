@@ -14,7 +14,7 @@ mod vst3;
 pub use au::{audio_units, AuKind, AuNode, AuPlugin};
 pub use catalog::{Available, Catalog, Format, Hosted, Instance};
 pub use clap::{load_bundle, plugins, ClapPlugin, HostError, ParamInfo, PluginInfo, PluginNode};
-pub use sampler::{LayerKind, Sampler};
+pub use sampler::{LayerKind, Pad, Sampler, CHOKE_GROUPS, PADS};
 pub use vst3::{Vst3Bundle, Vst3Node, Vst3Plugin};
 
 #[cfg(test)]

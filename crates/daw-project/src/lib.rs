@@ -18,8 +18,10 @@ pub mod edit;
 mod notes;
 pub mod smf;
 mod tempo;
+mod warp;
 pub use notes::{sorted, Note, Pattern, PatternClip, PatternNotes, Playback, MAX_TICKS, PPQ, STEP};
 pub use tempo::{bpm_ok, valid_meters, valid_tempos, BarBeat, MeterChange, TempoChange};
+pub use warp::{Piece, Warp};
 
 /// Bumped when the file format changes incompatibly.
 /// 2: built-in effects' MIX/MATCH/DELTA have fixed parameter ids
@@ -353,6 +355,10 @@ pub struct Stretch {
     pub ratio: f64,
     /// -24..=24.
     pub semitones: f64,
+    /// Set when the clip follows the tempo map; then the render is warped,
+    /// and `ratio` is its overall length factor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warp: Option<Warp>,
 }
 
 fn unity() -> f32 {

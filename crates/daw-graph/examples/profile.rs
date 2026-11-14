@@ -80,6 +80,8 @@ fn main() {
         root: 60,
         cell: 0,
         one_shot: true,
+        tune: 0.0,
+        choke: 0,
     };
     sampler.exchange(&mut SamplerData { zones: vec![zone] });
     time("sampler", &mut sampler, 0, true);

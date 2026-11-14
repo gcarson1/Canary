@@ -34,8 +34,9 @@ const fn spec(name: &'static str, min: f32, max: f32, default: f32) -> ParamSpec
 /// MODE, SLICER, SENS, GRID and ROOT shape the zones (main thread); the node
 /// reads ATTACK, RELEASE and GAIN each block.
 pub const SAMPLER_PARAMS: [ParamSpec; 8] = [
-    // 0 one-shot, 1 classic (held notes), 2 slice (one slice per pad).
-    spec("MODE", 0.0, 2.0, 1.0),
+    // 0 one-shot, 1 classic (held notes), 2 slice (one slice per pad),
+    // 3 kit (one sample per pad).
+    spec("MODE", 0.0, 3.0, 1.0),
     // 0 transients, 1 grid, 2 manual markers.
     spec("SLICER", 0.0, 2.0, 0.0),
     spec("SENS", 0.0, 1.0, 0.5),
@@ -65,6 +66,10 @@ pub struct Zone {
     pub cell: u16,
     /// Plays to its end, ignoring note off.
     pub one_shot: bool,
+    /// Semitones up (or down) from the key's pitch.
+    pub tune: f32,
+    /// A choke group: a note in it cuts every other voice in it. 0 is none.
+    pub choke: u8,
 }
 
 impl Zone {
@@ -138,7 +143,15 @@ impl SamplerNode {
             return;
         };
         *turn = turn.wrapping_add(1);
-        let semitones = f64::from(key) - f64::from(zone.root);
+        // A closed hat cuts the open one: the zone's choke group goes quiet.
+        if zone.choke > 0 {
+            let zones = &self.zones;
+            let grouped = |v: &Voice| zones.get(v.zone).is_some_and(|z| z.choke == zone.choke);
+            for v in self.voices.iter_mut().filter(|v| v.active && grouped(v)) {
+                v.choked = true;
+            }
+        }
+        let semitones = f64::from(key) - f64::from(zone.root) + f64::from(zone.tune);
         let step = 2f64.powf(semitones / 12.0) * f64::from(zone.sample.sample_rate())
             / f64::from(sample_rate);
         self.notes += 1;
@@ -328,6 +341,8 @@ mod tests {
             root: 60,
             cell: 0,
             one_shot: true,
+            tune: 0.0,
+            choke: 0,
         }
     }
 
@@ -421,6 +436,26 @@ mod tests {
         s.exchange(&mut old);
         assert_eq!(old.zones.len(), 1, "old zones go back to be dropped");
         assert!(block(&mut s, 64, &[]).iter().all(|&x| x == 0.0));
+    }
+
+    #[test]
+    fn a_choke_group_cuts_its_other_pads_and_tune_shifts_pitch() {
+        let pad = |key, choke, tune| Zone {
+            keys: (key, key),
+            root: key,
+            choke,
+            tune,
+            ..zone(0.5, 96_000)
+        };
+        let mut s = sampler(vec![pad(46, 1, 0.0), pad(42, 1, 12.0), pad(36, 0, 0.0)]);
+        block(&mut s, 64, &[on(46, 127, 0), on(36, 127, 0)]);
+        block(&mut s, 64, &[on(42, 127, 0)]);
+        let active = |s: &SamplerNode, key| s.voices.iter().any(|v| v.active && v.key == key);
+        block(&mut s, 4_800, &[]);
+        assert!(!active(&s, 46), "the open hat is choked");
+        assert!(active(&s, 42) && active(&s, 36), "the kick is in no group");
+        let v = s.voices.iter().find(|v| v.active && v.key == 42).unwrap();
+        assert!((v.step - 2.0).abs() < 1e-9, "tuned an octave up");
     }
 
     #[test]

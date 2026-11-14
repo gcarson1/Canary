@@ -51,6 +51,10 @@ pub struct SamplerView {
     /// Slice starts as fractions of the sample, the first at 0.
     pub slices: Vec<f64>,
     pub layers: usize,
+    /// Kit mode's pads (one per key zone).
+    pub kit_pads: usize,
+    /// Each pad's tune (semitones) and choke group (0 is none).
+    pub pads: Vec<(i8, u8)>,
 }
 
 /// The file a device takes (dropped from the browser onto its module).
@@ -87,6 +91,10 @@ pub enum SampleDrop {
 
 /// Pads shown per sampler (4 x 4); slices past these still play from their keys.
 const PADS: usize = 16;
+/// Wheel travel (points) per semitone of pad tune.
+const PAD_WHEEL_STEP: f32 = 24.0;
+/// Choke groups a pad can join (0 is none); matches the sampler's.
+const CHOKE_GROUPS: u8 = 4;
 const NOTE_NAMES: [&str; 12] = [
     "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
 ];
@@ -897,6 +905,7 @@ fn sampler_panel(
             .map(|p| p.value)
     };
     let slicing = param("MODE").is_some_and(|v| v.round() == 2.0);
+    let kit = param("MODE").is_some_and(|v| v.round() == 3.0);
     let root = param("ROOT").map_or(60, |v| v.round().clamp(0.0, 127.0) as usize);
     let grid = Rect::from_x_y_ranges(wave.x_range(), wave.max.y + pad..=r.max.y - pad);
     let cell = Vec2::new(grid.width() / 4.0, grid.height() / 4.0);
@@ -905,6 +914,8 @@ fn sampler_panel(
         let rect = m.snap_rect(Rect::from_min_size(min, cell).shrink(0.125 * u));
         let live = if slicing {
             i < view.slices.len()
+        } else if kit {
+            i < view.kit_pads
         } else {
             i == 0 && view.path.is_some()
         };
@@ -917,7 +928,43 @@ fn sampler_panel(
             m.hair(if live { t.line_2 } else { t.line }),
             StrokeKind::Inside,
         );
-        let key = if slicing { root + i } else { root };
+        let key = if slicing || kit { root + i } else { root };
+        let (tune, choke) = view.pads.get(i).copied().unwrap_or_default();
+        if live && key <= 127 && !covered && (slicing || kit) {
+            // On a pad, the wheel tunes it and right-click steps its choke group.
+            let hovered = ui.rect_contains_pointer(rect);
+            let id = ui.scope_id().with(("pad-wheel", di, i));
+            let steps = if hovered {
+                // Mostly-sideways swipes scroll the rack, not the tune.
+                let d = ui.input(|i| i.smooth_scroll_delta);
+                let wheel = if d.y.abs() > d.x.abs() { d.y } else { 0.0 };
+                ui.ctx().memory_mut(|mem| {
+                    let acc = mem.data.get_temp_mut_or(id, 0.0f32);
+                    *acc += wheel;
+                    let steps = (*acc / PAD_WHEEL_STEP).trunc();
+                    *acc -= steps * PAD_WHEEL_STEP;
+                    steps as i32
+                })
+            } else {
+                ui.ctx().memory_mut(|mem| mem.data.remove::<f32>(id));
+                0
+            };
+            let right = hovered && ui.input(|i| i.pointer.secondary_clicked());
+            let new_tune = (i32::from(tune) + steps).clamp(-24, 24) as i8;
+            if new_tune != tune || right {
+                out.push(Request::SamplerPad {
+                    track,
+                    device: di,
+                    pad: i,
+                    tune: new_tune,
+                    choke: if right {
+                        (choke + 1) % (CHOKE_GROUPS + 1)
+                    } else {
+                        choke
+                    },
+                });
+            }
+        }
         if live && key <= 127 && !covered {
             // Pressing a pad plays its key; `Workspace::show` sends the note-off
             // on release, even if the pad is gone by then.
@@ -953,6 +1000,22 @@ fn sampler_panel(
                 m.mono(0.5),
                 t.faint,
             );
+            let mut tags = Vec::new();
+            if tune != 0 {
+                tags.push(format!("{tune:+}ST"));
+            }
+            if choke != 0 {
+                tags.push(format!("C{choke}"));
+            }
+            if !tags.is_empty() {
+                p.text(
+                    Pos2::new(rect.min.x + 0.375 * u, rect.max.y - 0.375 * u),
+                    Align2::LEFT_BOTTOM,
+                    tags.join(" "),
+                    m.mono(0.5),
+                    t.muted,
+                );
+            }
         }
     }
 }

@@ -138,6 +138,15 @@ pub enum Request {
         ratio: f64,
         semitones: f64,
     },
+    /// Set pad `pad` of `track`'s sampler `device`: tune in semitones, and its
+    /// choke group (0 is none).
+    SamplerPad {
+        track: usize,
+        device: usize,
+        pad: usize,
+        tune: i8,
+        choke: u8,
+    },
     /// Freeze `track` (render it through its devices and unload them), or thaw
     /// it if frozen; with `bounce`, put the render in place of its devices,
     /// clips and notes.

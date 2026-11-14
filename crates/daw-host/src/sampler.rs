@@ -21,6 +21,17 @@ const SLICER: usize = 1;
 const SENS: usize = 2;
 const GRID: usize = 3;
 const ROOT: usize = 6;
+/// Pads with their own tune and choke group (slice and kit modes).
+pub const PADS: usize = 16;
+/// Choke groups a pad can join (0 is none).
+pub const CHOKE_GROUPS: u8 = 4;
+
+/// One pad's settings: semitones of tune and a choke group (0 is none).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Pad {
+    pub tune: i8,
+    pub choke: u8,
+}
 
 /// How a dropped file joins the sampler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +60,7 @@ pub struct Sampler {
     layers: Vec<Layer>,
     /// Manual slice points, as fractions of the first layer's length.
     markers: Vec<f64>,
+    pads: [Pad; PADS],
     /// Slice starts in frames of the first layer, as last built.
     starts: Vec<usize>,
     /// The slices need recomputing (slicer settings, markers or audio changed);
@@ -112,6 +124,7 @@ pub fn instantiate() -> Instance {
         infos,
         layers: Vec::new(),
         markers: Vec::new(),
+        pads: [Pad::default(); PADS],
         starts: Vec::new(),
         reslice: true,
         to_node,
@@ -204,6 +217,36 @@ impl Sampler {
         self.layers.len()
     }
 
+    /// Kit mode's pads: one per key zone (a file dropped with Cmd).
+    pub fn kit_pads(&self) -> usize {
+        self.layers
+            .iter()
+            .map(|l| usize::from(l.key) + 1)
+            .max()
+            .unwrap_or(0)
+    }
+
+    pub fn pads(&self) -> [Pad; PADS] {
+        self.pads
+    }
+
+    /// Sets pad `index`'s tune (held to two octaves) and choke group.
+    pub fn set_pad(&mut self, index: usize, pad: Pad) {
+        if let Some(p) = self.pads.get_mut(index) {
+            *p = Pad {
+                tune: pad.tune.clamp(-24, 24),
+                choke: pad.choke.min(CHOKE_GROUPS),
+            };
+            self.rebuild();
+        }
+    }
+
+    /// Pad `i`'s tune and choke group, as a zone takes them.
+    fn pad(&self, i: usize) -> (f32, u8) {
+        let p = self.pads.get(i).copied().unwrap_or_default();
+        (f32::from(p.tune), p.choke)
+    }
+
     /// Slice starts as fractions of the first layer's length.
     pub fn slice_points(&self) -> Vec<f64> {
         let frames = self
@@ -284,6 +327,7 @@ impl Sampler {
                     else {
                         break;
                     };
+                    let (tune, choke) = self.pad(i);
                     zones.push(Zone {
                         sample: audio.clone(),
                         start,
@@ -293,8 +337,33 @@ impl Sampler {
                         root: key,
                         cell: i as u16,
                         one_shot: true,
+                        tune,
+                        choke,
                     });
                 }
+            }
+        } else if mode == 3 {
+            // A kit: key zone n is pad n, on ROOT + n at its own pitch.
+            for l in &self.layers {
+                let (Some(audio), Some(key)) = (l.audio.clone(), root.checked_add(l.key)) else {
+                    continue;
+                };
+                if key > 127 {
+                    continue;
+                }
+                let (tune, choke) = self.pad(usize::from(l.key));
+                zones.push(Zone {
+                    end: audio.frames(),
+                    sample: audio,
+                    start: 0,
+                    keys: (key, key),
+                    velocities: split(1, self.velocities(l.key), l.velocity),
+                    root: key,
+                    cell: u16::from(l.key) * 128 + u16::from(l.velocity),
+                    one_shot: true,
+                    tune,
+                    choke,
+                });
             }
         } else {
             let keys = self.layers.iter().map(|l| l.key).max().map_or(1, |m| m + 1);
@@ -317,6 +386,8 @@ impl Sampler {
                     },
                     cell: u16::from(l.key) * 128 + u16::from(l.velocity),
                     one_shot: mode == 0,
+                    tune: 0.0,
+                    choke: 0,
                 });
             }
         }
@@ -360,7 +431,8 @@ impl Hosted for Sampler {
         }
         true
     }
-    /// Param lines, then `LAYER=key,velocity,path` and `MARKER=fraction` lines.
+    /// Param lines, then `LAYER=key,velocity,path`, `MARKER=fraction` and
+    /// `PAD=index,tune,choke` lines (pads left at their defaults are omitted).
     fn save_state(&mut self) -> Result<Vec<u8>, HostError> {
         let mut lines: Vec<String> = self
             .infos
@@ -376,6 +448,11 @@ impl Hosted for Sampler {
             ));
         }
         lines.extend(self.markers.iter().map(|m| format!("MARKER={m}")));
+        for (i, p) in self.pads.iter().enumerate() {
+            if *p != Pad::default() {
+                lines.push(format!("PAD={i},{},{}", p.tune, p.choke));
+            }
+        }
         Ok(lines.join("\n").into_bytes())
     }
     /// Bad lines are skipped. Layer audio must be given again with `set_audio`.
@@ -383,6 +460,7 @@ impl Hosted for Sampler {
         let text = std::str::from_utf8(bytes).map_err(|_| HostError::State)?;
         self.layers.clear();
         self.markers.clear();
+        self.pads = [Pad::default(); PADS];
         self.reslice = true;
         for (name, value) in text.lines().filter_map(|l| l.split_once('=')) {
             match name {
@@ -402,6 +480,20 @@ impl Hosted for Sampler {
                     }
                 }
                 "MARKER" => self.markers.extend(value.parse::<f64>().ok()),
+                "PAD" => {
+                    let v: Vec<&str> = value.split(',').collect();
+                    if let [i, tune, choke] = v[..] {
+                        let pad = (i.parse::<usize>(), tune.parse::<i8>(), choke.parse::<u8>());
+                        if let (Ok(i), Ok(tune), Ok(choke)) = pad {
+                            if let Some(p) = self.pads.get_mut(i) {
+                                *p = Pad {
+                                    tune: tune.clamp(-24, 24),
+                                    choke: choke.min(CHOKE_GROUPS),
+                                };
+                            }
+                        }
+                    }
+                }
                 _ => {
                     let id = self.infos.iter().find(|p| p.name == name).map(|p| p.id);
                     if let (Some(id), Ok(v)) = (id, value.trim().parse::<f32>()) {
@@ -540,6 +632,7 @@ mod tests {
             [PathBuf::from("/x/kick=1.wav"), "/x/kick2.wav".into()]
         );
         assert_eq!(s.markers, [0.5]);
+        assert_eq!(s.pads, [Pad::default(); PADS]);
         b.load_state(b"LAYER=x\nLAYER=1,2\nMARKER=nope\nGRID=abc")
             .unwrap();
         assert!(
@@ -547,6 +640,49 @@ mod tests {
             "bad lines skipped"
         );
         assert!(b.load_state(&[0xff]).is_err());
+    }
+
+    #[test]
+    fn a_kit_puts_each_key_zone_on_its_own_pad_with_its_tune_and_choke() {
+        let (mut a, _) = handle();
+        a.set_param(MODE as u32, 3.0);
+        a.set_param(ROOT as u32, 36.0);
+        let s = a.sampler().unwrap();
+        s.add_layer("kick.wav".into(), LayerKind::Replace);
+        s.add_layer("closed.wav".into(), LayerKind::Key);
+        s.add_layer("open.wav".into(), LayerKind::Key);
+        for p in ["kick.wav", "closed.wav", "open.wav"] {
+            s.set_audio(Path::new(p), &audio(100));
+        }
+        s.set_pad(1, Pad { tune: 3, choke: 1 });
+        s.set_pad(
+            2,
+            Pad {
+                tune: -99,
+                choke: 9,
+            },
+        );
+        assert_eq!(s.kit_pads(), 3);
+        let zones: Vec<_> = s
+            .zones()
+            .iter()
+            .map(|z| (z.keys, z.root, z.tune, z.choke, z.one_shot))
+            .collect();
+        assert_eq!(
+            zones,
+            [
+                ((36, 36), 36, 0.0, 0, true),
+                ((37, 37), 37, 3.0, 1, true),
+                ((38, 38), 38, -24.0, CHOKE_GROUPS, true),
+            ]
+        );
+        // Pads survive a save.
+        let state = a.save_state().unwrap();
+        let (mut b, _) = handle();
+        b.load_state(&state).unwrap();
+        assert_eq!(b.sampler().unwrap().pads()[1], Pad { tune: 3, choke: 1 });
+        b.load_state(b"PAD=99,1,1\nPAD=0,x,1").unwrap();
+        assert_eq!(b.sampler().unwrap().pads(), [Pad::default(); PADS]);
     }
 
     #[test]

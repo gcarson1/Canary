@@ -1394,6 +1394,20 @@ impl App {
                     self.error("pad note dropped".into());
                 }
             }
+            Request::SamplerPad {
+                track,
+                device,
+                pad,
+                tune,
+                choke,
+            } => {
+                let uid = self.device_uid(track, device);
+                if let Some(s) = uid.and_then(|uid| self.devices.sampler(uid)) {
+                    s.set_pad(pad, daw_host::Pad { tune, choke });
+                    self.history.mark_dirty();
+                    self.autosaved = None;
+                }
+            }
             Request::SliceMarker {
                 track,
                 device,
@@ -1751,6 +1765,7 @@ impl App {
                     original: done.original,
                     ratio: done.ratio,
                     semitones: done.semitones,
+                    warp: None,
                 }),
                 ..done.clip
             };

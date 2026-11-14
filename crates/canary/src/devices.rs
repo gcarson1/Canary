@@ -761,6 +761,8 @@ impl Devices {
                         path: s.main_path().map(Path::to_path_buf),
                         slices: s.slice_points(),
                         layers: s.layer_count(),
+                        kit_pads: s.kit_pads(),
+                        pads: s.pads().iter().map(|p| (p.tune, p.choke)).collect(),
                     }),
             })
             .collect()

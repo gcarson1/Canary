@@ -68,6 +68,10 @@ pub trait Hosted {
     fn editor_resized(&mut self) -> Option<(f64, f64)> {
         None
     }
+    /// The output analyzer of a built-in effect that draws one (the parametric EQ).
+    fn scope(&self) -> Option<Arc<daw_dsp::Scope>> {
+        None
+    }
     /// The built-in sampler's own controls; None for everything else.
     fn sampler(&mut self) -> Option<&mut crate::Sampler> {
         None

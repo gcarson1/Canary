@@ -78,6 +78,22 @@ impl Biquad {
         self.z2 = 0.0;
     }
 
+    /// The gain at `freq` (linear), for drawing a response curve.
+    pub fn magnitude(&self, freq: f32, sample_rate: f32) -> f32 {
+        let w = 2.0 * PI * freq / sample_rate;
+        let (s1, c1) = w.sin_cos();
+        let (s2, c2) = (2.0 * w).sin_cos();
+        let (nr, ni) = (
+            self.b0 + self.b1 * c1 + self.b2 * c2,
+            -self.b1 * s1 - self.b2 * s2,
+        );
+        let (dr, di) = (
+            1.0 + self.a1 * c1 + self.a2 * c2,
+            -self.a1 * s1 - self.a2 * s2,
+        );
+        ((nr * nr + ni * ni) / (dr * dr + di * di).max(1e-30)).sqrt()
+    }
+
     /// The filter's memory, to carry across a change of coefficients.
     pub fn state(&self) -> (f32, f32) {
         (self.z1, self.z2)

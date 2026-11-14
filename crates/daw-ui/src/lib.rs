@@ -17,7 +17,7 @@ use daw_dsp::WaveformPyramid;
 use daw_project::{Action, History, Pattern, Playback, Project, Target, Track, TrackProps, PPQ};
 use egui::{Align2, Color32, Key, Pos2, Rect, Sense, Shape, StrokeKind, Vec2};
 
-pub use rack::{DeviceView, ParamView, PluginChoice, SampleDrop, SamplerView};
+pub use rack::{DeviceView, EqView, ParamView, PluginChoice, SampleDrop, SamplerView};
 use theme::Metrics;
 pub use theme::Theme;
 
@@ -289,6 +289,8 @@ pub struct Workspace {
     picker: Option<f32>,
     /// Points the rack is scrolled to the left.
     rack_scroll: f32,
+    /// The parametric EQ band whose dials the rack shows.
+    eq_band: usize,
     /// What Cmd+C or Cmd+X took, for Cmd+V.
     clipboard: Option<Clipboard>,
 
@@ -333,6 +335,7 @@ impl Default for Workspace {
             picker: None,
             device_drag: None,
             rack_scroll: 0.0,
+            eq_band: 0,
             clipboard: None,
 
             loop_anchor: None,

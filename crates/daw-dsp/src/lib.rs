@@ -5,6 +5,7 @@ pub mod effects;
 mod filter;
 pub mod fx;
 mod meter;
+mod scope;
 pub mod slice;
 pub mod stretch;
 mod waveform;
@@ -12,6 +13,7 @@ mod waveform;
 pub use click::Click;
 pub use filter::{db_to_gain, gain_to_db, Biquad, Envelope, FilterKind};
 pub use meter::{integrated_loudness, Loudness, TruePeak};
+pub use scope::{Scope, SPECTRUM_HIGH_HZ, SPECTRUM_LOW_HZ};
 pub use waveform::{MinMax, WaveformPyramid, LEVELS};
 
 /// One-pole smoother that glides a parameter toward its target to avoid zipper noise and clicks.

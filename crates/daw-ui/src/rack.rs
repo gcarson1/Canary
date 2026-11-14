@@ -1,12 +1,14 @@
 //! 02B // HARDWARE_DSP_RACK: the selected track's plugin devices as modules with
 //! arc dials (Styles.md 4.3), and the picker that adds one. A sampler module is
 //! twice as wide: its waveform with slice points, and the pads they map to
-//! (press one to hear it).
+//! (press one to hear it). So is the parametric EQ: its curve over an analyzer,
+//! with a handle per band, and the selected band's dials.
 
 use std::f32::consts::PI;
 use std::path::PathBuf;
 
-use daw_dsp::MinMax;
+use daw_dsp::fx::{eq8_response_db, BandType, EQ8_BANDS, EQ8_BAND_PARAMS};
+use daw_dsp::{MinMax, SPECTRUM_HIGH_HZ, SPECTRUM_LOW_HZ};
 
 use daw_project::Action;
 use egui::{Align2, Pos2, Rect, Sense, Shape, Stroke, StrokeKind, Vec2};
@@ -33,6 +35,8 @@ pub struct DeviceView {
     pub params: Vec<ParamView>,
     /// Set for the built-in sampler.
     pub sampler: Option<SamplerView>,
+    /// Set for the built-in parametric EQ.
+    pub eq: Option<EqView>,
     /// A third-party plugin, which may have its own editor.
     pub editor: bool,
 }
@@ -45,6 +49,14 @@ pub struct SamplerView {
     /// Slice starts as fractions of the sample, the first at 0.
     pub slices: Vec<f64>,
     pub layers: usize,
+}
+
+/// What the rack shows of the parametric EQ besides its parameters.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct EqView {
+    pub sample_rate: f32,
+    /// Output level in dBFS at points spaced evenly in octaves, 20 Hz to 20 kHz.
+    pub spectrum: Vec<f32>,
 }
 
 /// How a file dropped on a sampler joins it, by modifier held at the drop.
@@ -113,7 +125,7 @@ pub(crate) fn show(
     let module_w = 16.0 * u;
     let width = |d: &DeviceView| {
         // The sampler's panel, or more dials than one module holds, take two.
-        if d.sampler.is_some() || d.params.len() > DIALS {
+        if d.sampler.is_some() || d.eq.is_some() || d.params.len() > DIALS {
             2.0 * module_w
         } else {
             module_w
@@ -313,10 +325,45 @@ pub(crate) fn show(
             p.vline(m.snap(panel.max.x), panel.y_range(), m.hair(t.line));
             dials_x = panel.max.x;
         }
+        if let Some(view) = &device.eq {
+            let panel = Rect::from_x_y_ranges(
+                module.min.x..=module.min.x + module_w,
+                top + 1.25 * u..=module.max.y,
+            );
+            eq_panel(
+                ui,
+                &p,
+                m,
+                ws,
+                panel,
+                device,
+                view,
+                (track, di),
+                was_open,
+                out,
+            );
+            p.vline(m.snap(panel.max.x), panel.y_range(), m.hair(t.line));
+            dials_x = panel.max.x;
+        }
         let cell = Vec2::new(module_w / 4.0, (module.height() - 2.5 * u) / 2.0);
         // Two rows of as many columns as fit beside any panel.
         let cols = (((module.max.x - dials_x) / cell.x).round() as usize).max(1);
-        for (pi, param) in device.params.iter().take(cols * 2).enumerate() {
+        // The EQ shows its selected band's four dials, then OUTPUT and the rest.
+        let shown: Vec<&ParamView> = if device.eq.is_some() {
+            let band = ws.eq_band.min(EQ8_BANDS - 1) * EQ8_BAND_PARAMS;
+            let own = EQ8_BANDS * EQ8_BAND_PARAMS;
+            device
+                .params
+                .iter()
+                .filter(|p| {
+                    let i = p.id as usize;
+                    (band..band + EQ8_BAND_PARAMS).contains(&i) || i >= own
+                })
+                .collect()
+        } else {
+            device.params.iter().collect()
+        };
+        for (pi, param) in shown.into_iter().take(cols * 2).enumerate() {
             let origin = Pos2::new(
                 dials_x + (pi % cols) as f32 * cell.x,
                 top + 1.25 * u + (pi / cols) as f32 * cell.y,
@@ -397,6 +444,172 @@ pub(crate) fn show(
     if ws.picker.is_some() {
         if let Some(choice) = picker(ws, ui, m, r, inputs, was_open) {
             out.push(Request::AddDevice { track, choice });
+        }
+    }
+}
+
+/// Below this the EQ panel's analyzer floor, in dBFS.
+const EQ_FLOOR_DB: f32 = -90.0;
+/// The EQ curve spans this many dB either way.
+const EQ_RANGE_DB: f32 = 24.0;
+
+/// The parametric EQ's response curve over an analyzer of its output, with a
+/// handle per band (numbered; off bands dim): click one to show its dials, drag
+/// it sideways for frequency and up or down for gain.
+#[allow(clippy::too_many_arguments)]
+fn eq_panel(
+    ui: &egui::Ui,
+    p: &egui::Painter,
+    m: &Metrics,
+    ws: &mut Workspace,
+    r: Rect,
+    device: &DeviceView,
+    view: &EqView,
+    (track, di): (usize, usize),
+    covered: bool,
+    out: &mut Vec<Request>,
+) {
+    let (t, u) = (ws.theme, m.u);
+    let plot = m.snap_rect(Rect::from_x_y_ranges(
+        r.min.x + 0.75 * u..=r.max.x - 0.75 * u,
+        r.min.y + 1.0 * u..=r.max.y - 1.25 * u,
+    ));
+    p.rect_stroke(plot, 0.0, m.hair(t.line_2), StrokeKind::Inside);
+    let (low, span) = (
+        SPECTRUM_LOW_HZ.ln(),
+        (SPECTRUM_HIGH_HZ / SPECTRUM_LOW_HZ).ln(),
+    );
+    let x_of = |f: f32| plot.min.x + plot.width() * (f.max(1.0).ln() - low) / span;
+    let gain_y = |db: f32| {
+        plot.center().y - db.clamp(-EQ_RANGE_DB, EQ_RANGE_DB) / EQ_RANGE_DB * 0.5 * plot.height()
+    };
+    for (f, label) in [(100.0, "100"), (1_000.0, "1K"), (10_000.0, "10K")] {
+        let x = m.snap(x_of(f));
+        p.vline(x, plot.y_range(), m.hair(t.line));
+        p.text(
+            Pos2::new(x, plot.max.y + 0.625 * u),
+            Align2::CENTER_CENTER,
+            label,
+            m.mono(0.5),
+            t.faint,
+        );
+    }
+    p.hline(plot.x_range(), m.snap(gain_y(0.0)), m.hair(t.line));
+
+    // The analyzer: what comes out, floor at the bottom, 0 dBFS at the top.
+    let n = view.spectrum.len();
+    if n > 1 {
+        let points = view
+            .spectrum
+            .iter()
+            .enumerate()
+            .map(|(i, &db)| {
+                let level = ((db - EQ_FLOOR_DB) / -EQ_FLOOR_DB).clamp(0.0, 1.0);
+                Pos2::new(
+                    plot.min.x + plot.width() * i as f32 / (n - 1) as f32,
+                    plot.max.y - level * plot.height(),
+                )
+            })
+            .collect();
+        p.add(Shape::line(points, m.hair(t.faint)));
+    }
+
+    let own = EQ8_BANDS * EQ8_BAND_PARAMS;
+    let mut values = vec![0.0f32; own + 1];
+    for param in &device.params {
+        if let Some(v) = values.get_mut(param.id as usize) {
+            *v = param.value as f32;
+        }
+    }
+    let sr = if view.sample_rate > 0.0 {
+        view.sample_rate
+    } else {
+        48_000.0
+    };
+    let steps = 128;
+    let curve = (0..=steps)
+        .map(|i| {
+            let x = plot.min.x + plot.width() * i as f32 / steps as f32;
+            let f = (low + span * i as f32 / steps as f32).exp();
+            Pos2::new(x, gain_y(eq8_response_db(&values, f, sr)))
+        })
+        .collect();
+    p.add(Shape::line(curve, Stroke::new(0.125 * u, t.text)));
+
+    let selected = ws.eq_band.min(EQ8_BANDS - 1);
+    let band_at = |b: usize| &values[b * EQ8_BAND_PARAMS..(b + 1) * EQ8_BAND_PARAMS];
+    p.text(
+        Pos2::new(plot.min.x, r.min.y + 0.5 * u),
+        Align2::LEFT_CENTER,
+        format!(
+            "BAND {} // {}",
+            selected + 1,
+            BandType::from_value(band_at(selected)[0]).label()
+        ),
+        m.mono(0.5625),
+        t.muted,
+    );
+    for b in 0..EQ8_BANDS {
+        let [kind, freq, gain, _] = band_at(b) else {
+            continue;
+        };
+        let kind = BandType::from_value(*kind);
+        let at = Pos2::new(
+            x_of(*freq),
+            gain_y(if kind.has_gain() { *gain } else { 0.0 }),
+        );
+        let handle = m.snap_rect(Rect::from_center_size(at, Vec2::splat(0.75 * u)));
+        let color = if b == selected {
+            t.accent_amber
+        } else if kind == BandType::Off {
+            t.faint
+        } else {
+            t.muted
+        };
+        if b == selected {
+            p.rect_filled(handle, 0.0, color);
+        } else {
+            p.rect_stroke(handle, 0.0, m.hair(color), StrokeKind::Inside);
+        }
+        p.text(
+            Pos2::new(at.x, handle.min.y - 0.5 * u),
+            Align2::CENTER_CENTER,
+            format!("{}", b + 1),
+            m.mono(0.5),
+            color,
+        );
+        // Only where the panel is drawn: the rack clips modules that run past it.
+        if covered || !p.clip_rect().intersects(handle) {
+            continue;
+        }
+        let resp = ui.interact(
+            handle.expand(0.25 * u),
+            ui.scope_id().with(("eq-band", di, b)),
+            Sense::click_and_drag(),
+        );
+        if resp.clicked() || resp.drag_started() {
+            ws.eq_band = b;
+        }
+        if resp.dragged() {
+            let d = resp.drag_delta();
+            let mut set = |param: usize, value: f32| {
+                out.push(Request::SetParam {
+                    track,
+                    device: di,
+                    param: (b * EQ8_BAND_PARAMS + param) as u32,
+                    value: f64::from(value),
+                });
+            };
+            if d.x != 0.0 {
+                set(
+                    1,
+                    (freq * (d.x / plot.width() * span).exp()).clamp(20.0, 20_000.0),
+                );
+            }
+            if d.y != 0.0 && kind.has_gain() {
+                let db = gain - d.y / (0.5 * plot.height()) * EQ_RANGE_DB;
+                set(2, db.clamp(-EQ_RANGE_DB, EQ_RANGE_DB));
+            }
         }
     }
 }

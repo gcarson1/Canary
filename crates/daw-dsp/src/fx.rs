@@ -36,6 +36,8 @@ pub enum EqKind {
     Peak,
     LowShelf,
     HighShelf,
+    /// A narrow cut to silence at `freq`; gain is ignored.
+    Notch,
 }
 
 /// Coefficients for an EQ band: `gain_db` at `freq` with width `q`.
@@ -65,6 +67,7 @@ pub fn eq_band(kind: EqKind, freq: f32, q: f32, gain_db: f32, sample_rate: f32) 
                 (a + 1.0) + (a - 1.0) * cos - s,
             )
         }
+        EqKind::Notch => (1.0, -2.0 * cos, 1.0, 1.0 + alpha, -2.0 * cos, 1.0 - alpha),
         EqKind::HighShelf => {
             let s = 2.0 * a.sqrt() * alpha;
             (
@@ -161,6 +164,225 @@ impl Effect for Eq {
     }
     fn reset(&mut self) {
         self.bands.iter_mut().flatten().for_each(Biquad::reset);
+    }
+}
+
+// ---------------------------------------------------------------- Parametric EQ
+
+/// Bands in the parametric EQ; each has TYPE, FREQ, GAIN and Q, in that order.
+pub const EQ8_BANDS: usize = 8;
+/// Parameters per band.
+pub const EQ8_BAND_PARAMS: usize = 4;
+
+/// What a parametric EQ band does, by its TYPE value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BandType {
+    Off,
+    Bell,
+    LowShelf,
+    HighShelf,
+    /// 12 dB/octave high-pass; Q is its resonance.
+    LowCut,
+    /// 12 dB/octave low-pass.
+    HighCut,
+    Notch,
+}
+
+impl BandType {
+    pub fn from_value(v: f32) -> Self {
+        match v.round() as i32 {
+            1 => Self::Bell,
+            2 => Self::LowShelf,
+            3 => Self::HighShelf,
+            4 => Self::LowCut,
+            5 => Self::HighCut,
+            6 => Self::Notch,
+            _ => Self::Off,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "OFF",
+            Self::Bell => "BELL",
+            Self::LowShelf => "LO SHELF",
+            Self::HighShelf => "HI SHELF",
+            Self::LowCut => "LO CUT",
+            Self::HighCut => "HI CUT",
+            Self::Notch => "NOTCH",
+        }
+    }
+
+    /// GAIN changes the response (bells and shelves).
+    pub fn has_gain(self) -> bool {
+        matches!(self, Self::Bell | Self::LowShelf | Self::HighShelf)
+    }
+}
+
+/// One band's filter from its four values (TYPE, FREQ, GAIN, Q); None when off
+/// or when it would not change the signal (a bell or shelf at 0 dB).
+pub fn eq8_band(values: &[f32], sample_rate: f32) -> Option<Biquad> {
+    let [kind, freq, gain, q] = values else {
+        return None;
+    };
+    let kind = BandType::from_value(*kind);
+    let eq = |k| Some(eq_band(k, *freq, *q, *gain, sample_rate));
+    match kind {
+        BandType::Off => None,
+        _ if kind.has_gain() && gain.abs() < 0.01 => None,
+        BandType::Bell => eq(EqKind::Peak),
+        BandType::LowShelf => eq(EqKind::LowShelf),
+        BandType::HighShelf => eq(EqKind::HighShelf),
+        BandType::Notch => eq(EqKind::Notch),
+        BandType::LowCut | BandType::HighCut => {
+            let mut f = Biquad::default();
+            let filter = if kind == BandType::LowCut {
+                FilterKind::HighPass
+            } else {
+                FilterKind::LowPass
+            };
+            f.set(filter, *freq, *q, sample_rate);
+            Some(f)
+        }
+    }
+}
+
+/// The parametric EQ's gain at `freq` in dB, from its parameter values (the
+/// bands, then OUTPUT), for drawing its curve.
+pub fn eq8_response_db(values: &[f32], freq: f32, sample_rate: f32) -> f32 {
+    let bands: f32 = values
+        .as_chunks::<EQ8_BAND_PARAMS>()
+        .0
+        .iter()
+        .take(EQ8_BANDS)
+        .filter_map(|b| eq8_band(b, sample_rate))
+        .map(|f| gain_to_db(f.magnitude(freq, sample_rate)))
+        .sum();
+    bands
+        + values
+            .get(EQ8_BANDS * EQ8_BAND_PARAMS)
+            .copied()
+            .unwrap_or(0.0)
+}
+
+/// Eight bands (bell, shelves, cuts, notch) and an output gain, with an
+/// analyzer of what comes out. Defaults are flat: shelves at the ends, bells
+/// between, all at 0 dB.
+pub struct Eq8 {
+    sr: f32,
+    values: [f32; EQ8_BANDS * EQ8_BAND_PARAMS + 1],
+    bands: [[Biquad; 2]; EQ8_BANDS],
+    active: [bool; EQ8_BANDS],
+    output: Smoother,
+    scope: std::sync::Arc<crate::Scope>,
+}
+
+impl Default for Eq8 {
+    fn default() -> Self {
+        Self {
+            sr: 0.0,
+            values: Self::PARAMS.map(|p| p.default),
+            bands: Default::default(),
+            active: [false; EQ8_BANDS],
+            output: Smoother::default(),
+            scope: std::sync::Arc::new(crate::Scope::new(48_000.0)),
+        }
+    }
+}
+
+impl Eq8 {
+    const PARAMS: [ParamSpec; EQ8_BANDS * EQ8_BAND_PARAMS + 1] = [
+        spec("1 TYPE", 0.0, 6.0, 2.0),
+        freq("1 FREQ", 20.0, 20_000.0, 30.0),
+        spec("1 GAIN", -24.0, 24.0, 0.0),
+        spec("1 Q", 0.1, 18.0, 0.7),
+        spec("2 TYPE", 0.0, 6.0, 1.0),
+        freq("2 FREQ", 20.0, 20_000.0, 80.0),
+        spec("2 GAIN", -24.0, 24.0, 0.0),
+        spec("2 Q", 0.1, 18.0, 1.0),
+        spec("3 TYPE", 0.0, 6.0, 1.0),
+        freq("3 FREQ", 20.0, 20_000.0, 200.0),
+        spec("3 GAIN", -24.0, 24.0, 0.0),
+        spec("3 Q", 0.1, 18.0, 1.0),
+        spec("4 TYPE", 0.0, 6.0, 1.0),
+        freq("4 FREQ", 20.0, 20_000.0, 500.0),
+        spec("4 GAIN", -24.0, 24.0, 0.0),
+        spec("4 Q", 0.1, 18.0, 1.0),
+        spec("5 TYPE", 0.0, 6.0, 1.0),
+        freq("5 FREQ", 20.0, 20_000.0, 1200.0),
+        spec("5 GAIN", -24.0, 24.0, 0.0),
+        spec("5 Q", 0.1, 18.0, 1.0),
+        spec("6 TYPE", 0.0, 6.0, 1.0),
+        freq("6 FREQ", 20.0, 20_000.0, 3000.0),
+        spec("6 GAIN", -24.0, 24.0, 0.0),
+        spec("6 Q", 0.1, 18.0, 1.0),
+        spec("7 TYPE", 0.0, 6.0, 1.0),
+        freq("7 FREQ", 20.0, 20_000.0, 7000.0),
+        spec("7 GAIN", -24.0, 24.0, 0.0),
+        spec("7 Q", 0.1, 18.0, 1.0),
+        spec("8 TYPE", 0.0, 6.0, 3.0),
+        freq("8 FREQ", 20.0, 20_000.0, 16000.0),
+        spec("8 GAIN", -24.0, 24.0, 0.0),
+        spec("8 Q", 0.1, 18.0, 0.7),
+        spec("OUTPUT", -24.0, 24.0, 0.0),
+    ];
+
+    fn update(&mut self, band: usize) {
+        if self.sr <= 0.0 {
+            return;
+        }
+        let at = band * EQ8_BAND_PARAMS;
+        let made = eq8_band(&self.values[at..at + EQ8_BAND_PARAMS], self.sr);
+        self.active[band] = made.is_some();
+        if let Some(new) = made {
+            for f in &mut self.bands[band] {
+                retune(f, new);
+            }
+        }
+    }
+}
+
+impl Effect for Eq8 {
+    fn params(&self) -> &'static [ParamSpec] {
+        &Self::PARAMS
+    }
+    fn set_param(&mut self, index: usize, value: f32) {
+        if let Some(v) = self.values.get_mut(index) {
+            *v = value;
+            if index < EQ8_BANDS * EQ8_BAND_PARAMS {
+                self.update(index / EQ8_BAND_PARAMS);
+            } else {
+                self.output.set_target(db_to_gain(value));
+            }
+        }
+    }
+    fn set_sample_rate(&mut self, sample_rate: f32) {
+        self.sr = sample_rate;
+        self.scope.set_sample_rate(sample_rate);
+        self.output.set_time(GLIDE, sample_rate);
+        (0..EQ8_BANDS).for_each(|b| self.update(b));
+    }
+    fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
+        for (ch, buf) in [&mut *left, &mut *right].into_iter().enumerate() {
+            for (band, on) in self.bands.iter_mut().zip(self.active) {
+                if on {
+                    buf.iter_mut().for_each(|s| *s = band[ch].process(*s));
+                }
+            }
+        }
+        for (l, r) in left.iter_mut().zip(right.iter_mut()) {
+            let g = self.output.tick();
+            *l *= g;
+            *r *= g;
+        }
+        self.scope.write(left, right);
+    }
+    fn reset(&mut self) {
+        self.bands.iter_mut().flatten().for_each(Biquad::reset);
+        self.output.settle();
+    }
+    fn scope(&self) -> Option<std::sync::Arc<crate::Scope>> {
+        Some(self.scope.clone())
     }
 }
 
@@ -492,6 +714,11 @@ impl MinWindow {
 
     fn push(&mut self, v: f32) -> f32 {
         let w = self.at.len();
+        // Drop what leaves the window as `v` comes in, so the ring has room.
+        while self.len > 0 && self.at[self.head] + w as u64 <= self.count {
+            self.head = (self.head + 1) % w;
+            self.len -= 1;
+        }
         // Values not smaller than `v` can never be the minimum again.
         while self.len > 0 && self.value[(self.head + self.len - 1) % w] >= v {
             self.len -= 1;
@@ -499,11 +726,6 @@ impl MinWindow {
         let back = (self.head + self.len) % w;
         (self.at[back], self.value[back]) = (self.count, v);
         self.len += 1;
-        // Drop what has left the window.
-        while self.at[self.head] + w as u64 <= self.count {
-            self.head = (self.head + 1) % w;
-            self.len -= 1;
-        }
         self.count += 1;
         self.value[self.head]
     }
@@ -1091,6 +1313,35 @@ mod tests {
     }
 
     #[test]
+    fn parametric_eq_is_flat_by_default_and_its_curve_matches_its_sound() {
+        let flat = sine(3_000.0, 0.5, 4_800);
+        let (l, _) = run("canary.eq8", &[], &flat);
+        assert!(l.iter().zip(&flat).all(|(a, b)| (a - b).abs() < 1e-6));
+        // Band 3 to a 9 dB bell at 2 kHz, band 1 to a 100 Hz low cut.
+        let set = [(9, 2_000.0), (10, 9.0), (0, 4.0), (1, 100.0)];
+        let mut values = crate::effects::effect("canary.eq8", SR)
+            .unwrap()
+            .params()
+            .iter()
+            .map(|p| p.default)
+            .collect::<Vec<_>>();
+        for &(i, v) in &set {
+            values[i] = v;
+        }
+        for f in [40.0, 2_000.0, 8_000.0] {
+            let heard =
+                gain_to_db(peak(&run("canary.eq8", &set, &sine(f, 0.1, 24_000)).0[12_000..]) / 0.1);
+            let drawn = eq8_response_db(&values, f, SR);
+            assert!(
+                (heard - drawn).abs() < 0.5,
+                "{f} Hz: heard {heard}, drawn {drawn}"
+            );
+        }
+        assert!(eq8_response_db(&values, 2_000.0, SR) > 8.5);
+        assert!(eq8_response_db(&values, 40.0, SR) < -12.0);
+    }
+
+    #[test]
     fn reverb_rings_on_after_the_input_stops() {
         let mut click = vec![0.0; 48_000];
         click[0] = 1.0;
@@ -1155,6 +1406,23 @@ mod tests {
             .zip(&quiet)
             .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
         assert!(err < 1e-6, "{err}");
+    }
+
+    #[test]
+    fn min_window_matches_a_brute_force_minimum() {
+        // Rising runs longer than the window are the case that once overflowed.
+        let values: Vec<f32> = (0..200)
+            .map(|i| ((i % 37) as f32 * 0.1 + (i / 37) as f32).sin())
+            .chain((0..20).map(|i| i as f32))
+            .collect();
+        let mut w = MinWindow::new(5);
+        for (i, &v) in values.iter().enumerate() {
+            let want = values[i.saturating_sub(4)..=i]
+                .iter()
+                .copied()
+                .fold(f32::MAX, f32::min);
+            assert_eq!(w.push(v), want, "at {i}");
+        }
     }
 
     #[test]

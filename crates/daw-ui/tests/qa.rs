@@ -10,8 +10,8 @@ use daw_core::SampleData;
 use daw_dsp::WaveformPyramid;
 use daw_project::{Action, ClipRef, History, Note, Pattern, PatternClip, Track, PPQ, STEP};
 use daw_ui::{
-    theme, DeviceView, EngineView, Inputs, Page, ParamView, PluginChoice, Request, SampleDrop,
-    SamplerView, Theme, Workspace,
+    theme, DeviceView, EngineView, EqView, Inputs, Page, ParamView, PluginChoice, Request,
+    SampleDrop, SamplerView, Theme, Workspace,
 };
 use egui::epaint::ColorMode;
 use egui::{Color32, Shape, Vec2};
@@ -194,7 +194,7 @@ fn harness(
                         waveforms: &waveforms,
                         files: &files,
                         plugins: &plugins(),
-                        devices: &[vec![sampler()], devices()].concat(),
+                        devices: &[vec![sampler()], devices(), vec![eq()]].concat(),
                         meters: &[[0.4, 0.5], [0.9, 1.0], [0.0, 0.0], [0.2, 0.25]],
                     },
                 );
@@ -238,6 +238,7 @@ fn devices() -> Vec<DeviceView> {
                 param(3, "Lowpass", 100.0),
             ],
             sampler: None,
+            eq: None,
             editor: true,
         },
         DeviceView {
@@ -265,6 +266,7 @@ fn devices() -> Vec<DeviceView> {
             })
             .collect(),
             sampler: None,
+            eq: None,
             editor: false,
         },
     ]
@@ -297,11 +299,47 @@ fn sampler() -> DeviceView {
             })
             .collect(),
         editor: false,
+        eq: None,
         sampler: Some(SamplerView {
             path: Some(PathBuf::from("/samples/808_Thermal_Sub.wav")),
             slices: vec![0.0, 0.25, 0.5, 0.75],
             layers: 2,
         }),
+    }
+}
+
+/// The parametric EQ with its real parameters: band 1 a 60 Hz low cut, band 3
+/// a 9 dB bell at 2 kHz, band 5 off, and a falling analyzer trace.
+fn eq() -> DeviceView {
+    let fx = daw_dsp::effects::effect("canary.eq8", 48_000.0).unwrap();
+    let common = [("MIX", 100.0), ("MATCH", 0.0), ("DELTA", 0.0)];
+    let mut params: Vec<ParamView> = fx
+        .params()
+        .iter()
+        .map(|p| (p.name, p.min, p.max, p.default, p.log))
+        .chain(common.iter().map(|&(n, v)| (n, 0.0, 100.0, v, false)))
+        .enumerate()
+        .map(|(i, (name, min, max, value, log))| ParamView {
+            id: i as u32,
+            name: name.into(),
+            value: value.into(),
+            min: min.into(),
+            max: max.into(),
+            log,
+        })
+        .collect();
+    for (id, v) in [(0, 4.0), (1, 60.0), (9, 2_000.0), (10, 9.0), (16, 0.0)] {
+        params[id].value = v;
+    }
+    DeviceView {
+        name: "Parametric EQ".into(),
+        params,
+        sampler: None,
+        eq: Some(EqView {
+            sample_rate: 48_000.0,
+            spectrum: (0..192).map(|i| -20.0 - i as f32 * 0.3).collect(),
+        }),
+        editor: false,
     }
 }
 
@@ -572,6 +610,51 @@ fn picker_adds_a_device_and_dials_set_params() {
         _ => None,
     });
     assert!(set.is_some_and(|v| v > 50.0), "{:?}", h.state().requests);
+}
+
+#[test]
+fn dragging_an_eq_band_sets_its_frequency_and_gain() {
+    // The EQ is 32u wide from x 280; its plot spans x 292..524, y 608..880, so
+    // band 3 (9 dB at 2 kHz) sits at x 292 + 232 * 2/3, y 744 - 9/24 * 136.
+    let mut h = rig_with(vec![eq()]);
+    h.run();
+    let at = egui::Pos2::new(292.0 + 232.0 * 2.0 / 3.0, 744.0 - 51.0);
+    h.hover_at(at);
+    h.run();
+    press(&mut h, at, true);
+    h.run();
+    for step in 1..=4 {
+        h.hover_at(at + Vec2::new(5.0, -3.0) * step as f32);
+        h.run();
+    }
+    press(&mut h, at + Vec2::new(20.0, -12.0), false);
+    h.run();
+    std::fs::create_dir_all("../../target/qa").unwrap();
+    h.render()
+        .unwrap()
+        .save("../../target/qa/eq-drag.png")
+        .unwrap();
+    let last = |param: u32| {
+        h.state().requests.iter().rev().find_map(|r| match r {
+            Request::SetParam {
+                device: 0,
+                param: p,
+                value,
+                ..
+            } if *p == param => Some(*value),
+            _ => None,
+        })
+    };
+    assert!(
+        last(9).is_some_and(|f| f > 2_000.0),
+        "{:?}",
+        h.state().requests
+    );
+    assert!(
+        last(10).is_some_and(|g| g > 9.0),
+        "{:?}",
+        h.state().requests
+    );
 }
 
 #[test]

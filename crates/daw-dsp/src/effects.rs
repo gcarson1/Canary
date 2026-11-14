@@ -62,11 +62,16 @@ pub trait Effect: Send {
     }
     /// The song tempo, called before each block; for tempo-synced effects.
     fn set_tempo(&mut self, _bpm: f32) {}
+    /// What an analyzer shows of the output, for effects that draw one.
+    fn scope(&self) -> Option<std::sync::Arc<crate::Scope>> {
+        None
+    }
 }
 
 /// The built-in effects by id, for the device picker: (id, display name).
-pub const EFFECTS: [(&str, &str); 14] = [
+pub const EFFECTS: [(&str, &str); 15] = [
     ("canary.eq", "EQ"),
+    ("canary.eq8", "Parametric EQ"),
     ("canary.compressor", "Compressor"),
     ("canary.limiter", "Limiter"),
     ("canary.gate", "Gate"),
@@ -90,6 +95,7 @@ pub fn effect(id: &str, sample_rate: f32) -> Option<Box<dyn Effect>> {
         "canary.dynamic_eq" => Box::new(DynamicEq::default()),
         "canary.deesser" => Box::new(DeEsser::default()),
         "canary.eq" => Box::new(crate::fx::Eq::default()),
+        "canary.eq8" => Box::new(crate::fx::Eq8::default()),
         "canary.limiter" => Box::new(crate::fx::Limiter::default()),
         "canary.gate" => Box::new(crate::fx::Gate::default()),
         "canary.filter" => Box::new(crate::fx::Filter::default()),

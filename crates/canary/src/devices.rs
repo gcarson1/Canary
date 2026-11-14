@@ -12,7 +12,10 @@ use daw_graph::{AudioNode, ExecutionPlan, Source, StepId, MAX_NODES};
 use daw_host::ara::{self, AraClip};
 use daw_host::{Catalog, Format, Hosted, Sampler};
 use daw_project::{AraArchive, Device, PluginFormat, Project, Track};
-use daw_ui::{DeviceView, ParamView, PluginChoice, SamplerView};
+use daw_ui::{DeviceView, EqView, ParamView, PluginChoice, SamplerView};
+
+/// Analyzer points the EQ panel draws, spaced evenly in octaves.
+const EQ_POINTS: usize = 192;
 
 /// Node ids from here up belong to devices; tracks and the master use those below.
 pub const FIRST_DEVICE_NODE: u32 = 2048;
@@ -580,7 +583,13 @@ impl Devices {
             .map(|d| DeviceView {
                 name: d.name.clone(),
                 params: self.live.get_mut(&d.uid).map_or_else(Vec::new, |l| {
-                    let infos: Vec<_> = l.hosted.params().iter().take(8).cloned().collect();
+                    // The EQ shows the selected band's dials, so it needs them all.
+                    let shown = if l.hosted.scope().is_some() {
+                        usize::MAX
+                    } else {
+                        8
+                    };
+                    let infos: Vec<_> = l.hosted.params().iter().take(shown).cloned().collect();
                     infos
                         .into_iter()
                         .map(|p| ParamView {
@@ -594,6 +603,14 @@ impl Devices {
                         .collect()
                 }),
                 editor: d.format != PluginFormat::Builtin,
+                eq: self
+                    .live
+                    .get(&d.uid)
+                    .and_then(|l| l.hosted.scope())
+                    .map(|s| EqView {
+                        sample_rate: s.sample_rate(),
+                        spectrum: s.spectrum(EQ_POINTS),
+                    }),
                 sampler: self
                     .live
                     .get_mut(&d.uid)

@@ -28,11 +28,13 @@ pub fn instantiate(id: &str, sample_rate: f32, max_block: usize) -> Result<Insta
     if id == crate::sampler::ID {
         return Ok(crate::sampler::instantiate());
     }
+    let mut scope = None;
     let (node, params, instrument): (Box<dyn daw_graph::AudioNode>, _, _) = if id == SYNTH {
         let (node, params) = PolySynthNode::new();
         (Box::new(node), params, true)
     } else {
         let fx = effect(id, sample_rate).ok_or_else(|| HostError::UnknownPlugin(id.into()))?;
+        scope = fx.scope();
         let (node, params) = EffectNode::new(fx, sample_rate, max_block);
         (Box::new(node), params, false)
     };
@@ -56,6 +58,7 @@ pub fn instantiate(id: &str, sample_rate: f32, max_block: usize) -> Result<Insta
             infos,
             instrument,
             latency,
+            scope,
         }),
         node,
     ))
@@ -68,6 +71,7 @@ struct Builtin {
     instrument: bool,
     /// Fixed for the instance (lookahead), so PDC is sized once.
     latency: u32,
+    scope: Option<Arc<daw_dsp::Scope>>,
 }
 
 impl Hosted for Builtin {
@@ -105,6 +109,9 @@ impl Hosted for Builtin {
     }
     fn has_audio_input(&self) -> bool {
         !self.instrument
+    }
+    fn scope(&self) -> Option<Arc<daw_dsp::Scope>> {
+        self.scope.clone()
     }
 }
 

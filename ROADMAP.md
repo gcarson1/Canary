@@ -113,7 +113,7 @@ The UI follows Styles.md whichever framework is chosen.
 ### Phase 10: Built-in Instruments and Effects
 - [x] Subtractive synth (`canary.synth`, `daw_graph::PolySynthNode`): 16 voices, two PolyBLEP oscillators (saw/square/triangle/sine, interval, detune, mix), resonant TPT low-pass with its own envelope, amp ADSR, glide, velocity. `+ SYNTH` / `+ SAMPLER` under the step sequencer add a channel with it. Still to do: LFO, noise/sub, unison, presets
 - [ ] Drum machine on the sampler (kits on pads, per-pad choke and tune)
-- [x] Effects (`daw_dsp::fx`): EQ (low cut, low/high shelves, mid bell), reverb (Freeverb-style with predelay), delay (ping-pong, tone), chorus/flanger, limiter (brickwall, no lookahead), gate, multimode filter with drive, bitcrusher, utility (gain, width, pan, polarity). Devices with more than 8 parameters get a double-width rack module. Still to do: 8-band EQ with analyzer, tempo-synced delay, phaser, true-peak lookahead limiter
+- [x] Effects (`daw_dsp::fx`): EQ (low cut, low/high shelves, mid bell), reverb (Freeverb-style with predelay), delay (ping-pong, tone), chorus/flanger, true-peak lookahead limiter (78 samples at 48 kHz, reported for PDC), gate, multimode filter with drive, bitcrusher, utility (gain, width, pan, polarity), phaser, 8-band parametric EQ `canary.eq8` with analyzer (drag a band handle for frequency and gain). Delay has SYNC to note lengths at the song tempo. Devices with more than 8 parameters get a double-width rack module
 - [ ] MIDI effects: arpeggiator, chord, scale lock, note repeat
 - [ ] Device presets (save/load per built-in device)
 

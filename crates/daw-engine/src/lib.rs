@@ -93,6 +93,7 @@ impl EngineHandle {
     /// will have, then queues it to be swapped in at the start of a block.
     pub fn send_plan(&mut self, mut plan: Box<ExecutionPlan>) -> Result<(), SendPlanError> {
         plan.compensate();
+        plan.schedule();
         let latency = plan.latency();
         let next = self.live.check(&plan).map_err(SendPlanError::Invalid)?;
         self.plans
@@ -160,6 +161,49 @@ pub struct AudioEngine {
     transport: Transport,
     playhead: Arc<AtomicU64>,
     sample_rate: f32,
+    /// Helps run each plan level's independent steps (multi-core DSP).
+    pool: daw_graph::WorkerPool,
+}
+
+/// Cores the audio thread gets help from: the performance cores but its own
+/// (an efficiency core would make it wait), up to 7.
+fn dsp_workers() -> usize {
+    let cores = performance_cores()
+        .or_else(|| std::thread::available_parallelism().ok().map(|n| n.get()))
+        .unwrap_or(1);
+    cores.saturating_sub(1).min(7)
+}
+
+/// Performance cores on Apple silicon (`hw.perflevel0.logicalcpu`).
+fn performance_cores() -> Option<usize> {
+    #[cfg(target_os = "macos")]
+    {
+        extern "C" {
+            fn sysctlbyname(
+                name: *const std::ffi::c_char,
+                old: *mut std::ffi::c_void,
+                old_len: *mut usize,
+                new: *mut std::ffi::c_void,
+                new_len: usize,
+            ) -> i32;
+        }
+        let mut count: i32 = 0;
+        let mut len = std::mem::size_of::<i32>();
+        // SAFETY: a NUL-terminated name and an out value of the size given.
+        let ok = unsafe {
+            sysctlbyname(
+                c"hw.perflevel0.logicalcpu".as_ptr(),
+                std::ptr::from_mut(&mut count).cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        } == 0;
+        if ok && count > 0 {
+            return Some(count as usize);
+        }
+    }
+    None
 }
 
 /// Creates both ends of the engine queues. The command and telemetry queues each
@@ -201,6 +245,7 @@ pub fn engine(capacity: usize, sample_rate: f32) -> (EngineHandle, AudioEngine) 
             transport: Transport::default(),
             playhead,
             sample_rate,
+            pool: daw_graph::WorkerPool::new(dsp_workers()),
         },
     )
 }
@@ -296,7 +341,7 @@ impl AudioEngine {
                             });
                         }
                     }
-                    plan.process(
+                    plan.process_with(
                         &mut self.nodes,
                         &ProcessContext {
                             sample_rate: self.sample_rate,
@@ -307,6 +352,7 @@ impl AudioEngine {
                             ..Default::default()
                         },
                         now,
+                        Some(&mut self.pool),
                     );
                     let master = plan.output();
                     for (frame, out) in chunk.chunks_exact_mut(channels).enumerate() {

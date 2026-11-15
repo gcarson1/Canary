@@ -6,6 +6,7 @@ mod midifx;
 mod monitor;
 mod plan;
 mod poly;
+mod pool;
 mod preview;
 mod sampler;
 mod sequence;
@@ -20,6 +21,7 @@ pub use plan::{
     MAX_NODES,
 };
 pub use poly::{PolySynthNode, SYNTH_PARAMS};
+pub use pool::WorkerPool;
 pub use preview::{Preview, PreviewNode};
 pub use sampler::{SamplerData, SamplerNode, Zone, SAMPLER_PARAMS};
 pub use synth::SynthNode;

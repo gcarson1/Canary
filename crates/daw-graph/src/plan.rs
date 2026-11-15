@@ -95,6 +95,10 @@ struct Step {
     latency: Option<u32>,
     /// Compensation delays on this step's sources, in (input, source) order.
     delays: Vec<Delay>,
+    /// This step's MIDI for the block (its notes merged with live input) and
+    /// its node's MIDI output: per step, so steps can run on several threads.
+    midi_in: Vec<MidiEvent>,
+    midi_out: Vec<MidiEvent>,
 }
 
 /// Delays one source of one input so it lines up with the slowest path into the
@@ -135,9 +139,11 @@ impl Delay {
 pub struct ExecutionPlan {
     steps: Vec<Step>,
     max_block: usize,
-    midi_out: Vec<MidiEvent>,
-    /// A sequenced step's MIDI for the block: its notes merged with live input.
-    midi_in: Vec<MidiEvent>,
+    /// Steps by level (`schedule`): every step's inputs come from earlier
+    /// levels, so one level's steps can run at once. Empty: run in order.
+    order: Vec<usize>,
+    /// Where each level ends in `order`.
+    levels: Vec<usize>,
     /// Metronome beats by timeline sample; `data[0]` is 1 on a downbeat.
     clicks: Box<[SeqEvent]>,
     /// Tempo and meter, so every node's context carries the musical position.
@@ -162,8 +168,8 @@ impl ExecutionPlan {
         Self {
             steps: Vec::new(),
             max_block,
-            midi_out: Vec::with_capacity(MIDI_CAPACITY),
-            midi_in: Vec::with_capacity(MIDI_CAPACITY),
+            order: Vec::new(),
+            levels: Vec::new(),
             clicks: Box::default(),
             tempo: Box::default(),
             inserts: Vec::new(),
@@ -234,6 +240,8 @@ impl ExecutionPlan {
             taps: Vec::new(),
             latency: None,
             delays: Vec::new(),
+            midi_in: Vec::with_capacity(MIDI_CAPACITY),
+            midi_out: Vec::with_capacity(MIDI_CAPACITY),
         });
         Ok(StepId(self.steps.len() - 1))
     }
@@ -290,6 +298,39 @@ impl ExecutionPlan {
     /// sync to the host read it).
     pub fn set_tempo_map(&mut self, segments: Vec<TempoSegment>) {
         self.tempo = segments.into_boxed_slice();
+    }
+
+    /// Groups the steps into levels that can run in parallel: a step goes one
+    /// level after the latest step it reads (audio or MIDI). Call on the main
+    /// thread once the plan is built (`EngineHandle::send_plan` does). A plan
+    /// that runs one node in two steps stays in order.
+    pub fn schedule(&mut self) {
+        self.order.clear();
+        self.levels.clear();
+        let mut seen = vec![false; MAX_NODES];
+        for s in &self.steps {
+            let slot = seen.get_mut(s.node.0 as usize);
+            match slot {
+                Some(slot) if !*slot => *slot = true,
+                _ => return,
+            }
+        }
+        let mut level = vec![0usize; self.steps.len()];
+        for (i, s) in self.steps.iter().enumerate() {
+            let after = s
+                .sources
+                .iter()
+                .flatten()
+                .map(|src| src.step.0)
+                .chain(s.midi_source);
+            level[i] = after.map(|j| level[j] + 1).max().unwrap_or(0);
+        }
+        let deepest = level.iter().copied().max().unwrap_or(0);
+        for l in 0..=deepest {
+            self.order
+                .extend((0..self.steps.len()).filter(|&i| level[i] == l));
+            self.levels.push(self.order.len());
+        }
     }
 
     /// The metronome's beats while this plan plays: timeline samples, with
@@ -462,6 +503,18 @@ impl ExecutionPlan {
     /// `context.num_samples` must not exceed `max_block`. `midi` is this block's live
     /// input, offsets below `num_samples` and in order; it goes to `route_midi` steps.
     pub fn process(&mut self, arena: &mut NodeArena, context: &ProcessContext, midi: &[MidiEvent]) {
+        self.process_with(arena, context, midi, None);
+    }
+
+    /// `process`, running each level's independent steps on `pool` as well
+    /// (once `schedule` has grouped them).
+    pub fn process_with(
+        &mut self,
+        arena: &mut NodeArena,
+        context: &ProcessContext,
+        midi: &[MidiEvent],
+        pool: Option<&mut crate::WorkerPool>,
+    ) {
         let with_music;
         let context = if self.tempo.is_empty() {
             context
@@ -478,95 +531,149 @@ impl ExecutionPlan {
         let n = context.num_samples;
         assert!(n <= self.max_block, "block of {n} frames exceeds plan max");
         debug_assert!(midi.iter().all(|e| (e.sample_offset as usize) < n.max(1)));
+        let work = Work {
+            steps: self.steps.as_mut_ptr(),
+            nodes: arena.slots.as_mut_ptr(),
+            node_count: arena.slots.len(),
+        };
+        // SAFETY (every `run_step` below): each step runs once, after every
+        // step it reads (in order, or by level); steps of one level read only
+        // earlier levels and run distinct nodes (`schedule` checks).
+        match pool.filter(|p| p.workers() > 0 && !self.levels.is_empty()) {
+            Some(pool) => {
+                let mut start = 0;
+                for &end in &self.levels {
+                    let level = &self.order[start..end];
+                    start = end;
+                    let task = |k: usize| unsafe { work.run_step(level[k], context, midi) };
+                    pool.run(level.len(), &task);
+                }
+            }
+            None => {
+                for i in 0..self.steps.len() {
+                    unsafe { work.run_step(i, context, midi) };
+                }
+            }
+        }
+    }
+}
 
-        for i in 0..self.steps.len() {
-            let (done, rest) = self.steps.split_at_mut(i);
-            let Step {
-                node,
-                sources,
-                inputs,
-                outputs,
-                takes_midi,
-                delays,
-                sequence,
-                notes,
-                automation,
-                taps,
-                midi_source,
-                kept_midi,
-                ..
-            } = &mut rest[0];
+/// Raw access to a plan's steps and an arena's nodes for `run_step`, so steps
+/// can run on several threads.
+struct Work {
+    steps: *mut Step,
+    nodes: *mut Option<Box<dyn AudioNode>>,
+    node_count: usize,
+}
 
-            // Inputs are summing buses, so they start from silence.
-            let mut delays = delays.iter_mut().peekable();
-            for (ch, (input, sources)) in inputs.iter_mut().zip(sources.iter()).enumerate() {
-                let input = &mut input[..n];
-                input.fill(0.0);
-                for (k, source) in sources.iter().enumerate() {
-                    let from = &done[source.step.0].outputs[source.channel][..n];
-                    match delays.next_if(|d| d.input == ch && d.source == k) {
-                        Some(delay) => delay.mix_into(input, from),
-                        None => {
-                            for (i, s) in input.iter_mut().zip(from) {
-                                *i += s;
-                            }
+// SAFETY: `process` hands `Work` to pool threads only for steps that touch
+// disjoint data (see `run_step`), and waits for them before returning.
+unsafe impl Sync for Work {}
+
+impl Work {
+    /// Runs step `i`: sums its inputs, applies automation and MIDI, processes
+    /// its node and feeds its taps. Never allocates, locks or blocks.
+    ///
+    /// # Safety
+    /// Every step `i` reads must have finished, and no other thread may run
+    /// step `i`, any step reading it, or any step with its node, meanwhile.
+    unsafe fn run_step(&self, i: usize, context: &ProcessContext, midi: &[MidiEvent]) {
+        let n = context.num_samples;
+        // SAFETY: the caller's contract: this step is ours alone.
+        let step = unsafe { &mut *self.steps.add(i) };
+        // SAFETY: steps it reads are earlier ones that have finished, and
+        // nobody writes them while this one runs.
+        let done = |j: usize| unsafe { &*self.steps.add(j) };
+        let Step {
+            node,
+            sources,
+            inputs,
+            outputs,
+            takes_midi,
+            delays,
+            sequence,
+            notes,
+            automation,
+            taps,
+            midi_source,
+            kept_midi,
+            midi_in: scratch_in,
+            midi_out,
+            ..
+        } = step;
+
+        // Inputs are summing buses, so they start from silence.
+        let mut delays = delays.iter_mut().peekable();
+        for (ch, (input, sources)) in inputs.iter_mut().zip(sources.iter()).enumerate() {
+            let input = &mut input[..n];
+            input.fill(0.0);
+            for (k, source) in sources.iter().enumerate() {
+                let from = &done(source.step.0).outputs[source.channel][..n];
+                match delays.next_if(|d| d.input == ch && d.source == k) {
+                    Some(delay) => delay.mix_into(input, from),
+                    None => {
+                        for (i, s) in input.iter_mut().zip(from) {
+                            *i += s;
                         }
                     }
                 }
             }
+        }
 
-            let (num_inputs, num_outputs) = (inputs.len(), outputs.len());
-            let mut ins: [&[f32]; MAX_CHANNELS] = [&[]; MAX_CHANNELS];
-            for (slot, buffer) in ins.iter_mut().zip(inputs.iter()) {
-                *slot = &buffer[..n];
-            }
-            let mut outs: [&mut [f32]; MAX_CHANNELS] = Default::default();
-            for (slot, buffer) in outs.iter_mut().zip(outputs.iter_mut()) {
-                *slot = &mut buffer[..n];
-            }
+        let (num_inputs, num_outputs) = (inputs.len(), outputs.len());
+        let mut ins: [&[f32]; MAX_CHANNELS] = [&[]; MAX_CHANNELS];
+        for (slot, buffer) in ins.iter_mut().zip(inputs.iter()) {
+            *slot = &buffer[..n];
+        }
+        let mut outs: [&mut [f32]; MAX_CHANNELS] = Default::default();
+        for (slot, buffer) in outs.iter_mut().zip(outputs.iter_mut()) {
+            *slot = &mut buffer[..n];
+        }
 
-            // `LiveNodes::check` guarantees the node exists; stay silent if not.
-            let Some(node) = arena.get_mut(*node) else {
-                for out in &mut outs[..num_outputs] {
-                    out.fill(0.0);
-                }
-                continue;
-            };
-            for (id, points) in automation.iter() {
-                if let Some(v) = automation_value(points, context.playhead) {
-                    node.automate(*id, v);
-                }
+        // `LiveNodes::check` guarantees the node exists; stay silent if not.
+        let slot = (node.0 as usize) < self.node_count;
+        // SAFETY: in range, and no other running step has this node.
+        let node = slot.then(|| unsafe { &mut *self.nodes.add(node.0 as usize) });
+        let Some(node) = node.and_then(|n| n.as_deref_mut()) else {
+            for out in &mut outs[..num_outputs] {
+                out.fill(0.0);
             }
-            self.midi_out.clear();
-            let live = if *takes_midi { midi } else { &[] };
-            // A MIDI effect's output stands in for the live input; either way a
-            // pending release (plan swap) still goes through `render`.
-            let input = match *midi_source {
-                Some(src) => &done[src].kept_midi[..],
-                None => live,
-            };
-            let midi_in = if sequence.is_empty() && notes.is_idle() {
-                input
-            } else {
-                notes.render(sequence, context, input, &mut self.midi_in);
-                &self.midi_in
-            };
-            node.process(
-                &ins[..num_inputs],
-                &mut outs[..num_outputs],
-                midi_in,
-                &mut self.midi_out,
-                context,
-            );
-            // Kept for a later step; the same capacity, so this never allocates.
-            if kept_midi.capacity() >= MIDI_CAPACITY {
-                kept_midi.clear();
-                kept_midi.extend_from_slice(&self.midi_out);
+            return;
+        };
+        for (id, points) in automation.iter() {
+            if let Some(v) = automation_value(points, context.playhead) {
+                node.automate(*id, v);
             }
-            if let [l, r, ..] = &outs[..num_outputs] {
-                for tap in taps.iter_mut() {
-                    tap.write(l, r, context);
-                }
+        }
+        midi_out.clear();
+        let live = if *takes_midi { midi } else { &[] };
+        // A MIDI effect's output stands in for the live input; either way a
+        // pending release (plan swap) still goes through `render`.
+        let input = match *midi_source {
+            Some(src) => &done(src).kept_midi[..],
+            None => live,
+        };
+        let midi_in = if sequence.is_empty() && notes.is_idle() {
+            input
+        } else {
+            notes.render(sequence, context, input, scratch_in);
+            &scratch_in[..]
+        };
+        node.process(
+            &ins[..num_inputs],
+            &mut outs[..num_outputs],
+            midi_in,
+            midi_out,
+            context,
+        );
+        // Kept for a later step; the same capacity, so this never allocates.
+        if kept_midi.capacity() >= MIDI_CAPACITY {
+            kept_midi.clear();
+            kept_midi.extend_from_slice(midi_out);
+        }
+        if let [l, r, ..] = &outs[..num_outputs] {
+            for tap in taps.iter_mut() {
+                tap.write(l, r, context);
             }
         }
     }
@@ -1028,6 +1135,85 @@ mod tests {
         }
 
         fn reset(&mut self) {}
+    }
+
+    /// A per-node ramp source: each block writes `phase + k` for frame k, then
+    /// moves on, so its output depends on its own history (state per node).
+    struct Ramp(f32);
+
+    impl AudioNode for Ramp {
+        fn process(
+            &mut self,
+            _inputs: &[&[f32]],
+            outputs: &mut [&mut [f32]],
+            _midi_in: &[MidiEvent],
+            _midi_out: &mut Vec<MidiEvent>,
+            _context: &ProcessContext,
+        ) {
+            for (k, o) in outputs[0].iter_mut().enumerate() {
+                *o = self.0 + k as f32;
+            }
+            self.0 += 0.5;
+        }
+        fn reset(&mut self) {}
+    }
+
+    /// 24 tracks (a ramp through two gains each) into one sum.
+    fn wide_plan() -> ExecutionPlan {
+        let mut plan = ExecutionPlan::new(64);
+        let mut sum = Vec::new();
+        for t in 0..24 {
+            let r = add(&mut plan, Box::new(Ramp(t as f32)), vec![], 1).unwrap();
+            let g = Box::new(GainNode {
+                gain: 0.5 + t as f32,
+            });
+            let a = add(&mut plan, g, vec![vec![src(r)]], 1).unwrap();
+            if t % 5 == 0 {
+                plan.set_latency(a, 3 + t as u32);
+            }
+            let g = Box::new(GainNode { gain: 0.25 });
+            sum.push(src(add(&mut plan, g, vec![vec![src(a)]], 1).unwrap()));
+        }
+        // MIDI chains: an effect feeding an instrument.
+        for _ in 0..8 {
+            let fx = add(&mut plan, Box::new(Doubler), vec![], 1).unwrap();
+            plan.route_midi(fx);
+            let inst = add(&mut plan, Box::new(MidiCount), vec![], 1).unwrap();
+            plan.midi_from(inst, fx);
+            sum.push(src(inst));
+        }
+        add(&mut plan, Box::new(GainNode { gain: 1.0 }), vec![sum], 1).unwrap();
+        plan.compensate();
+        plan
+    }
+
+    #[test]
+    fn levels_run_on_the_pool_give_exactly_what_running_in_order_gives() {
+        let (mut serial, mut a) = (wide_plan(), NodeArena::default());
+        let (mut parallel, mut b) = (wide_plan(), NodeArena::default());
+        parallel.schedule();
+        assert_eq!(parallel.levels.len(), 4, "sources, gains, gains, the sum");
+        let midi = [MidiEvent {
+            sample_offset: 0,
+            data: [0x90, 60, 100],
+        }];
+        a.apply(&mut serial);
+        b.apply(&mut parallel);
+        let mut pool = crate::WorkerPool::new(3);
+        for _ in 0..200 {
+            serial.process(&mut a, &ctx(64), &midi);
+            assert_no_alloc::assert_no_alloc(|| {
+                parallel.process_with(&mut b, &ctx(64), &midi, Some(&mut pool));
+            });
+            assert_eq!(serial.output()[0], parallel.output()[0]);
+        }
+        // One node in two steps: the plan keeps to its order.
+        let mut twice = ExecutionPlan::new(8);
+        twice.insert(NodeId(1), Box::new(GainNode { gain: 1.0 }));
+        twice.add(NodeId(1), vec![], 1).unwrap();
+        twice.add(NodeId(1), vec![], 1).unwrap();
+        twice.schedule();
+        assert!(twice.levels.is_empty());
     }
 
     /// Writes the loop's start beat it is told (or -1 without a loop).

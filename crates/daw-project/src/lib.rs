@@ -1074,6 +1074,16 @@ impl History {
         Ok(())
     }
 
+    /// Applies an edit the app makes on its own (a warped clip's render after
+    /// a tempo change): no undo step, and redo is kept, so undo and redo step
+    /// over it (and the app makes it again where it is needed).
+    pub fn apply_quiet(&mut self, action: Action) -> Result<(), ActionError> {
+        action.apply(&mut self.project)?;
+        self.dirty = true;
+        self.revision += 1;
+        Ok(())
+    }
+
     /// Applies one edit of a continuous gesture (a fader drag) named `gesture`:
     /// the first makes an undo step, later ones with the same `gesture` fold
     /// into it, so undo returns to where the gesture began. Every edit of one

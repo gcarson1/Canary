@@ -70,6 +70,8 @@ struct Shared {
     take: AtomicU32,
     start_sample: AtomicU64,
     dropped_frames: AtomicU64,
+    /// Frames from capture to the input callback, as the device reports.
+    input_latency: AtomicU32,
 }
 
 /// Input-callback side. `push` never allocates, locks or blocks.
@@ -183,6 +185,7 @@ pub fn recorder(
         take: AtomicU32::new(0),
         start_sample: AtomicU64::new(0),
         dropped_frames: AtomicU64::new(0),
+        input_latency: AtomicU32::new(0),
     });
     let spec = hound::WavSpec {
         channels,
@@ -209,6 +212,11 @@ pub fn recorder(
 }
 
 impl Recorder {
+    /// The input's latency in frames (capture to callback), once known.
+    pub fn input_latency(&self) -> u32 {
+        self.shared.input_latency.load(Ordering::Relaxed)
+    }
+
     pub fn is_recording(&self) -> bool {
         self.writer.is_some()
     }
@@ -378,13 +386,21 @@ pub fn input_devices() -> Vec<String> {
 /// and feeds a recorder. `sample_rate` is the output's; the input is asked for
 /// it and must run at it. Stream errors go to `faults`. Capture stops when the
 /// returned `Stream` is dropped. On macOS the first call asks the user for
-/// microphone access.
+/// microphone access. The `MonitorNode` plays the input live, for monitoring.
 pub fn start_input(
     sample_rate: u32,
     playhead: Arc<AtomicU64>,
     device: Option<&str>,
     faults: StreamFaults,
-) -> Result<(Recorder, cpal::Stream, cpal::StreamConfig), InputError> {
+) -> Result<
+    (
+        Recorder,
+        cpal::Stream,
+        cpal::StreamConfig,
+        crate::MonitorNode,
+    ),
+    InputError,
+> {
     let host = cpal::default_host();
     // The named input if it is still there, else the system default.
     let named = device.and_then(|want| {
@@ -409,14 +425,26 @@ pub fn start_input(
         });
     }
     let (recorder, mut input) = recorder(config.channels, config.sample_rate, playhead);
+    let (mut live, node) = crate::monitor(config.channels);
+    let shared = recorder.shared.clone();
+    let rate = f64::from(config.sample_rate);
     let stream = device.build_input_stream(
         config,
-        move |data: &[f32], _| input.push(data),
+        move |data: &[f32], info: &cpal::InputCallbackInfo| {
+            // How long ago the device captured this: the input's latency.
+            let t = info.timestamp();
+            if let Some(d) = t.callback.checked_duration_since(t.capture) {
+                let frames = (d.as_secs_f64() * rate).round() as u32;
+                shared.input_latency.store(frames, Ordering::Relaxed);
+            }
+            input.push(data);
+            live.push(data);
+        },
         move |e| faults.record(&e),
         None,
     )?;
     stream.play()?;
-    Ok((recorder, stream, config))
+    Ok((recorder, stream, config, node))
 }
 
 /// A tap that writes a step's stereo output straight to a WAV file. For

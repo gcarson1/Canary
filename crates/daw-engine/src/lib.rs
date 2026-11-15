@@ -3,6 +3,7 @@
 mod lend;
 mod load;
 mod midi;
+mod monitor;
 mod output;
 mod peaks;
 mod record;
@@ -12,6 +13,7 @@ mod transport;
 pub use lend::{lendable_engine, Lending, Renderer};
 pub use load::{load_audio, resample, write_wav, LoadError};
 pub use midi::{connect_midi, midi_input_ports, MidiConnection, MidiError, MidiSender};
+pub use monitor::{monitor, MonitorInput, MonitorNode};
 pub use output::{output_devices, start_output, start_output_at, OutputChoice, OutputError};
 pub use peaks::cached_waveform;
 pub use record::{
@@ -63,6 +65,9 @@ pub struct EngineHandle {
     /// Borrows the engine from the device callback for offline rendering; set
     /// by `start_output`.
     pub lending: Option<Lending>,
+    /// Frames from the output callback to the speaker, as the device reports
+    /// (0 until known, or without a device).
+    pub output_latency: Arc<std::sync::atomic::AtomicU32>,
 }
 
 #[derive(Debug)]
@@ -181,6 +186,7 @@ pub fn engine(capacity: usize, sample_rate: f32) -> (EngineHandle, AudioEngine) 
             collected: 0,
             plan_latency: 0,
             lending: None,
+            output_latency: Arc::default(),
         },
         AudioEngine {
             commands: command_rx,

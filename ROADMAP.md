@@ -108,7 +108,7 @@ The UI follows Styles.md whichever framework is chosen.
 ### Phase 9: Audio Editing
 - [x] Clip gain (Up/Down 1 dB, Shift 0.1 dB, shown in the clip title and waveform), reverse (R) and fade handles (drag a clip title's corner). Slicing to new clips was already the SLICE tool. Still to do: consolidate
 - [x] Time-stretch and pitch-shift, offline (`daw_dsp::stretch`, WSOLA): Option-drag a clip's end edge to stretch it, [ and ] shift it a semitone. Rendered from the original file to `Stretched/`, recorded in `ClipRef::stretch` so a new stretch starts from the original. Still to do: formant preservation, stretch-to-tempo
-- [ ] Warp markers (audio follows the tempo map)
+- [x] Warp markers (audio follows the tempo map): W on a playlist clip warps it at the tempo it plays at; Option-click pins the audio under the pointer to the grid; tempo changes and moves render it again
 - [x] Loop recording into takes and comping: recording round the song loop keeps every full pass in one file and places the latest as a clip marked TAKE k/N; slice it (C) and press T / Shift+T on a piece to hear another pass there. Each piece is a plain window, so nothing needs flattening
 - [x] Take lanes: selecting a loop recording shows one lane per pass under its track; swipe a lane to play that pass there, click it for the whole loop (`daw_project::comp`, short fades at the seams)
 - [x] Audio-to-MIDI: select an audio clip and press N for its melody (YIN pitch tracking) or Shift+N for its drum hits (kick/snare/hat by brightness); the notes land in a new pattern on a new track at the clip's position, played by the built-in synth or sampler (`daw_dsp::transcribe`)

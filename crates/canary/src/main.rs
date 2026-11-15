@@ -67,6 +67,10 @@ struct Stretched {
     path: PathBuf,
     ratio: f64,
     semitones: f64,
+    /// A warped render's warp (with its source length and tempo key).
+    warp: Option<daw_project::Warp>,
+    /// Made by the app (a tempo change or move), not asked for: no undo step.
+    auto: bool,
     /// Frames rendered.
     result: Result<u64, String>,
 }
@@ -178,6 +182,10 @@ struct App {
     transcribe_rx: mpsc::Receiver<Transcribed>,
     /// The preset each device last loaded, so PRESET steps to the next.
     preset_at: HashMap<u64, PathBuf>,
+    /// Warped clips whose render failed, at this project revision.
+    warp_failed: (u64, HashSet<(usize, usize)>),
+    /// Render files being written, so two jobs never write one.
+    rendering_paths: HashSet<PathBuf>,
     /// Clips (track, index) with a stretch render running.
     stretching: HashSet<(usize, usize)>,
     /// Stretched or pitched clip renders coming back from worker threads.
@@ -348,6 +356,8 @@ impl App {
             export_failed: false,
             freeze_done: None,
             stretching: HashSet::new(),
+            warp_failed: (0, HashSet::new()),
+            rendering_paths: HashSet::new(),
             preset_at: HashMap::new(),
             transcribe_tx,
             transcribe_rx,
@@ -1300,6 +1310,13 @@ impl App {
                 ratio,
                 semitones,
             } => self.stretch_clip(track, index, ratio, semitones),
+            Request::Warp { track, index } => self.toggle_warp(track, index),
+            Request::WarpPin {
+                track,
+                index,
+                at,
+                to,
+            } => self.warp_pin(track, index, at, to),
             Request::AddDevice { track, choice } => {
                 let uid = self.history.new_device_uid();
                 let rate = self.view.sample_rate as f32;
@@ -1659,14 +1676,120 @@ impl App {
     /// long and `semitones` higher, on a worker thread; `receive_stretches`
     /// swaps it in.
     fn stretch_clip(&mut self, track: usize, index: usize, ratio: f64, semitones: f64) {
-        let Some(clip) = self
-            .history
-            .project()
-            .tracks
-            .get(track)
-            .and_then(|t| t.clips.get(index))
-            .cloned()
-        else {
+        // A new pitch keeps a clip warped; a new length is a stretch by hand.
+        let warp = self
+            .clip(track, index)
+            .and_then(|c| c.stretch)
+            .filter(|s| (s.ratio - ratio).abs() < 1e-9)
+            .and_then(|s| s.warp);
+        self.render_clip(track, index, ratio, semitones, warp, false);
+    }
+
+    fn clip(&self, track: usize, index: usize) -> Option<ClipRef> {
+        let tracks = &self.history.project().tracks;
+        tracks.get(track).and_then(|t| t.clips.get(index)).cloned()
+    }
+
+    /// Warps clip `index` on `track` to the tempo map at the tempo it plays
+    /// at now, or renders it back at its own tempo if warped.
+    fn toggle_warp(&mut self, track: usize, index: usize) {
+        let Some(clip) = self.clip(track, index) else {
+            return;
+        };
+        let (ratio, semitones) = clip
+            .stretch
+            .as_ref()
+            .map_or((1.0, 0.0), |s| (s.ratio, s.semitones));
+        if clip.stretch.as_ref().is_some_and(|s| s.warp.is_some()) {
+            return self.render_clip(track, index, 1.0, semitones, None, false);
+        }
+        let project = self.history.project();
+        // Where the render's first frame sits, and the tempo it plays at there.
+        let tick = project.ticks_at(clip.start.saturating_sub(clip.offset));
+        let warp = daw_project::Warp {
+            tick,
+            bpm: (project.bpm_at(tick) * ratio).clamp(1.0, 1000.0),
+            markers: Vec::new(),
+            source_frames: 0,
+            map: 0,
+            window: (0.0, 0.0),
+        };
+        self.render_clip(track, index, ratio, semitones, Some(warp), false);
+    }
+
+    /// Pins the audio of warped clip `index` at timeline sample `at` to tick
+    /// `to`, and renders it again.
+    fn warp_pin(&mut self, track: usize, index: usize, at: u64, to: u64) {
+        let Some(clip) = self.clip(track, index) else {
+            return;
+        };
+        let Some(s) = clip.stretch.filter(|s| s.warp.is_some()) else {
+            return;
+        };
+        let mut warp = s.warp.expect("checked");
+        let project = self.history.project();
+        let beats = |tick: u64| (tick as f64 - warp.tick as f64) / daw_project::PPQ as f64;
+        let frame = warp.source_at(
+            beats(project.ticks_at(at)),
+            warp.source_frames,
+            project.sample_rate,
+        );
+        if to <= warp.tick || !warp.pin(frame, beats(to)) {
+            return self
+                .error("a warp marker cannot cross the clip start or another marker".into());
+        }
+        self.render_clip(track, index, s.ratio, s.semitones, Some(warp), false);
+    }
+
+    /// Renders warped clips again where the tempo map changed under them or
+    /// they were moved (a move re-pins their start to the tick it lands on).
+    fn tend_warps(&mut self) {
+        if self.ws.is_dragging() {
+            return;
+        }
+        let project = self.history.project();
+        let key = project.tempo_key();
+        let mut stale = Vec::new();
+        for (ti, t) in project.tracks.iter().enumerate() {
+            for (ci, c) in t.clips.iter().enumerate() {
+                let Some(s) = c.stretch.as_ref() else {
+                    continue;
+                };
+                let Some(w) = s.warp.as_ref() else { continue };
+                let failed = self.warp_failed.0 == self.history.revision()
+                    && self.warp_failed.1.contains(&(ti, ci));
+                if failed || self.stretching.contains(&(ti, ci)) {
+                    continue;
+                }
+                let start = project.samples_at(w.tick) + c.offset;
+                if w.map == key && c.start == start {
+                    continue;
+                }
+                let mut w = w.clone();
+                if w.map == key {
+                    w.tick = project.ticks_at(c.start.saturating_sub(c.offset));
+                }
+                stale.push((ti, ci, s.ratio, s.semitones, w));
+            }
+        }
+        for (ti, ci, ratio, semitones, w) in stale {
+            self.render_clip(ti, ci, ratio, semitones, Some(w), true);
+        }
+    }
+
+    /// Renders clip `index` on `track` from its original file on a worker:
+    /// `ratio` times as long and `semitones` higher, or with `warp`, onto the
+    /// tempo map.
+    fn render_clip(
+        &mut self,
+        track: usize,
+        index: usize,
+        ratio: f64,
+        semitones: f64,
+        warp: Option<daw_project::Warp>,
+        auto: bool,
+    ) {
+        let Some(clip) = self.clip(track, index) else {
             return;
         };
         let original = clip
@@ -1676,7 +1799,10 @@ impl App {
         let stem = original
             .file_stem()
             .map_or_else(|| "clip".into(), |s| s.to_string_lossy().into_owned());
-        if !self.stretching.insert((track, index)) {
+        if self.stretching.contains(&(track, index)) {
+            if !auto {
+                self.error("still rendering this clip".into());
+            }
             return; // one render per clip at a time
         }
         let dir = self.samples_dir.join("Stretched");
@@ -1684,16 +1810,47 @@ impl App {
         // Kick.wav never share a render.
         let mut hash = std::hash::DefaultHasher::new();
         std::hash::Hash::hash(&(&original, self.view.sample_rate), &mut hash);
+        let project = self.history.project();
+        // A warp's tempo map and markers name its render too.
+        let tempo = daw_project::Project {
+            bpm: project.bpm,
+            tempos: project.tempos.clone(),
+            sample_rate: project.sample_rate,
+            ..Default::default()
+        };
+        let key = tempo.tempo_key();
+        let warp = warp.map(|mut w| {
+            // On the map the clip was placed on, its window is measured again
+            // (it may have been trimmed or moved); after a tempo change, the
+            // beats it covered stay.
+            if w.map == 0 || w.map == key {
+                w.window = project.warp_window(&w, clip.start, clip.length);
+            }
+            daw_project::Warp { map: key, ..w }
+        });
+        if let Some(w) = &warp {
+            let markers: Vec<(u64, u64)> = w.markers.iter().map(|m| (m.0, m.1.to_bits())).collect();
+            std::hash::Hash::hash(&(w.tick, w.bpm.to_bits(), markers, w.map), &mut hash);
+        }
         let tag = std::hash::Hasher::finish(&hash) & 0xff_ffff;
-        let path = dir.join(format!(
-            "{stem} {tag:06x} x{ratio:.3} {semitones:+.0}st.wav"
-        ));
+        let name = match &warp {
+            Some(_) => format!("{stem} {tag:06x} warp {semitones:+.0}st.wav"),
+            None => format!("{stem} {tag:06x} x{ratio:.3} {semitones:+.0}st.wav"),
+        };
+        let path = dir.join(name);
+        // Two clips of one file can want the same render: one writes it.
+        if self.rendering_paths.contains(&path) {
+            return;
+        }
+        self.stretching.insert((track, index));
+        self.rendering_paths.insert(path.clone());
         let (tx, rate) = (self.stretch_tx.clone(), self.view.sample_rate);
         self.ws.status = Some(Status {
             text: "RENDERING STRETCH".into(),
             error: false,
         });
         thread::spawn(move || {
+            let mut warp = warp;
             let result = (|| -> Result<u64, String> {
                 fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
                 let audio = daw_engine::load_audio(&original)
@@ -1702,7 +1859,13 @@ impl App {
                 let channels: Vec<Vec<f32>> = (0..audio.num_channels())
                     .map(|c| audio.channel(c).to_vec())
                     .collect();
-                let out = daw_dsp::stretch::stretch_and_pitch(&channels, ratio, semitones);
+                let out = match warp.as_mut() {
+                    Some(w) => {
+                        w.source_frames = audio.frames() as u64;
+                        warp_render(&channels, &tempo.warp_pieces(w, w.source_frames), semitones)
+                    }
+                    None => daw_dsp::stretch::stretch_and_pitch(&channels, ratio, semitones),
+                };
                 let frames = out.first().map_or(0, Vec::len) as u64;
                 daw_engine::write_wav(&path, &out, rate)?;
                 Ok(frames)
@@ -1715,6 +1878,8 @@ impl App {
                 path,
                 ratio,
                 semitones,
+                warp,
+                auto,
                 result,
             });
         });
@@ -1728,6 +1893,15 @@ impl App {
         }
         while let Ok(done) = self.stretch_rx.try_recv() {
             self.stretching.remove(&(done.track, done.index));
+            self.rendering_paths.remove(&done.path);
+            if !matches!(done.result, Ok(f) if f > 0) && done.warp.is_some() {
+                // Not tried again until the project changes.
+                let revision = self.history.revision();
+                if self.warp_failed.0 != revision {
+                    self.warp_failed = (revision, HashSet::new());
+                }
+                self.warp_failed.1.insert((done.track, done.index));
+            }
             let frames = match done.result {
                 Ok(frames) if frames > 0 => frames,
                 Ok(_) => {
@@ -1748,32 +1922,61 @@ impl App {
                 self.error("clip changed while stretching; render discarded".into());
                 continue;
             }
-            // Scale the window from the old render's frames to the new one's.
+            // A warped render's length factor is what the tempo map made it.
+            let ratio = match &done.warp {
+                Some(w) => frames as f64 / w.source_frames.max(1) as f64,
+                None => done.ratio,
+            };
+            // Scale the window from the old render's frames to the new one's;
+            // a warped one keeps its beats.
+            let project = self.history.project();
             let old = done.clip.stretch.as_ref().map_or(1.0, |s| s.ratio);
-            let scale = done.ratio / old;
-            let at = |v: u64| ((v as f64 * scale).round() as u64).min(frames);
-            let offset = at(done.clip.offset).min(frames - 1);
-            let length = at(done.clip.length).clamp(1, frames - offset);
+            let (offset, length) = match &done.warp {
+                Some(w) => {
+                    let offset = project.warp_frame(w, w.window.0).min(frames - 1);
+                    let end = project.warp_frame(w, w.window.1);
+                    (offset, end.saturating_sub(offset).clamp(1, frames - offset))
+                }
+                None => {
+                    let at = |v: u64| ((v as f64 * ratio / old).round() as u64).min(frames);
+                    let offset = at(done.clip.offset).min(frames - 1);
+                    (offset, at(done.clip.length).clamp(1, frames - offset))
+                }
+            };
+            let scale = length as f64 / done.clip.length.max(1) as f64;
+            let at = |v: u64| ((v as f64 * scale).round() as u64).min(length);
             let fade_in = at(done.clip.fade_in).min(length);
+            // A warped clip's start follows its tick.
+            let start = match &done.warp {
+                Some(w) => self.history.project().samples_at(w.tick) + offset,
+                None => done.clip.start,
+            };
             let clip = ClipRef {
                 source: done.path.clone(),
+                start,
                 offset,
                 length,
                 fade_in,
                 fade_out: at(done.clip.fade_out).min(length - fade_in),
                 stretch: Some(daw_project::Stretch {
                     original: done.original,
-                    ratio: done.ratio,
+                    ratio,
                     semitones: done.semitones,
-                    warp: None,
+                    warp: done.warp,
                 }),
                 ..done.clip
             };
-            match self.history.apply(Action::SetClip {
+            let action = Action::SetClip {
                 track: done.track,
                 index: done.index,
                 clip,
-            }) {
+            };
+            let applied = if done.auto {
+                self.history.apply_quiet(action)
+            } else {
+                self.history.apply(action)
+            };
+            match applied {
                 Ok(()) => {
                     self.load(done.path, None);
                     self.ws.status = Some(Status {
@@ -2329,7 +2532,7 @@ impl App {
                 self.input_choice.as_deref(),
                 self.input_faults.clone(),
             ) {
-                Ok((recorder, stream, _)) => self.recorder = Some((recorder, stream)),
+                Ok((recorder, stream, _, _monitor)) => self.recorder = Some((recorder, stream)),
                 Err(e) => return self.error(format!("cannot record: {e}")),
             }
         }
@@ -2538,6 +2741,7 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         self.receive_loads();
         self.receive_stretches();
+        self.tend_warps();
         self.receive_transcriptions();
         self.check_streams();
         self.sync_midi_inputs();
@@ -2763,6 +2967,31 @@ fn bounce_actions(t: &Track, track: usize, file: PathBuf, frames: u64) -> Vec<Ac
     batch
 }
 
+/// The pieces of a warped render, each stretched to its length on the
+/// timeline (and `semitones` higher), end to end.
+fn warp_render(
+    channels: &[Vec<f32>],
+    pieces: &[daw_project::Piece],
+    semitones: f64,
+) -> Vec<Vec<f32>> {
+    let mut out = vec![Vec::new(); channels.len()];
+    for p in pieces {
+        let (from, to) = (p.from as usize, p.to as usize);
+        let part: Vec<Vec<f32>> = channels
+            .iter()
+            .map(|c| c[from.min(c.len())..to.min(c.len())].to_vec())
+            .collect();
+        let ratio = p.frames as f64 / (to - from).max(1) as f64;
+        let stretched = daw_dsp::stretch::stretch_and_pitch(&part, ratio, semitones);
+        // Exactly as long as the piece's beats, so later pieces stay on them.
+        for (o, mut c) in out.iter_mut().zip(stretched) {
+            c.resize(p.frames as usize, 0.0);
+            o.extend(c);
+        }
+    }
+    out
+}
+
 /// How far a playhead at `at` is through an export from `start` to `end`, 0 to 1.
 fn progress(at: u64, start: u64, end: u64) -> f64 {
     (at.saturating_sub(start) as f64 / end.saturating_sub(start).max(1) as f64).min(1.0)
@@ -2928,6 +3157,26 @@ mod tests {
         // Range wider than the take: the whole take.
         assert_eq!(punch_window(1_000, 500, (0, 9_000)), Some((1_000, 0, 500)));
         assert_eq!(punch_window(1_000, 500, (2_000, 3_000)), None);
+    }
+
+    #[test]
+    fn a_warped_render_is_exactly_as_long_as_its_pieces() {
+        let source = vec![vec![0.25f32; 9_000]; 2];
+        let pieces = [
+            daw_project::Piece {
+                from: 0,
+                to: 4_000,
+                frames: 6_000,
+            },
+            daw_project::Piece {
+                from: 4_000,
+                to: 9_000,
+                frames: 2_501,
+            },
+        ];
+        let out = warp_render(&source, &pieces, 0.0);
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|c| c.len() == 8_501));
     }
 
     #[test]

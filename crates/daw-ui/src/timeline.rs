@@ -1259,7 +1259,22 @@ pub(crate) fn show(
         }
     }
     if lanes_resp.clicked() {
+        let alt = ui.input(|i| i.modifiers.alt);
+        let warped = |ti: usize, ci: usize| {
+            let clip = &project.tracks[ti].clips[ci];
+            clip.stretch.as_ref().is_some_and(|s| s.warp.is_some())
+        };
         match (hit, ws.tool, pointer_sample) {
+            // Option-click on a warped clip pins the audio there to the grid.
+            (Some((ti, ci, _)), Tool::Draw, Some(at)) if alt && warped(ti, ci) => {
+                let to = project.ticks_at(snap_f(at, ws.snap, project) as u64);
+                out.push(Request::WarpPin {
+                    track: ti,
+                    index: ci,
+                    at: at as u64,
+                    to,
+                });
+            }
             (Some((ti, ci, _)), Tool::Slice, Some(at)) => {
                 let clip = &project.tracks[ti].clips[ci];
                 let at = snap_f(at, ws.snap, project) as u64;

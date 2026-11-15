@@ -119,9 +119,19 @@ pub fn start_output_at(
     let (mut handle, lending, mut audio) =
         lendable_engine(queue_capacity, config.sample_rate as f32);
     handle.lending = Some(lending);
+    let latency = handle.output_latency.clone();
+    let rate = f64::from(config.sample_rate);
     let stream = device.build_output_stream(
         config,
-        move |data: &mut [f32], _| audio.process(data, channels),
+        move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
+            // How far ahead of the speaker this callback runs.
+            let t = info.timestamp();
+            if let Some(d) = t.playback.checked_duration_since(t.callback) {
+                let frames = (d.as_secs_f64() * rate).round() as u32;
+                latency.store(frames, std::sync::atomic::Ordering::Relaxed);
+            }
+            audio.process(data, channels)
+        },
         // May run on the render thread (xruns): only flags the fault.
         move |e| faults.record(&e),
         None,

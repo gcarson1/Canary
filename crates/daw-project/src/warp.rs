@@ -16,6 +16,17 @@ pub struct Warp {
     /// (source frame, beats after `tick`), rising in both; (0, 0) is implied.
     #[serde(default)]
     pub markers: Vec<(u64, f64)>,
+    /// The source's length in frames, as last rendered.
+    #[serde(default)]
+    pub source_frames: u64,
+    /// `Project::tempo_key` of the map the render followed: when it differs,
+    /// the clip is rendered again.
+    #[serde(default)]
+    pub map: u64,
+    /// The clip's window (start, end) in beats after `tick`, so a new render
+    /// plays the same beats however the tempo map stretched them.
+    #[serde(default)]
+    pub window: (f64, f64),
 }
 
 /// One stretch of a warped render: source frames `from..to` become `frames`
@@ -89,6 +100,31 @@ impl Warp {
 }
 
 impl Project {
+    /// A digest of everything a warped render depends on in the project: the
+    /// tempo, its changes and the sample rate.
+    pub fn tempo_key(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::hash::DefaultHasher::new();
+        (self.bpm.to_bits(), self.sample_rate).hash(&mut h);
+        for c in &self.tempos {
+            (c.tick, c.bpm.to_bits()).hash(&mut h);
+        }
+        h.finish()
+    }
+
+    /// The beats after `warp.tick` of a clip window from timeline sample
+    /// `start`, `length` long (on this project's tempo map).
+    pub fn warp_window(&self, warp: &Warp, start: u64, length: u64) -> (f64, f64) {
+        let beats = |s: u64| (self.ticks_at(s) as f64 - warp.tick as f64).max(0.0) / PPQ as f64;
+        (beats(start), beats(start.saturating_add(length)))
+    }
+
+    /// The frame of a warped render at `beats` after `warp.tick`.
+    pub fn warp_frame(&self, warp: &Warp, beats: f64) -> u64 {
+        let tick = warp.tick + (beats.max(0.0) * PPQ as f64).round() as u64;
+        self.samples_at(tick) - self.samples_at(warp.tick)
+    }
+
     /// How to render `source_frames` of a warped source onto this project's
     /// tempo map: pieces in order, split at markers and at tempo changes, each
     /// as long on the timeline as its beats last there.
@@ -112,7 +148,8 @@ impl Project {
             for c in cuts.windows(2) {
                 let (from, to) = (frame_at(c[0]), frame_at(c[1]));
                 let frames = self.samples_at(c[1]) - self.samples_at(c[0]);
-                if to > from && frames > 0 {
+                // Even a piece with no source frames keeps its time.
+                if frames > 0 {
                     pieces.push(Piece { from, to, frames });
                 }
             }
@@ -134,6 +171,9 @@ mod tests {
             tick: 0,
             bpm: 120.0,
             markers: Vec::new(),
+            source_frames: 0,
+            map: 0,
+            window: (0.0, 0.0),
         };
         // At its own tempo, the source plays as it is.
         let same = p.warp_pieces(&w, 96_000);
@@ -171,5 +211,31 @@ mod tests {
         assert_eq!(m.markers, [(20_000, 1.5)]);
         assert!(!m.pin(0, 0.5), "frame 0 is the start");
         assert!(!Warp { bpm: 0.0, ..w }.is_valid());
+    }
+
+    #[test]
+    fn a_trimmed_window_keeps_its_beats_when_the_tempo_changes_inside_it() {
+        // A clip playing beats 2 to 4 of a source pinned at tick 0.
+        let mut p = Project::default();
+        let w = Warp {
+            tick: 0,
+            bpm: 120.0,
+            markers: Vec::new(),
+            source_frames: 96_000,
+            map: 0,
+            window: (0.0, 0.0),
+        };
+        let window = p.warp_window(&w, 48_000, 48_000);
+        assert_eq!(window, (2.0, 4.0));
+        // Half tempo from beat 2: the window now starts 48 000 frames in and
+        // lasts twice as long, on the same beats.
+        p.tempos = vec![TempoChange {
+            tick: 2 * PPQ,
+            bpm: 60.0,
+        }];
+        let (from, to) = (p.warp_frame(&w, window.0), p.warp_frame(&w, window.1));
+        assert_eq!((from, to - from), (48_000, 96_000));
+        // Measured again on the new map, it is the same window: it settles.
+        assert_eq!(p.warp_window(&w, from, to - from), window);
     }
 }

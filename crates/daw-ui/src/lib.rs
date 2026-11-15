@@ -161,6 +161,20 @@ pub enum Request {
         device: usize,
         save: bool,
     },
+    /// Warp clip `index` on `track` to the tempo map (its audio then follows
+    /// tempo changes), or unwarp it if warped.
+    Warp {
+        track: usize,
+        index: usize,
+    },
+    /// Pin the audio of warped clip `index` at timeline sample `at` to tick
+    /// `to` (a warp marker).
+    WarpPin {
+        track: usize,
+        index: usize,
+        at: u64,
+        to: u64,
+    },
     /// Turn clip `index` on `track` into notes on a new track: a melody, or
     /// with `drums`, drum hits.
     AudioToMidi {
@@ -828,6 +842,7 @@ impl Workspace {
             let mut semis = 0.0;
             let mut take = 0i32;
             let mut midi = None;
+            let mut warp = false;
             for e in &i.events {
                 if let egui::Event::Key {
                     key,
@@ -853,15 +868,23 @@ impl Workspace {
                         // N turns the clip into notes, Shift+N into drum hits
                         // (M is mute).
                         Key::N if !repeat => midi = Some(modifiers.shift),
+                        // W warps the clip to the tempo map (again unwarps).
+                        Key::W if !repeat => warp = true,
                         _ => {}
                     }
                 }
             }
-            (db, flip, semis, take, midi)
+            (db, flip, semis, take, midi, warp)
         });
-        if let (Page::Playlist, Some((ti, ci)), (db, flip, semis, take, midi)) =
+        if let (Page::Playlist, Some((ti, ci)), (db, flip, semis, take, midi, warp)) =
             (self.page, self.selected_clip, clip_keys)
         {
+            if warp {
+                out.push(Request::Warp {
+                    track: ti,
+                    index: ci,
+                });
+            }
             if let Some(drums) = midi {
                 out.push(Request::AudioToMidi {
                     track: ti,

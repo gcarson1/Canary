@@ -37,9 +37,11 @@ const REFERENCE_NODE: NodeId = NodeId(devices::FIRST_DEVICE_NODE - 1);
 /// Track nodes are 1..=MAX_TRACKS; send nodes take the ids after them, up to
 /// the reference's.
 const MAX_TRACKS: usize = 1023;
-const SEND_NODES: std::ops::Range<u32> = MAX_TRACKS as u32 + 1..PREVIEW_NODE.0;
+const SEND_NODES: std::ops::Range<u32> = MAX_TRACKS as u32 + 1..INPUT_NODE.0;
 /// The browser's audition voice, inserted once and kept, like the master.
 const PREVIEW_NODE: NodeId = NodeId(REFERENCE_NODE.0 - 1);
+/// The live input, for monitoring; inserted when the input opens.
+const INPUT_NODE: NodeId = NodeId(PREVIEW_NODE.0 - 1);
 const AUDIO_EXTENSIONS: [&str; 7] = ["wav", "flac", "mp3", "m4a", "aac", "aif", "aiff"];
 const MIDI_EXTENSIONS: [&str; 2] = ["mid", "midi"];
 /// Amp captures, for the amp device; listed in the browser, never played.
@@ -140,6 +142,13 @@ struct App {
     devices: Devices,
     /// Open only while a take records, so the microphone is not held between takes.
     recorder: Option<(Recorder, cpal::Stream)>,
+    /// The input's monitor node, until the next plan inserts it.
+    input_node: Option<Box<daw_engine::MonitorNode>>,
+    /// The engine has an input node (from the input open now).
+    input_inserted: bool,
+    /// The monitoring tracks (by id) when opening the input for them failed:
+    /// not tried again until that set changes (or the input is switched).
+    input_failed: Option<Vec<u64>>,
     /// MIDI being recorded into a pattern.
     midi_take: Option<take::MidiTake>,
     /// Punch ranges (timeline samples) for takes still loading, by file.
@@ -366,6 +375,9 @@ impl App {
             title: String::new(),
             master: Some(Box::new(master)),
             preview_node: Some(Box::new(preview_node)),
+            input_node: None,
+            input_inserted: false,
+            input_failed: None,
             preview,
             preview_wanted: None,
             preview_tx,
@@ -430,7 +442,7 @@ impl App {
         };
         let frames = audio.frames() as u64;
         // A punched take: only its part inside the punch range.
-        let (start, offset, length, takes) = match self.punches.remove(path) {
+        let (start, offset, length, takes) = match self.punches.get(path).cloned() {
             Some(TakePlan::Punch(range)) => match punch_window(at, frames, range) {
                 Some((s, o, l)) => (s, o, l, None),
                 None => return self.error("nothing was recorded inside the punch range".into()),
@@ -557,8 +569,11 @@ impl App {
                     for (track, at) in places {
                         self.place(&done.path, track, at);
                     }
+                    // Every armed track placed it the same way.
+                    self.punches.remove(&done.path);
                 }
                 Err(e) => {
+                    self.punches.remove(&done.path);
                     self.built = None; // an ARA restore waiting on this file can go
                     self.error(format!("could not load {}: {e}", done.path.display()));
                 }
@@ -703,6 +718,11 @@ impl App {
         let (preview_node, preview) = PreviewNode::new();
         self.preview_node = Some(Box::new(preview_node));
         self.preview = preview;
+        // The input's monitor node lived in the old engine: open it again.
+        self.input_inserted = false;
+        if !self.taking() {
+            self.recorder = None;
+        }
         self.midi = self.engine.midi.take().map(|m| Arc::new(Mutex::new(m)));
         // Inputs feed the old engine's sender: connect them all again.
         self.midi_in.clear();
@@ -841,6 +861,14 @@ impl App {
         let mut steps = Vec::with_capacity(count);
         let mut sends = Vec::new();
         let mut send_levels = Vec::new();
+        if let Some(node) = self.input_node.take() {
+            plan.insert(INPUT_NODE, node);
+            self.input_inserted = true;
+        }
+        let monitoring = tracks.iter().any(|t| t.monitor && t.frozen.is_none());
+        let input_step = (self.input_inserted && monitoring && self.export.is_none())
+            .then(|| plan.add(INPUT_NODE, vec![], 2).ok())
+            .flatten();
         // The track a freeze renders: before its fader, so it plays at unity.
         let freezing = self.export.as_ref().and_then(|e| e.freeze).map(|f| f.0);
         // Equal-power centre pan is -3 dB: the render passes the track node
@@ -907,7 +935,13 @@ impl App {
                 None => vec![],
             };
             // A bus sums what is routed or sent to it, after any instrument.
-            let feeds: Vec<StepId> = inputs.into_iter().chain(bus_in[i].drain(..)).collect();
+            // A monitoring track hears the live input, through its effects.
+            let live = input_step.filter(|_| track.monitor && frozen.is_none());
+            let feeds: Vec<StepId> = inputs
+                .into_iter()
+                .chain(bus_in[i].drain(..))
+                .chain(live)
+                .collect();
             let inputs = if feeds.is_empty() {
                 vec![]
             } else {
@@ -1222,8 +1256,12 @@ impl App {
                 self.error("stop recording before switching the input".into());
             }
             Request::SetInput(device) => {
-                // Used from the next take on (the input opens per take).
+                // Used from the next take on; a monitored input opens again.
                 self.input_choice = device;
+                self.recorder = None;
+                self.input_inserted = false;
+                self.input_failed = None;
+                self.built = None;
                 self.audio_view.input = self.input_choice.clone();
                 save_audio_choice(&self.samples_dir, &self.audio_choice, &self.input_choice);
             }
@@ -2517,6 +2555,44 @@ impl App {
         });
     }
 
+    /// Opens the input device for recording and monitoring.
+    fn open_input(&mut self) -> Result<(), daw_engine::InputError> {
+        let (recorder, stream, _, node) = daw_engine::start_input(
+            self.view.sample_rate,
+            self.engine.playhead_clock(),
+            self.input_choice.as_deref(),
+            self.input_faults.clone(),
+        )?;
+        self.recorder = Some((recorder, stream));
+        self.input_node = Some(Box::new(node));
+        self.built = None; // the next plan takes the new monitor node
+        Ok(())
+    }
+
+    /// Keeps the input open while a track monitors it (and between takes),
+    /// and closes it when nothing needs it, releasing the microphone.
+    fn tend_input(&mut self) {
+        let tracks = self.history.project().tracks.iter();
+        let ids: Vec<u64> = tracks
+            .filter(|t| t.monitor && t.frozen.is_none())
+            .map(|t| t.id)
+            .collect();
+        let monitoring = !ids.is_empty();
+        if monitoring && self.recorder.is_none() {
+            if self.input_failed.as_ref() == Some(&ids) {
+                return;
+            }
+            if let Err(e) = self.open_input() {
+                self.input_failed = Some(ids);
+                self.error(format!("cannot monitor the input: {e}"));
+            }
+        } else if !monitoring && !self.taking() && self.recorder.is_some() {
+            self.recorder = None;
+            self.input_inserted = false;
+            self.built = None;
+        }
+    }
+
     fn toggle_record(&mut self) {
         let audio_take = self
             .recorder
@@ -2526,20 +2602,15 @@ impl App {
             return self.toggle_midi_take();
         }
         if self.recorder.is_none() {
-            match daw_engine::start_input(
-                self.view.sample_rate,
-                self.engine.playhead_clock(),
-                self.input_choice.as_deref(),
-                self.input_faults.clone(),
-            ) {
-                Ok((recorder, stream, _, _monitor)) => self.recorder = Some((recorder, stream)),
-                Err(e) => return self.error(format!("cannot record: {e}")),
+            if let Err(e) = self.open_input() {
+                return self.error(format!("cannot record: {e}"));
             }
         }
         let Some((recorder, _)) = self.recorder.as_mut() else {
             return;
         };
         if recorder.is_recording() {
+            let input_latency = recorder.input_latency();
             let take = match recorder.stop() {
                 Ok(take) => take,
                 Err(daw_engine::RecordError::Wav {
@@ -2554,13 +2625,18 @@ impl App {
                     return self.error(format!("recording failed: {e}"));
                 }
             };
-            self.recorder = None; // release the microphone between takes
+            // `tend_input` releases the microphone unless a track monitors it.
             self.files = audio_files(&self.samples_dir);
             // The mix plays `plan_latency` behind the transport (PDC), and the
             // performer played to what they heard.
-            let start = take
-                .start_sample
-                .saturating_sub(u64::from(self.engine.plan_latency()));
+            // The input reached the callback late and the output plays ahead of
+            // the speaker: the performer played to a sample that much earlier.
+            let output_latency = self.engine.output_latency.load(Ordering::Relaxed);
+            let start = take.start_sample.saturating_sub(
+                u64::from(self.engine.plan_latency())
+                    + u64::from(input_latency)
+                    + u64::from(output_latency),
+            );
             // The song loop region, in samples, when it is on.
             let project = self.history.project();
             let region = project
@@ -2578,7 +2654,10 @@ impl App {
             if let Some(plan) = plan {
                 self.punches.insert(take.path.clone(), plan);
             }
-            self.load(take.path, Some((self.ws.selected_track, start)));
+            // shortcut: each armed track's clip is its own undo step.
+            for track in take_targets(self.history.project(), self.ws.selected_track) {
+                self.load(take.path.clone(), Some((track, start)));
+            }
         } else {
             let stamp = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -2755,6 +2834,7 @@ impl eframe::App for App {
         }
         self.read_telemetry();
         self.tend_export();
+        self.tend_input();
         self.engine.collect_garbage();
         if ctx.input(|i| i.modifiers.command && !i.modifiers.shift && i.key_pressed(egui::Key::S)) {
             self.save();
@@ -2992,6 +3072,18 @@ fn warp_render(
     out
 }
 
+/// Where a finished take goes: every armed track, else the selected one
+/// (`None`: a new track).
+fn take_targets(project: &daw_project::Project, selected: Option<usize>) -> Vec<Option<usize>> {
+    let armed = project.tracks.iter().enumerate().filter(|(_, t)| t.armed);
+    let armed: Vec<Option<usize>> = armed.map(|(i, _)| Some(i)).collect();
+    if armed.is_empty() {
+        vec![selected]
+    } else {
+        armed
+    }
+}
+
 /// How far a playhead at `at` is through an export from `start` to `end`, 0 to 1.
 fn progress(at: u64, start: u64, end: u64) -> f64 {
     (at.saturating_sub(start) as f64 / end.saturating_sub(start).max(1) as f64).min(1.0)
@@ -3011,6 +3103,7 @@ fn into_loop(looping: Option<(u64, u64)>, at: u64) -> Option<u64> {
 
 /// How a finished take is placed besides its start: only the punch range, or
 /// as the passes of a loop recording.
+#[derive(Clone)]
 enum TakePlan {
     Punch((u64, u64)),
     Loop((u64, u64, u64, daw_project::Takes)),
@@ -3177,6 +3270,19 @@ mod tests {
         let out = warp_render(&source, &pieces, 0.0);
         assert_eq!(out.len(), 2);
         assert!(out.iter().all(|c| c.len() == 8_501));
+    }
+
+    #[test]
+    fn a_take_lands_on_the_armed_tracks_else_the_selected_one() {
+        let mut p = daw_project::Project {
+            tracks: vec![Track::new("A"), Track::new("B"), Track::new("C")],
+            ..Default::default()
+        };
+        assert_eq!(take_targets(&p, Some(1)), [Some(1)]);
+        assert_eq!(take_targets(&p, None), [None]);
+        p.tracks[0].armed = true;
+        p.tracks[2].armed = true;
+        assert_eq!(take_targets(&p, Some(1)), [Some(0), Some(2)]);
     }
 
     #[test]

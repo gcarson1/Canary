@@ -106,6 +106,12 @@ pub struct Track {
     pub pan: f32,
     pub mute: bool,
     pub solo: bool,
+    /// Armed: a recording lands on this track.
+    #[serde(default)]
+    pub armed: bool,
+    /// Input monitoring: the live input plays through this track.
+    #[serde(default)]
+    pub monitor: bool,
     pub clips: Vec<ClipRef>,
     /// Plugins on the track, in signal order. An instrument (a plugin without an
     /// audio input) plays before the clips are mixed in; effects follow.
@@ -216,6 +222,8 @@ impl Track {
             pan: 0.0,
             mute: false,
             solo: false,
+            armed: false,
+            monitor: false,
             clips: Vec::new(),
             devices: Vec::new(),
             notes: Vec::new(),
@@ -527,6 +535,8 @@ pub struct TrackProps {
     pub pan: f32,
     pub mute: bool,
     pub solo: bool,
+    pub armed: bool,
+    pub monitor: bool,
 }
 
 impl TrackProps {
@@ -537,6 +547,8 @@ impl TrackProps {
             pan: track.pan,
             mute: track.mute,
             solo: track.solo,
+            armed: track.armed,
+            monitor: track.monitor,
         }
     }
 }
@@ -674,6 +686,7 @@ impl Action {
                 let old = TrackProps::of(t);
                 (t.name, t.gain, t.pan, t.mute, t.solo) =
                     (props.name, props.gain, props.pan, props.mute, props.solo);
+                (t.armed, t.monitor) = (props.armed, props.monitor);
                 SetTrackProps { index, props: old }
             }
             InsertClip {
@@ -1384,6 +1397,8 @@ mod tests {
             pan: -0.25,
             mute: true,
             solo: true,
+            armed: true,
+            monitor: true,
         };
         for action in [
             Action::SetTempo(140.0),

@@ -373,13 +373,19 @@ pub(crate) fn show(
             t.text,
         );
         let side = 1.25 * u;
-        for (k, (label, on, fill)) in [("M", track.mute, t.ink), ("S", track.solo, t.accent_amber)]
-            .into_iter()
-            .enumerate()
-        {
+        // R arms the track for recording, I monitors the input through it.
+        let buttons = [
+            ("R", track.armed, t.bad),
+            ("I", track.monitor, t.good),
+            ("M", track.mute, t.ink),
+            ("S", track.solo, t.accent_amber),
+        ];
+        let gap = 0.125 * u;
+        let row_w = 4.0 * side + 3.0 * gap;
+        for (k, (label, on, fill)) in buttons.into_iter().enumerate() {
             let b = m.snap_rect(Rect::from_min_size(
                 Pos2::new(
-                    strip.center().x - side - 0.125 * u + k as f32 * (side + 0.25 * u),
+                    strip.center().x - row_w / 2.0 + k as f32 * (side + gap),
                     bottom + 1.5 * u,
                 ),
                 Vec2::splat(side),
@@ -403,7 +409,18 @@ pub(crate) fn show(
             );
             if resp.clicked() {
                 let alt = ui.input(|i| i.modifiers.alt);
-                ws.edit(crate::mute_solo(&project.tracks, ti, k == 1, alt));
+                match k {
+                    0 | 1 => {
+                        let mut props = TrackProps::of(track);
+                        if k == 0 {
+                            props.armed ^= true;
+                        } else {
+                            props.monitor ^= true;
+                        }
+                        ws.edit(Action::SetTrackProps { index: ti, props });
+                    }
+                    _ => ws.edit(crate::mute_solo(&project.tracks, ti, k == 3, alt)),
+                }
             }
         }
     }

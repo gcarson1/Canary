@@ -1226,6 +1226,11 @@ impl AudioNode for Vst3Node {
         transport.tempo = m.bpm;
         transport.timeSigNumerator = i32::from(m.numerator);
         transport.timeSigDenominator = i32::from(m.denominator);
+        if let Some((start, end)) = m.loop_beats {
+            transport.state |= flags::kCycleActive;
+            transport.cycleStartMusic = start;
+            transport.cycleEndMusic = end;
+        }
         let mut data = ProcessData {
             processMode: ProcessModes_::kRealtime as int32,
             symbolicSampleSize: SymbolicSampleSizes_::kSample32 as int32,

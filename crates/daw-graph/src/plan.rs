@@ -466,8 +466,11 @@ impl ExecutionPlan {
         let context = if self.tempo.is_empty() {
             context
         } else {
+            let at = |sample| musical_at(&self.tempo, sample, context.sample_rate);
+            let mut musical = at(context.playhead);
+            musical.loop_beats = context.looping.map(|(a, b)| (at(a).beats, at(b).beats));
             with_music = ProcessContext {
-                musical: musical_at(&self.tempo, context.playhead, context.sample_rate),
+                musical,
                 ..*context
             };
             &with_music
@@ -1025,6 +1028,51 @@ mod tests {
         }
 
         fn reset(&mut self) {}
+    }
+
+    /// Writes the loop's start beat it is told (or -1 without a loop).
+    struct LoopProbe;
+
+    impl AudioNode for LoopProbe {
+        fn process(
+            &mut self,
+            _inputs: &[&[f32]],
+            outputs: &mut [&mut [f32]],
+            _midi_in: &[MidiEvent],
+            _midi_out: &mut Vec<MidiEvent>,
+            context: &ProcessContext,
+        ) {
+            let start = context.musical.loop_beats.map_or(-1.0, |l| l.0);
+            outputs[0].fill(start as f32);
+        }
+
+        fn reset(&mut self) {}
+    }
+
+    #[test]
+    fn plugins_hear_the_loop_in_beats() {
+        let mut arena = NodeArena::default();
+        let mut plan = ExecutionPlan::new(4);
+        add(&mut plan, Box::new(LoopProbe), vec![], 1).unwrap();
+        // 120 BPM at 48 kHz: a beat is 24 000 samples.
+        plan.set_tempo_map(vec![daw_core::TempoSegment {
+            at: 0,
+            beats: 0.0,
+            bpm: 120.0,
+            bar: 0,
+            bar_start: 0.0,
+            numerator: 4,
+            denominator: 4,
+        }]);
+        arena.apply(&mut plan);
+        let looping = ProcessContext {
+            looping: Some((48_000, 96_000)),
+            ..ctx(4)
+        };
+        plan.process(&mut arena, &looping, &[]);
+        assert_eq!(plan.output()[0][0], 2.0, "loop from beat 2");
+        plan.process(&mut arena, &ctx(4), &[]);
+        assert_eq!(plan.output()[0][0], -1.0, "no loop");
     }
 
     #[test]

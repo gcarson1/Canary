@@ -79,6 +79,8 @@ pub struct ProcessContext {
     /// Transport position in samples at the first frame of this tick.
     pub playhead: u64,
     pub playing: bool,
+    /// The transport's loop (start, end) in samples, while it loops.
+    pub looping: Option<(u64, u64)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,6 +106,7 @@ impl Default for ProcessContext {
             num_samples: 0,
             playhead: 0,
             playing: false,
+            looping: None,
         }
     }
 }
@@ -120,6 +123,8 @@ pub struct Musical {
     pub bar: i32,
     pub numerator: u16,
     pub denominator: u16,
+    /// The loop the transport plays round, in quarter notes, if it loops.
+    pub loop_beats: Option<(f64, f64)>,
 }
 
 impl Default for Musical {
@@ -131,6 +136,7 @@ impl Default for Musical {
             bar: 0,
             numerator: 4,
             denominator: 4,
+            loop_beats: None,
         }
     }
 }
@@ -167,6 +173,7 @@ pub fn musical_at(segments: &[TempoSegment], sample: u64, sample_rate: f32) -> M
         bar: seg.bar + bars as i32,
         numerator: seg.numerator,
         denominator: seg.denominator,
+        loop_beats: None,
     }
 }
 

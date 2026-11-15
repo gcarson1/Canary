@@ -303,6 +303,7 @@ impl AudioEngine {
                             num_samples: frames,
                             playhead: self.transport.playhead(),
                             playing: rolling,
+                            looping: self.transport.loop_range(),
                             ..Default::default()
                         },
                         now,

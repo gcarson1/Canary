@@ -331,7 +331,7 @@ unsafe fn transport(
         put(playing, u8::from(t.playing));
         put(changed, u8::from(t.changed));
         put(sample, t.sample);
-        put(cycling, 0);
+        put(cycling, u8::from(t.musical.loop_beats.is_some()));
     }
     t.changed = false;
     feed.time.set(t);
@@ -344,11 +344,32 @@ unsafe extern "C-unwind" fn transport_state(
     changed: *mut u8,
     sample: *mut f64,
     cycling: *mut u8,
-    _start: *mut f64,
-    _end: *mut f64,
+    start: *mut f64,
+    end: *mut f64,
 ) -> i32 {
     // SAFETY: as in `beat_and_tempo`.
-    unsafe { transport(data, playing, changed, sample, cycling) }
+    unsafe {
+        cycle(data, start, end);
+        transport(data, playing, changed, sample, cycling)
+    }
+}
+
+/// The loop's start and end beats, where asked for (0 when not looping).
+///
+/// # Safety
+/// As `beat_and_tempo`.
+unsafe fn cycle(data: *mut c_void, start: *mut f64, end: *mut f64) {
+    // SAFETY: the caller's contract.
+    let feed = unsafe { data.cast::<InputFeed>().as_ref() }
+        .filter(|f| f.rendering.load(std::sync::atomic::Ordering::Acquire));
+    let (a, b) = feed
+        .and_then(|f| f.time.get().musical.loop_beats)
+        .unwrap_or((0.0, 0.0));
+    // SAFETY: as in `beat_and_tempo`.
+    unsafe {
+        put(start, a);
+        put(end, b);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -359,12 +380,13 @@ unsafe extern "C-unwind" fn transport_state2(
     changed: *mut u8,
     sample: *mut f64,
     cycling: *mut u8,
-    _start: *mut f64,
-    _end: *mut f64,
+    start: *mut f64,
+    end: *mut f64,
 ) -> i32 {
     // SAFETY: as in `beat_and_tempo`.
     unsafe {
         put(recording, 0);
+        cycle(data, start, end);
         transport(data, playing, changed, sample, cycling)
     }
 }
@@ -1090,6 +1112,7 @@ mod tests {
                     bar: 1,
                     numerator: 3,
                     denominator: 4,
+                    loop_beats: Some((4.0, 8.0)),
                 },
                 playing: true,
                 sample: 108_000.0,
@@ -1109,6 +1132,7 @@ mod tests {
         assert_eq!((next, num, den, down), (12_000, 3.0, 4, 4.0));
         let (mut playing, mut rec, mut changed, mut sample, mut cyc) = (0u8, 9u8, 0u8, 0.0, 9u8);
         let (b, f) = (ptr::null_mut::<u8>(), ptr::null_mut::<f64>());
+        let (mut loop_start, mut loop_end) = (0.0, 0.0);
         // SAFETY: as above; the unit may pass null for what it does not want.
         unsafe {
             transport_state2(
@@ -1118,14 +1142,15 @@ mod tests {
                 &mut changed,
                 &mut sample,
                 &mut cyc,
-                f,
-                f,
+                &mut loop_start,
+                &mut loop_end,
             )
         };
         assert_eq!(
             (playing, rec, changed, sample, cyc),
-            (1, 0, 1, 108_000.0, 0)
+            (1, 0, 1, 108_000.0, 1)
         );
+        assert_eq!((loop_start, loop_end), (4.0, 8.0), "the loop, in beats");
         // SAFETY: as above.
         unsafe { transport_state(data, b, &mut changed, f, b, f, f) };
         assert_eq!(changed, 0, "a jump is reported once");

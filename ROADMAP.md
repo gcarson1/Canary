@@ -94,7 +94,7 @@ The UI follows Styles.md whichever framework is chosen.
 - [ ] Touch mode, mute automation, and edits to automation without a plan rebuild
 - [x] Transport info to plugins: every node's `ProcessContext::musical` carries tempo, quarter-note position, bar and time signature from the tempo/meter maps (`ExecutionPlan::set_tempo_map`, `daw_core::musical_at`); CLAP gets a transport event, VST3 a `ProcessContext`
 - [x] Transport info for Audio Units: host callbacks report tempo, beat, bar, meter, play state and jumps
-- [ ] Loop positions in plugin transport info; ARA content access for the tempo map
+- [x] Loop positions in plugin transport info (`Musical::loop_beats`: CLAP loop flags and positions, VST3 cycle, AU cycle callbacks). Still to do: ARA content access for the tempo map
 - [x] Plugin delay compensation for sequenced instruments: an instrument reports its latency to PDC, so the other tracks wait for it. Live MIDI still plays late by it, and audio clips on an instrument's own track early
 
 ### Phase 8: Mixer and Routing
@@ -103,7 +103,7 @@ The UI follows Styles.md whichever framework is chosen.
 - [x] Sidechain: built-in compressor key input from any track (`Device::sidechain`, `Action::SetSidechain`, key on the effect's inputs 2-3, `Effect::process_keyed`); KEY in a built-in module's header picks the source track. Still to do: plugins with a sidechain bus
 - [x] DSP load readout in the top bar (`Telemetry::Load`: render time over block time, red from 90%)
 - [x] Freeze (render a track through its devices to audio, devices unloaded) and bounce in place (FREEZE / THAW under + DEVICE in the rack, Shift-click bounces; the render is pre-fader, so the fader, pan and sends still apply)
-- [ ] Input monitoring and per-track record arm; duplex recording with input/output latency compensation
+- [x] Input monitoring and per-track record arm; duplex recording with input/output latency compensation: R and I on each mixer strip; a monitoring track hears the input live through its effects (`daw_engine::MonitorNode`), a take lands on every armed track, placed earlier by the device-reported input and output latency
 
 ### Phase 9: Audio Editing
 - [x] Clip gain (Up/Down 1 dB, Shift 0.1 dB, shown in the clip title and waveform), reverse (R) and fade handles (drag a clip title's corner). Slicing to new clips was already the SLICE tool. Still to do: consolidate

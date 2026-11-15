@@ -640,6 +640,13 @@ fn transport(c: &ProcessContext) -> clack_host::events::event_types::TransportEv
         flags |= TransportFlags::IS_PLAYING;
     }
     let zero = FixedPoint::from_int(0);
+    let seconds = |s: u64| FixedPoint::from_float(s as f64 / f64::from(c.sample_rate.max(1.0)));
+    let (mut loop_beats, mut loop_seconds) = ((zero, zero), (zero, zero));
+    if let (Some((a, b)), Some((sa, sb))) = (m.loop_beats, c.looping) {
+        flags |= TransportFlags::IS_LOOP_ACTIVE;
+        loop_beats = (FixedPoint::from_float(a), FixedPoint::from_float(b));
+        loop_seconds = (seconds(sa), seconds(sb));
+    }
     TransportEvent {
         header: EventHeader::new_core(0, EventFlags::empty()),
         flags,
@@ -649,10 +656,10 @@ fn transport(c: &ProcessContext) -> clack_host::events::event_types::TransportEv
         ),
         tempo: m.bpm,
         tempo_inc: 0.0,
-        loop_start_beats: zero,
-        loop_end_beats: zero,
-        loop_start_seconds: zero,
-        loop_end_seconds: zero,
+        loop_start_beats: loop_beats.0,
+        loop_end_beats: loop_beats.1,
+        loop_start_seconds: loop_seconds.0,
+        loop_end_seconds: loop_seconds.1,
         bar_start: FixedPoint::from_float(m.bar_start),
         bar_number: m.bar,
         time_signature_numerator: m.numerator,

@@ -91,7 +91,7 @@ The UI follows Styles.md whichever framework is chosen.
 - [x] Punch in/out, count-in for audio takes (PUNCH keeps the part of a take inside the song loop region as the clip's window; CNT counts in audio takes too, with nothing recorded during the count-in)
 - [x] Automation lanes: track gain/pan and any plugin or built-in parameter, breakpoints with curve shapes, applied per block on the audio thread (`ExecutionPlan::automate`, `AudioNode::automate`: TrackNode, built-in effects, sampler attack/release/gain, CLAP, VST3, AU). AUTO [GAIN][PAN] in the tool strip, or right-click a rack dial, shows the lane on the selected track's playlist row: click adds a snapped point, drag moves it, Option-drag bends a segment, right-click removes
 - [x] Automation recording (AUTO in the transport: dials, pan and faders write their lanes while playing, latch, one undo step per pass)
-- [ ] Touch mode, mute automation, and edits to automation without a plan rebuild
+- [x] Touch mode and mute automation: AUTO writes in touch mode (a control held still keeps writing; released, the lane plays on), right-click AUTO for LATCH (the last control released keeps its value until stop); MUTE lanes (`Target::Mute`, AUTO [MUTE]), and M clicked while AUTO records writes the step. Still to do: edits to automation without a plan rebuild; several controls latched at once
 - [x] Transport info to plugins: every node's `ProcessContext::musical` carries tempo, quarter-note position, bar and time signature from the tempo/meter maps (`ExecutionPlan::set_tempo_map`, `daw_core::musical_at`); CLAP gets a transport event, VST3 a `ProcessContext`
 - [x] Transport info for Audio Units: host callbacks report tempo, beat, bar, meter, play state and jumps
 - [x] Loop positions in plugin transport info (`Musical::loop_beats`: CLAP loop flags and positions, VST3 cycle, AU cycle callbacks). Still to do: ARA content access for the tempo map
@@ -127,7 +127,7 @@ The UI follows Styles.md whichever framework is chosen.
 - [x] Export a range, dither and sample-rate choice (the loop region when the loop is on; WAV16 with TPDF dither, dither on every integer format; Shift+right-click EXPORT picks 44.1, 48 or 96 kHz)
 - [x] Project template (Cmd+Shift+T saves the project as `Templates/Default.daw`; new projects start from it), autosave every minute to `<project>.autosave.daw` (removed on save; a newer one at startup says so, Cmd+Shift+R recovers it). Still to do: collect-and-save, relative sample paths
 - [x] Audio output device and buffer size (click the kHz readout; kept between sessions), all MIDI inputs (hot-plugged too), theme (Cmd+Shift+L)
-- [ ] Preferences: input device choice, project sample rate change, UI scale
+- [x] Preferences: input device choice, project sample rate change, UI scale: the audio panel picks the record input and a rate (44.1-96 kHz; the project's clips scale with it, undoable, and a project at another rate than the device moves to it on open); Cmd+= / Cmd+- / Cmd+0 set the UI scale (75-150%, kept between sessions)
 - [x] Shortcuts: F5 playlist, F6 step sequencer, F7 piano roll, F9 mixer, P draw, C slice, Cmd+Shift+L daylight theme; Cmd+C/X/V for playlist clips (pasted at the playhead on the selected track) and piano-roll notes. Still to do: marquee select in the playlist
 - [x] Browser preview: the arrow at a file row's end auditions it through the master (`daw_graph::PreviewNode`, kept across plans, left out of exports). Still to do: favorites, search across folders
 - [ ] Multi-core DSP: independent branches run on a real-time worker pool

@@ -590,6 +590,13 @@ impl Devices {
         self.pending_ara = archives;
     }
 
+    /// After `engine_lost` for a new sample rate: drops the ARA documents (made
+    /// at the old rate) so the next sync makes them again from `archives`.
+    pub fn rebuild_ara(&mut self, archives: Vec<AraArchive>) {
+        self.ara.clear();
+        self.pending_ara = archives;
+    }
+
     /// Every ARA document to save, with errors; see `merge_archives`.
     pub fn ara_archives(&self, previous: &[AraArchive]) -> (Vec<AraArchive>, Vec<String>) {
         let live = self

@@ -73,12 +73,16 @@ struct Stretched {
     warp: Option<daw_project::Warp>,
     /// Made by the app (a tempo change or move), not asked for: no undo step.
     auto: bool,
+    /// The engine rate it was rendered at.
+    rate: u32,
     /// Frames rendered.
     result: Result<u64, String>,
 }
 
 struct Loaded {
     path: PathBuf,
+    /// The engine rate it was resampled to.
+    rate: u32,
     result: Result<(Arc<SampleData>, WaveformPyramid), String>,
 }
 
@@ -149,6 +153,8 @@ struct App {
     /// The monitoring tracks (by id) when opening the input for them failed:
     /// not tried again until that set changes (or the input is switched).
     input_failed: Option<Vec<u64>>,
+    /// The UI scale last written to the preferences file.
+    saved_ui_scale: f32,
     /// MIDI being recorded into a pattern.
     midi_take: Option<take::MidiTake>,
     /// Punch ranges (timeline samples) for takes still loading, by file.
@@ -242,7 +248,10 @@ impl App {
         samples_dir: PathBuf,
     ) -> Result<Self, String> {
         theme::install_fonts(&cc.egui_ctx);
-        let ws = Workspace::default();
+        // Cmd+= / Cmd+- are the UI scale preference, not egui's own zoom.
+        cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
+        let mut ws = Workspace::default();
+        ws.ui_scale = load_ui_scale(&samples_dir);
         theme::apply(&cc.egui_ctx, &ws.theme);
 
         let template = samples_dir.join(TEMPLATE);
@@ -278,21 +287,15 @@ impl App {
         } else {
             History::default()
         };
-        if history.project().sample_rate != config.sample_rate {
-            if !history.project().tracks.is_empty() {
-                // shortcut: converting positions between rates is not built yet; opening
-                // would mix rates in one file, so refuse instead.
-                return Err(format!(
-                    "{} is at {} Hz but the audio device runs at {} Hz; switch the device rate to open it",
-                    project_path.display(),
-                    history.project().sample_rate,
-                    config.sample_rate
-                ));
-            }
-            history = History::new(daw_project::Project {
-                sample_rate: config.sample_rate,
-                ..history.project().clone()
-            });
+        // A project at another rate than the device took moves to the
+        // device's: its clips scale, and saving keeps the new rate.
+        let converted = history.project().sample_rate != config.sample_rate;
+        if converted {
+            let to = Action::SetSampleRate {
+                rate: config.sample_rate,
+                clips: None,
+            };
+            history.apply_quiet(to).map_err(|e| e.to_string())?;
         }
         let (loads_tx, loads_rx) = mpsc::channel();
         let (stretch_tx, stretch_rx) = mpsc::channel();
@@ -315,6 +318,7 @@ impl App {
                 buffer: fixed_buffer(&config),
                 inputs: daw_engine::input_devices(),
                 input: input_choice.clone(),
+                rate: config.sample_rate,
             },
             audio_choice,
             input_choice,
@@ -378,6 +382,7 @@ impl App {
             input_node: None,
             input_inserted: false,
             input_failed: None,
+            saved_ui_scale: 0.0, // set below
             preview,
             preview_wanted: None,
             preview_tx,
@@ -397,6 +402,13 @@ impl App {
             app.load(source, None);
         }
         app.devices.restore_ara(app.history.project().ara.clone());
+        app.saved_ui_scale = app.ws.ui_scale;
+        if converted {
+            app.ws.status = Some(Status {
+                text: format!("PROJECT MOVED TO {} HZ", config.sample_rate),
+                error: false,
+            });
+        }
         // Work from a session that ended without saving.
         if app.autosave_is_newer() {
             app.ws.status = Some(Status {
@@ -431,7 +443,7 @@ impl App {
                     (a, w)
                 })
                 .map_err(|e| e.to_string());
-            let _ = tx.send(Loaded { path, result });
+            let _ = tx.send(Loaded { path, rate, result });
         });
     }
 
@@ -561,6 +573,16 @@ impl App {
         }
         while let Ok(done) = self.loads_rx.try_recv() {
             let places = self.pending.remove(&done.path).unwrap_or_default();
+            if done.rate != self.view.sample_rate {
+                // Resampled for a rate the project has left: load it again.
+                if places.is_empty() {
+                    self.load(done.path.clone(), None);
+                }
+                for place in places {
+                    self.load(done.path.clone(), Some(place));
+                }
+                continue;
+            }
             match done.result {
                 Ok((audio, waveform)) => {
                     self.audio.insert(done.path.clone(), audio);
@@ -738,6 +760,67 @@ impl App {
         Ok(())
     }
 
+    /// Moves the audio onto the project's rate when it changed (a rate
+    /// choice, or its undo): opens the output at it and loads every file
+    /// again at it. If the device cannot run at it, the project goes back.
+    fn tend_rate(&mut self) {
+        let rate = self.history.project().sample_rate;
+        if rate == self.view.sample_rate {
+            return;
+        }
+        // An undo or redo of a rate change: the engine follows, or, while it
+        // cannot (or the device will not), the project goes back.
+        let blocked = self.taking() || self.export.is_some();
+        let failed = if blocked {
+            Some("stop recording or exporting before changing the rate".to_string())
+        } else {
+            self.switch_rate(rate).err()
+        };
+        if let Some(e) = failed {
+            let back = Action::SetSampleRate {
+                rate: self.view.sample_rate,
+                clips: None,
+            };
+            let _ = self.history.apply_quiet(back);
+            self.error(format!("cannot run at {rate} Hz: {e}"));
+        }
+    }
+
+    /// Opens the output at `rate` and moves everything rate-bound onto it:
+    /// files load again at it, and ARA documents are made again at it. The
+    /// project's own positions are the caller's (`Action::SetSampleRate`).
+    fn switch_rate(&mut self, rate: u32) -> Result<(), String> {
+        let (archives, _) = self.devices.ara_archives(&self.history.project().ara);
+        let old = std::mem::replace(&mut self.view.sample_rate, rate);
+        if let Err(e) = self.restart_audio() {
+            self.view.sample_rate = old;
+            return Err(e);
+        }
+        self.history.store_ara(archives.clone());
+        self.devices.rebuild_ara(archives);
+        // Everything loaded was resampled to the old rate; loads still running
+        // are dropped when they land (`receive_loads`).
+        self.audio.clear();
+        self.waveforms.clear();
+        self.sample_requests.clear();
+        let sources: Vec<PathBuf> = self
+            .history
+            .project()
+            .tracks
+            .iter()
+            .flat_map(|t| t.clips.iter().map(|c| c.source.clone()))
+            .collect();
+        for source in sources {
+            self.load(source, None);
+        }
+        self.audio_view.rate = rate;
+        self.ws.status = Some(Status {
+            text: format!("NOW AT {rate} HZ"),
+            error: false,
+        });
+        Ok(())
+    }
+
     fn error(&mut self, text: String) {
         eprintln!("{text}");
         self.ws.status = Some(Status { text, error: true });
@@ -897,9 +980,13 @@ impl App {
                 .filter(|_| frozen.is_none() && !ara && !pattern_mode)
                 .filter_map(|c| {
                     let audio = self.audio.get(&c.source)?.clone();
-                    let mut clip = Clip::with_window(
-                        c.start, audio, c.offset, c.length, c.fade_in, c.fade_out,
-                    )?;
+                    // Rounding (a rate change, a resample) can leave a window
+                    // a frame or two past the audio: play what is there.
+                    let (offset, length) = clip_window(c, audio.frames() as u64)?;
+                    let fade_in = c.fade_in.min(length);
+                    let fade_out = c.fade_out.min(length - fade_in);
+                    let mut clip =
+                        Clip::with_window(c.start, audio, offset, length, fade_in, fade_out)?;
                     clip.gain = c.gain;
                     clip.reversed = c.reverse;
                     Some(clip)
@@ -1011,6 +1098,7 @@ impl App {
                 let (step, param) = match lane.target {
                     Target::Gain => (Some(track_step), TrackNode::GAIN),
                     Target::Pan => (Some(track_step), TrackNode::PAN),
+                    Target::Mute => (Some(track_step), TrackNode::MUTE),
                     Target::Param { device, id } => (device_steps.get(&device).copied(), id),
                 };
                 if let Some(step) = step {
@@ -1250,6 +1338,20 @@ impl App {
             Request::AddFile { track, path, at } => self.load(path, Some((track, at))),
             Request::ExportMidi { track } => self.export_midi(track),
             Request::ToggleRecord => self.toggle_record(),
+            Request::SetRate(_) if self.taking() || self.export.is_some() => {
+                self.error("stop recording or exporting before changing the rate".into());
+            }
+            Request::SetRate(rate) => {
+                // The device first: the project moves only if it can run there.
+                let action = Action::SetSampleRate { rate, clips: None };
+                if !action.applies_to(self.history.project()) {
+                    self.error(format!("cannot change the rate to {rate} Hz"));
+                } else if let Err(e) = self.switch_rate(rate) {
+                    self.error(format!("cannot run at {rate} Hz: {e}"));
+                } else if let Err(e) = self.history.apply(action) {
+                    self.error(format!("cannot change the rate: {e}"));
+                }
+            }
             Request::Export { stems } => self.toggle_export(stems),
             Request::Freeze { track, bounce } => self.freeze(track, bounce),
             Request::SetInput(_) if self.taking() => {
@@ -1918,6 +2020,7 @@ impl App {
                 semitones,
                 warp,
                 auto,
+                rate,
                 result,
             });
         });
@@ -1932,6 +2035,9 @@ impl App {
         while let Ok(done) = self.stretch_rx.try_recv() {
             self.stretching.remove(&(done.track, done.index));
             self.rendering_paths.remove(&done.path);
+            if done.rate != self.view.sample_rate {
+                continue; // from before a rate change; warps render again
+            }
             if !matches!(done.result, Ok(f) if f > 0) && done.warp.is_some() {
                 // Not tried again until the project changes.
                 let revision = self.history.revision();
@@ -2741,7 +2847,16 @@ impl App {
         }
         let path = self.autosave_path();
         match History::load(&path) {
-            Ok(h) if h.project().sample_rate == self.view.sample_rate => {
+            Ok(mut h) => {
+                if h.project().sample_rate != self.view.sample_rate {
+                    let to = Action::SetSampleRate {
+                        rate: self.view.sample_rate,
+                        clips: None,
+                    };
+                    if let Err(e) = h.apply_quiet(to) {
+                        return self.error(format!("autosave: {e}"));
+                    }
+                }
                 // Plugins are remade from the recovered state, not kept from the old.
                 self.devices.reset();
                 self.history = h;
@@ -2763,7 +2878,6 @@ impl App {
                     error: false,
                 });
             }
-            Ok(_) => self.error("autosave is at another sample rate".into()),
             Err(e) => self.error(format!("no autosave to recover: {e}")),
         }
     }
@@ -2835,6 +2949,11 @@ impl eframe::App for App {
         self.read_telemetry();
         self.tend_export();
         self.tend_input();
+        self.tend_rate();
+        if self.ws.ui_scale != self.saved_ui_scale {
+            self.saved_ui_scale = self.ws.ui_scale;
+            save_ui_scale(&self.samples_dir, self.ws.ui_scale);
+        }
         self.engine.collect_garbage();
         if ctx.input(|i| i.modifiers.command && !i.modifiers.shift && i.key_pressed(egui::Key::S)) {
             self.save();
@@ -3084,6 +3203,13 @@ fn take_targets(project: &daw_project::Project, selected: Option<usize>) -> Vec<
     }
 }
 
+/// Clip `c`'s window (offset, length) held to `frames` of loaded audio;
+/// `None` if nothing of it is left.
+fn clip_window(c: &ClipRef, frames: u64) -> Option<(u64, u64)> {
+    let length = c.length.min(frames.saturating_sub(c.offset));
+    (length > 0).then_some((c.offset, length))
+}
+
 /// How far a playhead at `at` is through an export from `start` to `end`, 0 to 1.
 fn progress(at: u64, start: u64, end: u64) -> f64 {
     (at.saturating_sub(start) as f64 / end.saturating_sub(start).max(1) as f64).min(1.0)
@@ -3124,6 +3250,28 @@ fn fixed_buffer(config: &cpal::StreamConfig) -> Option<u32> {
     match config.buffer_size {
         cpal::BufferSize::Fixed(n) => Some(n),
         _ => None,
+    }
+}
+
+/// Where preferences besides the audio choice are kept between sessions.
+fn prefs_path(samples_dir: &Path) -> PathBuf {
+    samples_dir.join(".canary-prefs")
+}
+
+/// The saved UI scale (`ui_scale=` line), held to the offered range, else 1.
+fn load_ui_scale(samples_dir: &Path) -> f32 {
+    let text = fs::read_to_string(prefs_path(samples_dir)).unwrap_or_default();
+    let (lo, hi, _) = daw_ui::UI_SCALES;
+    text.lines()
+        .find_map(|l| l.strip_prefix("ui_scale="))
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .filter(|v| v.is_finite())
+        .map_or(1.0, |v| v.clamp(lo, hi))
+}
+
+fn save_ui_scale(samples_dir: &Path, scale: f32) {
+    if let Err(e) = fs::write(prefs_path(samples_dir), format!("ui_scale={scale}\n")) {
+        eprintln!("preferences not saved: {e}");
     }
 }
 
@@ -3283,6 +3431,24 @@ mod tests {
         p.tracks[0].armed = true;
         p.tracks[2].armed = true;
         assert_eq!(take_targets(&p, Some(1)), [Some(0), Some(2)]);
+    }
+
+    #[test]
+    fn a_window_a_frame_past_the_audio_still_plays() {
+        let c = ClipRef {
+            source: "/a.wav".into(),
+            start: 0,
+            offset: 100,
+            length: 1_001,
+            fade_in: 0,
+            fade_out: 0,
+            gain: 1.0,
+            reverse: false,
+            stretch: None,
+            takes: None,
+        };
+        assert_eq!(clip_window(&c, 1_100), Some((100, 1_000)));
+        assert_eq!(clip_window(&c, 100), None);
     }
 
     #[test]

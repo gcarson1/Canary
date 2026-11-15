@@ -25,6 +25,8 @@ pub struct TrackNode {
     /// Automated gain and pan, overriding the params while a plan automates them.
     auto_gain: Option<f32>,
     auto_pan: Option<f32>,
+    /// Automated mute, overriding the mute button (solo still applies).
+    auto_mute: Option<bool>,
     left: Smoother,
     right: Smoother,
 }
@@ -33,12 +35,13 @@ impl TrackNode {
     /// Built on the main thread. Starts settled at the current parameter values so a
     /// rebuilt plan does not fade the track in.
     pub fn new(clips: Vec<Clip>, params: Arc<TrackParams>) -> Self {
-        let (left, right) = target_gains(&params, None, None);
+        let (left, right) = target_gains(&params, None, None, None);
         Self {
             clips: clips.into_boxed_slice(),
             params,
             auto_gain: None,
             auto_pan: None,
+            auto_mute: None,
             left: Smoother::new(left),
             right: Smoother::new(right),
         }
@@ -46,9 +49,11 @@ impl TrackNode {
 }
 
 impl TrackNode {
-    /// Automation parameter ids: gain (linear) and pan (-1..=1).
+    /// Automation parameter ids: gain (linear), pan (-1..=1) and mute
+    /// (muted from 0.5).
     pub const GAIN: u32 = 0;
     pub const PAN: u32 = 1;
+    pub const MUTE: u32 = 2;
 
     /// Payload for `ExecutionPlan::update` that replaces a live track's clips.
     pub fn clips_update(clips: Vec<Clip>) -> Box<dyn Any + Send> {
@@ -58,8 +63,14 @@ impl TrackNode {
 
 /// Per-channel gains from the params (or their automated values): equal-power
 /// pan, zero when inaudible.
-fn target_gains(params: &TrackParams, gain: Option<f32>, pan: Option<f32>) -> (f32, f32) {
-    if !params.is_audible() {
+fn target_gains(
+    params: &TrackParams,
+    gain: Option<f32>,
+    pan: Option<f32>,
+    mute: Option<bool>,
+) -> (f32, f32) {
+    let muted = mute.unwrap_or_else(|| params.is_muted());
+    if muted || !params.solo_allows() {
         return (0.0, 0.0);
     }
     let angle = (pan.unwrap_or_else(|| params.pan()).clamp(-1.0, 1.0) + 1.0) * FRAC_PI_4;
@@ -116,7 +127,8 @@ impl AudioNode for TrackNode {
             }
         }
 
-        let (left, right) = target_gains(&self.params, self.auto_gain, self.auto_pan);
+        let (left, right) =
+            target_gains(&self.params, self.auto_gain, self.auto_pan, self.auto_mute);
         self.left.set_time(SMOOTHING_SECONDS, context.sample_rate);
         self.right.set_time(SMOOTHING_SECONDS, context.sample_rate);
         self.left.set_target(left);
@@ -150,13 +162,15 @@ impl AudioNode for TrackNode {
             match id {
                 Self::GAIN => self.auto_gain = Some(v),
                 Self::PAN => self.auto_pan = Some(v),
+                Self::MUTE => self.auto_mute = Some(v >= 0.5),
                 _ => {}
             }
         }
     }
 
     fn reset(&mut self) {
-        let (left, right) = target_gains(&self.params, self.auto_gain, self.auto_pan);
+        let (left, right) =
+            target_gains(&self.params, self.auto_gain, self.auto_pan, self.auto_mute);
         self.left = Smoother::new(left);
         self.right = Smoother::new(right);
     }
@@ -212,6 +226,20 @@ mod tests {
             },
         );
         (l, r)
+    }
+
+    #[test]
+    fn mute_automation_overrides_the_mute_button() {
+        let p = params(-1.0);
+        let mut node = TrackNode::new(vec![clip(0, 4_800, 1.0)], p.clone());
+        node.automate(TrackNode::MUTE, 1.0);
+        node.reset(); // settle, as a fresh plan does
+        assert!(run(&mut node, 0, 480, true).0.iter().all(|&x| x == 0.0));
+        // Automated unmuted plays even with M on.
+        p.set_mute(true);
+        node.automate(TrackNode::MUTE, 0.0);
+        node.reset();
+        assert!(run(&mut node, 480, 480, true).0.iter().all(|&x| x == 1.0));
     }
 
     #[test]

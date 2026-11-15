@@ -242,6 +242,30 @@ impl Track {
     }
 }
 
+impl Project {
+    /// Scales every clip's sample positions by `factor` (a rate change).
+    fn scale_clips(&mut self, factor: f64) {
+        let at = |v: u64| (v as f64 * factor).round() as u64;
+        for c in self.tracks.iter_mut().flat_map(|t| &mut t.clips) {
+            c.start = at(c.start);
+            c.offset = at(c.offset);
+            c.length = at(c.length).max(1);
+            c.fade_in = at(c.fade_in).min(c.length);
+            c.fade_out = at(c.fade_out).min(c.length - c.fade_in);
+            if let Some(t) = c.takes.as_mut() {
+                t.first = at(t.first);
+                t.len = at(t.len).max(1);
+            }
+            if let Some(w) = c.stretch.as_mut().and_then(|s| s.warp.as_mut()) {
+                w.source_frames = at(w.source_frames);
+                for m in &mut w.markers {
+                    m.0 = at(m.0);
+                }
+            }
+        }
+    }
+}
+
 /// A clip as saved: which file, where it sits, and the window of it that plays.
 /// Mirrors `daw_core::Clip`, whose edit methods keep the window valid; the app
 /// edits a `Clip` and stores the result here with `Action::SetClip`.
@@ -416,6 +440,13 @@ impl ClipRef {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
     SetTempo(f64),
+    /// Moves the project to `rate`: every sample position (clips, fades,
+    /// takes, warp frames) scales with it; tick positions stay. With `clips`,
+    /// puts those back exactly instead (how its undo restores them).
+    SetSampleRate {
+        rate: u32,
+        clips: Option<Vec<Vec<ClipRef>>>,
+    },
     SetReference(Option<PathBuf>),
     InsertTrack {
         index: usize,
@@ -646,6 +677,27 @@ impl Action {
     fn apply(self, p: &mut Project) -> Result<Action, ActionError> {
         use Action::*;
         Ok(match self {
+            SetSampleRate { rate, clips } => {
+                if !(8_000..=768_000).contains(&rate)
+                    || clips.as_ref().is_some_and(|c| c.len() != p.tracks.len())
+                {
+                    return Err(ActionError::BadValue);
+                }
+                let old: Vec<Vec<ClipRef>> = p.tracks.iter().map(|t| t.clips.clone()).collect();
+                let from = std::mem::replace(&mut p.sample_rate, rate);
+                match clips {
+                    Some(clips) => {
+                        for (t, c) in p.tracks.iter_mut().zip(clips) {
+                            t.clips = c;
+                        }
+                    }
+                    None => p.scale_clips(f64::from(rate) / f64::from(from)),
+                }
+                SetSampleRate {
+                    rate: from,
+                    clips: Some(old),
+                }
+            }
             SetTempo(bpm) => {
                 if !bpm_ok(bpm) {
                     return Err(ActionError::BadTempo);
@@ -1388,6 +1440,37 @@ mod tests {
     }
 
     #[test]
+    fn a_rate_change_scales_clips_and_undo_restores_them_exactly() {
+        let mut t = Track::new("Vox");
+        t.clips.push(ClipRef {
+            length: 44_100,
+            fade_in: 441,
+            ..clip(44_100)
+        });
+        let mut h = History::new(Project {
+            sample_rate: 44_100,
+            tracks: vec![t],
+            ..Project::default()
+        });
+        let before = h.project().clone();
+        h.apply(Action::SetSampleRate {
+            rate: 48_000,
+            clips: None,
+        })
+        .unwrap();
+        let c = &h.project().tracks[0].clips[0];
+        assert_eq!((c.start, c.fade_in), (48_000, 480));
+        assert_eq!(h.project().sample_rate, 48_000);
+        assert!(h.undo());
+        assert_eq!(h.project(), &before);
+        let bad = Action::SetSampleRate {
+            rate: 1,
+            clips: None,
+        };
+        assert_eq!(h.apply(bad), Err(ActionError::BadValue));
+    }
+
+    #[test]
     fn every_action_undoes_and_redoes_exactly() {
         let mut h = History::default();
         let mut snapshots = vec![h.project().clone()];
@@ -1402,6 +1485,10 @@ mod tests {
         };
         for action in [
             Action::SetTempo(140.0),
+            Action::SetSampleRate {
+                rate: 96_000,
+                clips: None,
+            },
             Action::SetReference(Some("/refs/master.wav".into())),
             Action::SetTempoMap(vec![TempoChange {
                 tick: 4 * PPQ,

@@ -419,7 +419,11 @@ pub(crate) fn show(
                         }
                         ws.edit(Action::SetTrackProps { index: ti, props });
                     }
-                    _ => ws.edit(crate::mute_solo(&project.tracks, ti, k == 3, alt)),
+                    _ => {
+                        let action = crate::mute_solo(&project.tracks, ti, k == 3, alt);
+                        let action = ws.with_mute_automation(project, inputs.engine, ti, action);
+                        ws.edit(action);
+                    }
                 }
             }
         }

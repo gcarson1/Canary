@@ -129,6 +129,12 @@ fn scale_for(target: Target, inputs: &Inputs<'_>, ti: usize) -> Option<Scale> {
             log: false,
             rest: f64::from(track.pan),
         }),
+        Target::Mute => Some(Scale {
+            min: 0.0,
+            max: 1.0,
+            log: false,
+            rest: if track.mute { 1.0 } else { 0.0 },
+        }),
         Target::Param { device, id } => {
             let index = track.devices.iter().position(|d| d.uid == device)?;
             let p = inputs

@@ -13,6 +13,8 @@ pub enum Target {
     Gain,
     /// Track pan, -1..=1.
     Pan,
+    /// Track mute: muted from 0.5 (written as 0 or 1).
+    Mute,
     /// Parameter `id` of the device with uid `device`, in the parameter's own units.
     Param { device: u64, id: u32 },
 }
@@ -23,6 +25,7 @@ impl Target {
         match self {
             Target::Gain => Some((0.0, 2.0)),
             Target::Pan => Some((-1.0, 1.0)),
+            Target::Mute => Some((0.0, 1.0)),
             Target::Param { .. } => None,
         }
     }

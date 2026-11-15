@@ -550,7 +550,12 @@ impl TrackParams {
 
     /// False when muted, or when another track is soloed and this one is not.
     pub fn is_audible(&self) -> bool {
-        !self.is_muted() && (self.is_soloed() || self.solo_count.load(Ordering::Relaxed) == 0)
+        !self.is_muted() && self.solo_allows()
+    }
+
+    /// Solo lets this track play: it is soloed, or nothing is.
+    pub fn solo_allows(&self) -> bool {
+        self.is_soloed() || self.solo_count.load(Ordering::Relaxed) == 0
     }
 }
 

@@ -184,6 +184,8 @@ pub enum Request {
     },
     /// Audition a file from the browser (`None` stops).
     Preview(Option<PathBuf>),
+    /// Move the project (and the audio) to this sample rate.
+    SetRate(u32),
     /// Open this output device (None: the system default) at this buffer size
     /// (None: the device's own).
     SetAudio {
@@ -237,7 +239,12 @@ pub struct AudioView {
     pub inputs: Vec<String>,
     /// The input chosen, `None` for the system default.
     pub input: Option<String>,
+    /// The project's (and the output's) sample rate.
+    pub rate: u32,
 }
+
+/// Sample rates the audio panel offers.
+pub const SAMPLE_RATES: [u32; 4] = [44_100, 48_000, 88_200, 96_000];
 
 /// Buffer sizes the audio panel offers.
 pub const BUFFER_SIZES: [u32; 6] = [64, 128, 256, 512, 1024, 2048];
@@ -284,6 +291,19 @@ impl ExportFormat {
             Self::Flac => Self::Aac,
             Self::Aac => Self::Wav32,
         }
+    }
+}
+
+/// Smallest and largest UI scale, and the step Cmd+= / Cmd+- take.
+pub const UI_SCALES: (f32, f32, f32) = (0.75, 1.5, 0.125);
+
+/// The UI scale after pressing `key` (= or + larger, - smaller, 0 back to 1).
+fn next_ui_scale(scale: f32, key: Key) -> f32 {
+    let (lo, hi, step) = UI_SCALES;
+    match key {
+        Key::Num0 => 1.0,
+        Key::Minus => (scale - step).max(lo),
+        _ => (scale + step).min(hi),
     }
 }
 
@@ -341,6 +361,8 @@ pub struct Status {
 /// UI state that is not part of the project: view, tools, selection, drags.
 pub struct Workspace {
     pub theme: Theme,
+    /// The UI scale preference (Cmd+= / Cmd+- / Cmd+0): every size times this.
+    pub ui_scale: f32,
     pub tool: Tool,
     pub snap: Snap,
     pub selected_track: Option<usize>,
@@ -378,7 +400,16 @@ pub struct Workspace {
     /// lane at the playhead (latch: it overwrites what it passes).
     pub auto_record: bool,
     /// The tick each control last wrote in this pass, cleared on release.
-    auto_pass: HashMap<(usize, Target), u64>,
+    /// Per control written this pass: the tick it last wrote, its value, and
+    /// when it was touched (a counter, newest highest).
+    auto_pass: HashMap<(usize, Target), (u64, f64, u64)>,
+    /// Latch (right-click AUTO): a released control keeps writing its last
+    /// value until the transport stops. Touch (the default): it stops writing,
+    /// and the lane plays what it had from there on.
+    pub auto_latch: bool,
+    auto_touches: u64,
+    /// Tracks in the project when the pass began.
+    auto_tracks: usize,
     /// The automation lane drawn over the selected track in the playlist.
     pub automation: Option<Target>,
     pub export_format: ExportFormat,
@@ -427,6 +458,7 @@ impl Default for Workspace {
     fn default() -> Self {
         Self {
             theme: Theme::DARK,
+            ui_scale: 1.0,
             tool: Tool::Draw,
             snap: Snap::Sixteenth,
             selected_track: None,
@@ -448,6 +480,9 @@ impl Default for Workspace {
             punch: false,
             auto_record: false,
             auto_pass: HashMap::new(),
+            auto_latch: false,
+            auto_touches: 0,
+            auto_tracks: 0,
             automation: None,
             export_format: ExportFormat::default(),
             export_rate: None,
@@ -539,9 +574,10 @@ impl Workspace {
         if ui.input(|i| i.pointer.any_pressed()) {
             self.track_focused = false;
         }
+        let held = ui.input(|i| i.pointer.any_down());
+        self.hold_automation(inputs.history.project(), inputs.engine, held);
         if !ui.input(|i| i.pointer.any_down()) {
             self.step_paint = None;
-            self.auto_pass.clear();
             if let Some((track, key)) = self.held_note.take() {
                 out.push(Request::Note {
                     track,
@@ -551,7 +587,7 @@ impl Workspace {
             }
         }
         let full = ui.max_rect();
-        let m = Metrics::new(full.width(), ui.ctx().pixels_per_point());
+        let m = Metrics::scaled(full.width(), ui.ctx().pixels_per_point(), self.ui_scale);
         let t = self.theme;
         if ui.visuals().panel_fill != t.bg_void {
             theme::apply(ui.ctx(), &t);
@@ -653,7 +689,9 @@ impl Workspace {
             self.clip_group.clear();
         }
         // A wheel turning a dial is one gesture until the scroll stops.
-        if !ui.input(|i| i.pointer.any_down() || i.smooth_scroll_delta != Vec2::ZERO) {
+        // A latched control writing on is one gesture too, until its pass ends.
+        let latched = !self.auto_pass.is_empty();
+        if !latched && !ui.input(|i| i.pointer.any_down() || i.smooth_scroll_delta != Vec2::ZERO) {
             inputs.history.end_gesture();
         }
         self.clear_selection(inputs.history);
@@ -737,7 +775,7 @@ impl Workspace {
         let from = self
             .auto_pass
             .get(&(track, target))
-            .copied()
+            .map(|e| e.0)
             .filter(|&last| last <= tick)
             .unwrap_or(tick);
         let mut points: Vec<daw_project::Point> = t
@@ -748,6 +786,12 @@ impl Workspace {
         // Keep this pass's last write (where the move ramps from); a first
         // write replaces any point at its tick.
         points.retain(|p| p.tick < from || (p.tick == from && from < tick) || p.tick > tick);
+        // A value held flat keeps only the ends of its run.
+        let kept = points.partition_point(|p| p.tick < from);
+        let flat = |p: Option<&daw_project::Point>| p.is_some_and(|p| p.value == value);
+        if from < tick && kept > 0 && flat(points.get(kept)) && flat(points.get(kept - 1)) {
+            points.remove(kept);
+        }
         let at = points.partition_point(|p| p.tick < tick);
         points.insert(
             at,
@@ -757,12 +801,29 @@ impl Workspace {
                 curve: 0.0,
             },
         );
-        self.auto_pass.insert((track, target), tick);
+        let touched = match self.auto_pass.get(&(track, target)) {
+            Some(e) => e.2,
+            None => {
+                // In latch, touching another control ends the latched one, so
+                // two never write (and fold their undo gestures) by turns.
+                if self.auto_latch {
+                    self.auto_pass.clear();
+                }
+                if self.auto_pass.is_empty() {
+                    self.auto_tracks = project.tracks.len();
+                }
+                self.auto_touches += 1;
+                self.auto_touches
+            }
+        };
+        self.auto_pass
+            .insert((track, target), (tick, value, touched));
         let id = 1 << 63
             | (track as u64) << 40
             | match target {
                 Target::Gain => 1,
                 Target::Pan => 2,
+                Target::Mute => 4,
                 Target::Param { device, id } => (device << 20).wrapping_add(3) ^ u64::from(id),
             } & ((1 << 40) - 1);
         self.edits.push(Edit::Gesture(
@@ -773,6 +834,81 @@ impl Workspace {
             },
             id,
         ));
+    }
+
+    /// Keeps writing while automation records: a control held still (touch)
+    /// or, in latch, the last one released, at its value, until the transport
+    /// stops. A release in touch mode ends the control's pass.
+    fn hold_automation(&mut self, project: &Project, engine: &EngineView, held: bool) {
+        // A track added or removed moves the indices the pass holds.
+        if !engine.playing || !self.auto_record || project.tracks.len() != self.auto_tracks {
+            self.auto_pass.clear();
+            self.auto_tracks = project.tracks.len();
+            return;
+        }
+        if !held {
+            if self.auto_latch {
+                // shortcut: only the newest latches; several would alternate
+                // their undo gestures every frame.
+                let newest = self.auto_pass.iter().max_by_key(|e| e.1 .2).map(|e| *e.0);
+                self.auto_pass.retain(|k, _| Some(*k) == newest);
+            } else {
+                self.auto_pass.clear();
+            }
+        }
+        let tick = project.ticks_at(engine.playhead);
+        let writes: Vec<_> = self
+            .auto_pass
+            .iter()
+            // Not where it just wrote; behind it (a loop wrap) writes again.
+            .filter(|e| e.1 .0 != tick)
+            .map(|e| (*e.0, e.1 .1))
+            .collect();
+        for ((track, target), value) in writes {
+            self.record_automation(project, engine, track, target, value);
+        }
+    }
+
+    /// A mute click while automation records also writes the step to the
+    /// track's MUTE lane, in the same undo step.
+    pub(crate) fn with_mute_automation(
+        &self,
+        project: &Project,
+        engine: &EngineView,
+        track: usize,
+        action: Action,
+    ) -> Action {
+        let Action::SetTrackProps { index, props } = &action else {
+            return action; // an exclusive (Option) click: several tracks
+        };
+        let Some(t) = project.tracks.get(*index).filter(|_| *index == track) else {
+            return action;
+        };
+        if !self.auto_record || !engine.playing || props.mute == t.mute {
+            return action;
+        }
+        let tick = project.ticks_at(engine.playhead);
+        let lane = t.automation.iter().find(|l| l.target == Target::Mute);
+        let points = lane.map_or(&[][..], |l| &l.points[..]);
+        // What plays here is the lane where there is one, not the button.
+        let was = match points
+            .iter()
+            .rev()
+            .find(|p| p.tick <= tick)
+            .or(points.first())
+        {
+            Some(p) => p.value >= 0.5,
+            None => t.mute,
+        };
+        let points = mute_step(points, tick, was, !was);
+        Action::Batch(vec![
+            action.clone(),
+            Action::SetAutomation {
+                track,
+                target: Target::Mute,
+                points,
+            },
+        ])
     }
 
     /// Queues a project edit for the end of the frame. `notes` as `track`'s notes in the current pattern, creating the
@@ -1044,6 +1180,13 @@ impl Workspace {
                     }
                 }
                 (Key::C, false, _) if self.page != Page::PianoRoll => self.tool = Tool::Slice,
+                (Key::Equals | Key::Plus | Key::Minus | Key::Num0, true, false) => {
+                    self.ui_scale = next_ui_scale(self.ui_scale, key);
+                    self.status = Some(Status {
+                        text: format!("UI SCALE {:.0}%", self.ui_scale * 100.0),
+                        error: false,
+                    });
+                }
                 (Key::L, true, true) => {
                     self.theme = if self.theme == Theme::DARK {
                         Theme::LIGHT
@@ -1106,8 +1249,8 @@ impl Workspace {
             ui.scope_id().with("audio-panel"),
         ));
         let row_h = 1.75 * u;
-        // Outputs, the buffer row, the INPUT label, then inputs.
-        let rows = audio.devices.len().max(1) as f32 + 2.0 + audio.inputs.len().max(1) as f32;
+        // Outputs, the buffer row, the rate row, the INPUT label, then inputs.
+        let rows = audio.devices.len().max(1) as f32 + 3.0 + audio.inputs.len().max(1) as f32;
         let width = 18.0 * u;
         let panel = m.snap_rect(Rect::from_min_size(
             Pos2::new(anchor.max.x - width, anchor.max.y + 0.75 * u),
@@ -1192,6 +1335,42 @@ impl Workspace {
             );
             if resp.clicked() && !on {
                 pick = Some((audio.device.clone(), size));
+            }
+            x = cell.max.x + 0.25 * u;
+        }
+        // Sample rates: the project moves with the output.
+        y = row.max.y;
+        let row = Rect::from_x_y_ranges(panel.x_range(), y..=m.snap(y + row_h));
+        p.hline(panel.x_range(), m.snap(y), m.hair(t.line));
+        let mut x = row.min.x + 0.75 * u;
+        for rate in SAMPLE_RATES {
+            let label = format!("{}K", rate as f32 / 1000.0);
+            let g = p.layout_no_wrap(label.clone(), m.mono(0.5625), t.text);
+            let cell = m.snap_rect(Rect::from_min_size(
+                Pos2::new(x, row.center().y - 0.5 * u),
+                Vec2::new(g.size().x + 0.5 * u, u),
+            ));
+            let resp = ui.interact(
+                cell,
+                ui.scope_id().with(("audio-rate", rate)),
+                Sense::click(),
+            );
+            let on = audio.rate == rate;
+            if on {
+                p.rect_filled(cell, 0.0, t.accent_amber);
+            } else {
+                let line = if resp.hovered() { t.text } else { t.line_2 };
+                p.rect_stroke(cell, 0.0, m.hair(line), StrokeKind::Inside);
+            }
+            p.text(
+                cell.center(),
+                Align2::CENTER_CENTER,
+                label,
+                m.mono(0.5625),
+                if on { t.ink_text } else { t.muted },
+            );
+            if resp.clicked() && !on {
+                out.push(Request::SetRate(rate));
             }
             x = cell.max.x + 0.25 * u;
         }
@@ -1625,6 +1804,12 @@ impl Workspace {
             ("AUTO", "auto"),
         ];
         for (label, id) in toggles {
+            // Right-click AUTO switches touch and latch; latch shows its name.
+            let label = if id == "auto" && self.auto_latch {
+                "LATCH"
+            } else {
+                label
+            };
             let on = match id {
                 "met" => self.metronome,
                 "count" => self.count_in,
@@ -1650,6 +1835,9 @@ impl Workspace {
                 m.mono(0.625),
                 if on { t.ink_text } else { t.muted },
             );
+            if resp.secondary_clicked() && id == "auto" {
+                self.auto_latch ^= true;
+            }
             if resp.clicked() {
                 match id {
                     "met" => self.metronome ^= true,
@@ -2086,6 +2274,7 @@ impl Workspace {
             (None, "OFF", "auto-off"),
             (Some(Target::Gain), "GAIN", "auto-gain"),
             (Some(Target::Pan), "PAN", "auto-pan"),
+            (Some(Target::Mute), "MUTE", "auto-mute"),
         ] {
             let (end, clicked) = seg(x, label, self.automation == target, id);
             if clicked {
@@ -2211,7 +2400,8 @@ impl Workspace {
             let (_, mute) = toggle(left - 0.25 * u, "M", track.mute, t.ink);
             if mute || solo {
                 let alt = ui.input(|i| i.modifiers.alt);
-                edit = Some(mute_solo(tracks, i, solo, alt));
+                let action = mute_solo(tracks, i, solo, alt);
+                edit = Some(self.with_mute_automation(history.project(), engine, i, action));
             } else if resp.clicked() {
                 self.selected_track = Some(i);
                 self.track_focused = true;
@@ -2460,6 +2650,41 @@ impl Workspace {
     }
 }
 
+/// `points` with a mute step written at `tick`: the old state up to just
+/// before it, `on` from it.
+fn mute_step(
+    points: &[daw_project::Point],
+    tick: u64,
+    was: bool,
+    on: bool,
+) -> Vec<daw_project::Point> {
+    let before = tick.saturating_sub(1);
+    let mut out: Vec<daw_project::Point> = points
+        .iter()
+        .copied()
+        .filter(|p| p.tick < before || p.tick > tick)
+        .collect();
+    let at = out.partition_point(|p| p.tick < before);
+    let point = |tick, on: bool| daw_project::Point {
+        tick,
+        value: if on { 1.0 } else { 0.0 },
+        curve: 0.0,
+    };
+    let step = if before < tick {
+        vec![point(before, was), point(tick, on)]
+    } else {
+        vec![point(tick, on)]
+    };
+    out.splice(at..at, step);
+    // Held until just before the next point, so the segment to it does not
+    // ramp across the threshold.
+    let next = out.iter().position(|p| p.tick > tick);
+    if let Some(n) = next.filter(|&n| (out[n].value >= 0.5) != on && out[n].tick - 1 > tick) {
+        out.insert(n, point(out[n].tick - 1, on));
+    }
+    out
+}
+
 /// The browser shows names, not paths.
 /// A click on track `index`'s M (or S when `solo`): toggles it, or with Option
 /// makes it the only muted (soloed) track, Option-clicking it again clears all.
@@ -2528,6 +2753,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_mute_click_writes_a_step_over_what_was_there() {
+        let p = |tick, value| daw_project::Point {
+            tick,
+            value,
+            curve: 0.0,
+        };
+        let old = [p(0, 0.0), p(500, 1.0), p(2_000, 0.0)];
+        let out = mute_step(&old, 1_000, true, false);
+        assert_eq!(
+            out,
+            [
+                p(0, 0.0),
+                p(500, 1.0),
+                p(999, 1.0),
+                p(1_000, 0.0),
+                p(2_000, 0.0)
+            ]
+        );
+        // Muting before an unmuted point holds until just before it.
+        let out = mute_step(&old, 1_000, false, true);
+        let ticks: Vec<u64> = out.iter().map(|p| p.tick).collect();
+        assert_eq!(ticks, [0, 500, 999, 1_000, 1_999, 2_000]);
+        assert_eq!(out[4].value, 1.0);
+        assert_eq!(mute_step(&[], 0, false, true), [p(0, 1.0)]);
+    }
+
+    #[test]
+    fn the_ui_scale_steps_within_its_range() {
+        assert_eq!(next_ui_scale(1.0, Key::Equals), 1.125);
+        assert_eq!(next_ui_scale(1.5, Key::Plus), 1.5);
+        assert_eq!(next_ui_scale(0.75, Key::Minus), 0.75);
+        assert_eq!(next_ui_scale(1.375, Key::Num0), 1.0);
+        let m = Metrics::scaled(1280.0, 2.0, 1.25);
+        assert_eq!(m.u, 20.0);
+    }
+
+    #[test]
     fn auto_writes_points_while_playing_and_overwrites_what_it_passes() {
         let mut project = Project::default();
         project.tracks.push(Track::new("T".to_string()));
@@ -2567,6 +2829,36 @@ mod tests {
         let ticks: Vec<u64> = second.iter().map(|p| p.tick).collect();
         assert_eq!(ticks, [0, 100, 200, 250, 520, 600, 700, 800, 900]);
         assert_eq!(second[4].value, 1.0, "clamped to the pan range");
+
+        // Touch: held still, it keeps writing; released, it stops.
+        ws.edits.clear();
+        engine.playhead = project.samples_at(700);
+        ws.hold_automation(&project, &engine, true);
+        assert!(points(&mut ws)
+            .iter()
+            .any(|p| p.tick == 700 && p.value == 1.0));
+        ws.hold_automation(&project, &engine, false);
+        assert!(ws.auto_pass.is_empty() && ws.edits.is_empty());
+        // Latch: the newest control keeps writing after release, until stop.
+        ws.auto_latch = true;
+        ws.record_automation(&project, &engine, 0, Target::Gain, 0.5);
+        ws.record_automation(&project, &engine, 0, Target::Pan, -0.5);
+        ws.edits.clear();
+        engine.playhead = project.samples_at(800);
+        ws.hold_automation(&project, &engine, false);
+        assert_eq!(ws.auto_pass.len(), 1, "only the newest latches");
+        assert!(points(&mut ws)
+            .iter()
+            .any(|p| p.tick == 800 && p.value == -0.5));
+        // Round a loop: behind the last write, it writes again.
+        engine.playhead = project.samples_at(300);
+        ws.hold_automation(&project, &engine, false);
+        assert!(points(&mut ws)
+            .iter()
+            .any(|p| p.tick == 300 && p.value == -0.5));
+        engine.playing = false;
+        ws.hold_automation(&project, &engine, false);
+        assert!(ws.auto_pass.is_empty(), "stopping ends the pass");
     }
 
     #[test]

@@ -193,8 +193,13 @@ pub struct Metrics {
 
 impl Metrics {
     pub fn new(width: f32, pixels_per_point: f32) -> Self {
+        Self::scaled(width, pixels_per_point, 1.0)
+    }
+
+    /// As `new`, every size `scale` times as large (the UI scale preference).
+    pub fn scaled(width: f32, pixels_per_point: f32, scale: f32) -> Self {
         Self {
-            u: unit(width),
+            u: unit(width) * scale,
             px: 1.0 / pixels_per_point,
             ppp: pixels_per_point,
         }
